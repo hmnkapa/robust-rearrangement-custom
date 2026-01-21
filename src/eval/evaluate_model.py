@@ -283,13 +283,20 @@ if __name__ == "__main__":
     # additional params for point cloud observation
     parser.add_argument("--save-pc-for-dp3", action="store_true", help="Enable point cloud generation and pickle export for DP3")
     parser.add_argument("--pc-points", type=int, default=4096, help="Downsampled point count for generated point clouds")
-    parser.add_argument("--pc-bbox-half-extent", type=float, default=0.2, help="Half-extent of the cubic bbox for point cloud cropping (in meters)")
+    parser.add_argument("--pc-bbox-half-extent", type=float, nargs="+", default=[0.2], help="Half-extent of the cubic bbox for point cloud cropping (in meters). Can be scalar or [x, y, z]")
     parser.add_argument(
         "--pc-downsample-mode",
         type=str,
         default="random",
         choices=["random", "uniform", "fps"],
         help="Downsample mode for point cloud generation",
+    )
+    parser.add_argument(
+        "--pc-bbox-crop-mode",
+        type=str,
+        default="eepose-centered",
+        choices=["eepose-centered", "fixed-scene"],
+        help="Mode for 3D bbox cropping: 'eepose-centered' (default) or 'fixed-scene'",
     )
 
     # Parse the arguments
@@ -432,7 +439,8 @@ if __name__ == "__main__":
                     actor.inference_steps = 4
 
                 if args.wt_path:
-                    actor.load_state_dict(run.checkpoint["model_state_dict"])
+                    if cfg.actor.name != "dp3":
+                        actor.load_state_dict(run.checkpoint["model_state_dict"])
                     actor.eval()
                     actor.to(device)
 
@@ -448,8 +456,14 @@ if __name__ == "__main__":
                     continue
 
                 suffix = args.save_rollouts_suffix
+
+                actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
+                if actor_name == "dp3":
+                    suffix = "dp3"
+
                 if args.save_pc_for_dp3:
-                    suffix += f"pc/{args.pc_points}/{args.pc_downsample_mode}"
+                    suffix = f"pc/{args.pc_points}/{args.pc_downsample_mode}"
+                
                 save_dir = (
                     trajectory_save_dir(
                         controller="diffik",
@@ -476,6 +490,19 @@ if __name__ == "__main__":
 
                 # Only actually load the environment after we know we've got at least one run to evaluate
                 if env is None:
+                    # Prepare obs_keys with depth_image2 if needed for point cloud generation
+                    env_obs_keys = None
+                    if args.save_pc_for_dp3 or actor_name == "dp3":
+                        # Need to include depth_image2 for point cloud generation
+                        from src.gym import FULL_OBS
+                        env_obs_keys = list(FULL_OBS)
+                        if args.observation_space == "state":
+                            # Filter out color images but keep depth
+                            env_obs_keys = [key for key in env_obs_keys if "color_image" not in key]
+                        # Ensure depth_image2 is included
+                        if "depth_image2" not in env_obs_keys:
+                            env_obs_keys.append("depth_image2")
+                    
                     env = get_rl_env(
                         gpu_id=args.gpu,
                         task=args.task,
@@ -484,24 +511,29 @@ if __name__ == "__main__":
                         observation_space=args.observation_space,
                         max_env_steps=5_000,
                         resize_img=False,
-                        act_rot_repr="rot_6d",
+                        act_rot_repr=cfg.control.act_rot_repr,
                         action_type=args.action_type,
                         april_tags=args.april_tags,
                         verbose=args.verbose,
                         headless=not args.visualize,
+                        obs_keys=env_obs_keys,  # Pass prepared obs_keys
                     )
                 
                 # 点云 obs 相关
-                if args.save_pc_for_dp3:
-                    pc_generator = None
-                    if args.save_pc_for_dp3:
-                        extra_obs_keys = []
-                        if "depth_image2" not in env.obs_keys:
-                            extra_obs_keys.append("depth_image2")
-                        if extra_obs_keys:
-                            env.obs_keys = list(env.obs_keys) + extra_obs_keys
-                            env.set_camera()
-                        pc_generator = PointCloudGenerator(env=env, camera_name="front", max_points=args.pc_points, bbox_half_extent=args.pc_bbox_half_extent)
+                pc_generator = None
+                if args.save_pc_for_dp3 or actor_name == "dp3":
+                    # depth_image2 should already be in obs_keys from env creation
+                    # Handle list vs scalar for bbox
+                    bbox_ext = args.pc_bbox_half_extent
+                    if isinstance(bbox_ext, list) and len(bbox_ext) == 1:
+                        bbox_ext = bbox_ext[0]
+                    pc_generator = PointCloudGenerator(
+                        env=env, 
+                        camera_name="front", 
+                        max_points=args.pc_points, 
+                        bbox_half_extent=bbox_ext,
+                        bbox_crop_mode=args.pc_bbox_crop_mode
+                    )
 
                 # Perform the rollouts
                 print(f"Starting rollout of run: {run.name}")
@@ -521,7 +553,7 @@ if __name__ == "__main__":
                     break_on_n_success=args.break_on_n_success,
                     stop_after_n_success=args.stop_after_n_success,
                     record_first_state_only=args.record_for_coverage,
-                    pc_generator=pc_generator if args.save_pc_for_dp3 else None,
+                    pc_generator=pc_generator,
                 )
 
                 if args.store_video_wandb:

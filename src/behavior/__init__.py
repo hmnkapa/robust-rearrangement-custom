@@ -8,7 +8,7 @@ def get_actor(cfg: DictConfig, device) -> Actor:
     actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
     obs_type = cfg.observation_type
 
-    assert obs_type in ["image", "state"], f"Invalid observation type: {obs_type}"
+    assert obs_type in ["image", "state", "point_cloud"], f"Invalid observation type: {obs_type}"
 
     if actor_name == "mlp":
 
@@ -42,4 +42,13 @@ def get_actor(cfg: DictConfig, device) -> Actor:
             cfg=cfg,
             device=device,
         )
+    
+    elif actor_name == "dp3":
+        from src.behavior.dp3 import DP3Actor
+        
+        return DP3Actor(
+            cfg=cfg,
+            device=device,
+        )
+    
     raise ValueError(f"Unknown actor type: {cfg.actor}")

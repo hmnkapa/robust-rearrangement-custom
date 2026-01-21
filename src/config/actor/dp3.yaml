@@ -1,0 +1,8 @@
+name: dp3
+checkpoint_path: ???
+point_cloud_points: 1024
+obs_horizon: 2
+pred_horizon: 16
+action_horizon: 8
+predict_past_actions: False
+flatten_obs: False

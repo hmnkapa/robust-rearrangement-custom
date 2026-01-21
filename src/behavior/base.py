@@ -129,6 +129,11 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             self.robot_state_dim = cfg.robot_state_dim
             self.parts_poses_dim = cfg.parts_poses_dim
             self.timestep_obs_dim = cfg.robot_state_dim + cfg.parts_poses_dim
+        elif self.observation_type == "point_cloud":
+            # Point cloud observation type - will be handled by specific actor implementations
+            # Set default values that can be overridden
+            self.robot_state_dim = getattr(cfg, 'robot_state_dim', 14)
+            self.timestep_obs_dim = self.robot_state_dim  # Will be updated by DP3Actor
         else:
             raise ValueError(f"Invalid observation type: {self.observation_type}")
 

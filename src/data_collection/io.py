@@ -30,6 +30,10 @@ def save_raw_rollout(
 ):
     observations: List[Observation] = list()
 
+    # If pcs is None, create a list of Nones with the same length as robot_states
+    if pcs is None:
+        pcs = [None] * len(robot_states)
+
     for robot_state, image1, image2, parts_pose, pc in zip(
         robot_states, imgs1, imgs2, parts_poses, pcs
     ):
@@ -45,9 +49,10 @@ def save_raw_rollout(
 
     if action_type == "pos":
 
-        assert actions.shape[1] == 10
-        # If we've used rot_6d convert to quat
-        actions = np_action_6d_to_quat(actions)
+        if actions.shape[1] == 10:
+            # If we've used rot_6d convert to quat
+            actions = np_action_6d_to_quat(actions)
+        
         assert actions.shape[1] == 8
 
         # Get the action quat

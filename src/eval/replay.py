@@ -214,6 +214,7 @@ def main(argv=None):
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--randomness", type=str, default="low")
+    parser.add_argument("--action-src", type=str, default="pos", choices=["pos", "action"], help="Source of action for replay: 'pos' (compute from observations) or 'action' (use recorded actions)")
     parser.add_argument("--max-env-steps", type=int, default=5000)
     parser.add_argument("--act-rot-repr", type=str, default="quat", choices=["quat","rot_6d","axis"])  # pos control uses quat here
     parser.add_argument("--record", action="store_true", help="Save replay videos to local sim_replay folder")
@@ -240,7 +241,17 @@ def main(argv=None):
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
+    # Load pickle
+    pkl_path = Path(args.pickle_path)
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+
     # Create RL env with pos control (diffik ctrl by default)
+    if args.action_src == "action":
+        action_type = "delta"
+        # action_type = data["action_type"]
+    else:
+        action_type = "pos"
     with suppress_all_output(False):
         env = get_rl_env(
             gpu_id=args.gpu,
@@ -250,7 +261,7 @@ def main(argv=None):
             max_env_steps=args.max_env_steps,
             observation_space="image",  # will be ignored for reset_to if state dict provided
             act_rot_repr=args.act_rot_repr,
-            action_type="pos",
+            action_type=action_type,
             april_tags=False,
             verbose=False,
             headless=not args.visualize and args.headless,
@@ -272,11 +283,6 @@ def main(argv=None):
         run_debug_action(env=env, device=device, args=args)
         return
 
-    # Load pickle
-    pkl_path = Path(args.pickle_path)
-    with open(pkl_path, "rb") as f:
-        data = pickle.load(f)
-
     observations: List[dict] = data["observations"]
     actions: List[List[float]] = data["actions"]  # kept for length reference only
 
@@ -297,21 +303,38 @@ def main(argv=None):
     # We step from obs[0] to obs[-1], using obs[t] as target pose at step t
     last_done = None
     for t in range(5, len(observations)):
-        obs = observations[t]
-        rs = obs.get("robot_state")
-        if not isinstance(rs, dict):
-            raise RuntimeError("Expected robot_state dict in observations for pos control replay")
-        # Extract ee_pos (3,) and ee_quat (4,) from stored robot_state
-        ee_pos = rs["ee_pos"] if not isinstance(rs["ee_pos"], list) else np.asarray(rs["ee_pos"], dtype=np.float32)
-        ee_quat = rs["ee_quat"] if not isinstance(rs["ee_quat"], list) else np.asarray(rs["ee_quat"], dtype=np.float32)
-        ee_pos = np.asarray(ee_pos, dtype=np.float32).reshape(-1)
-        ee_quat = np.asarray(ee_quat, dtype=np.float32).reshape(-1)
-        # Infer gripper action from gripper_width: open (+1) if width increased, else close (-1).
-        gw = rs.get("gripper_width", 0.0)
-        gw = float(np.asarray(gw).reshape(-1)[0]) if isinstance(gw, (np.ndarray, list)) else float(gw)
-        # Normalize gw from [0, 0.065] to [-1, 1]
-        grip = -1 * (2 * (gw / 0.065) - 1)
-        pos_action = np.concatenate([ee_pos, ee_quat, np.array([grip], dtype=np.float32)], axis=0)
+        if t < len(actions):
+            formatted_action = [f"{x:.3f}" for x in actions[t]]
+            print(f"[DEBUG] Step {t}: Original Action in Pickle: {formatted_action}")
+
+        if args.action_src == "action":
+            # Use the recorded action directly
+            if t >= len(actions):
+                print(f"[INFO] Reached end of recorded actions at step {t}")
+                break
+            # Ensure action is float32 numpy array
+            pos_action = np.array(actions[t], dtype=np.float32)
+            
+            # If explicit action is used, we might want to ensure gripper is handled correctly if it wasn't in the action?
+            # Assuming action in pickle is the full action required by environment.
+            
+        else:
+            # Default "pos": Compute action from observation (force state)
+            obs = observations[t]
+            rs = obs.get("robot_state")
+            if not isinstance(rs, dict):
+                raise RuntimeError("Expected robot_state dict in observations for pos control replay")
+            # Extract ee_pos (3,) and ee_quat (4,) from stored robot_state
+            ee_pos = rs["ee_pos"] if not isinstance(rs["ee_pos"], list) else np.asarray(rs["ee_pos"], dtype=np.float32)
+            ee_quat = rs["ee_quat"] if not isinstance(rs["ee_quat"], list) else np.asarray(rs["ee_quat"], dtype=np.float32)
+            ee_pos = np.asarray(ee_pos, dtype=np.float32).reshape(-1)
+            ee_quat = np.asarray(ee_quat, dtype=np.float32).reshape(-1)
+            # Infer gripper action from gripper_width: open (-1) if width increased, else close (+1).
+            gw = rs.get("gripper_width", 0.0)
+            gw = float(np.asarray(gw).reshape(-1)[0]) if isinstance(gw, (np.ndarray, list)) else float(gw)
+            # Normalize gw from [0, 0.065] to [-1, 1]
+            grip = -1 * (2 * (gw / 0.065) - 1)
+            pos_action = np.concatenate([ee_pos, ee_quat, np.array([grip], dtype=np.float32)], axis=0)
 
         ac_t = _to_tensor_action(pos_action, num_envs=args.num_envs, device=device)
         # Step the env (pos control) and record images from the step output
@@ -337,7 +360,7 @@ def main(argv=None):
             if isinstance(step_obs, dict) and "color_image2" in step_obs:
                 front_img = np.array(step_obs["color_image2"][0].cpu())
             if front_img is not None and args.visualize_axis:
-                front_img = render_world_axes(env, front_img, origin=np.array([-0.1, -0.1, 0.4], dtype=np.float32), length=0.1)
+                front_img = render_world_axes(env, front_img, origin=np.array([-0.1, -0.1, 0.5], dtype=np.float32), length=0.1)
             # Append frames
             if isinstance(step_obs, dict):
                 if "color_image1" in step_obs:

@@ -11,6 +11,7 @@ artifacts/
 *.pt
 *.pth
 training-artifacts/
+checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

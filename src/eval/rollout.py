@@ -179,6 +179,10 @@ def rollout(
     point_clouds = []  # List of lists: [[env0_step0, env1_step0, ...], [env0_step1, ...]]
     if pc_generator is not None:
         pcs_step = pc_generator.generate_transformed_cropped_point_cloud_for_all_env()
+        # Add point cloud to obs for actor
+        if len(pcs_step) > 0:
+            obs["point_cloud"] = torch.stack(pcs_step)
+            
         pcs_step_np = []
         for env_idx, pc in enumerate(pcs_step):
             pc_np = pc.detach().cpu().numpy()
@@ -195,14 +199,26 @@ def rollout(
 
     while not done.all():
         # Convert from robot state dict to robot state tensor
-        obs["robot_state"] = env.filter_and_concat_robot_state(obs["robot_state"])
+        if not getattr(actor, "expects_raw_robot_state", False):
+            obs["robot_state"] = env.filter_and_concat_robot_state(obs["robot_state"])
 
         # Get the next actions from the actor
         action_pred = actor.action(obs)
+        
+        # print("[DEBUG] action: ", action_pred)
+        # print("[DEBUG] gripper action: ", action_pred[:, 7])
         # action_pred = torch.tensor(actions[step_idx], device="cuda").unsqueeze(0)
         # action_pred = actor.normalizer(action_pred, "action", forward=False)
 
         obs, reward, done, _ = env.step(action_pred, sample_perturbations=False)
+        
+        # Generate point clouds for the new observation
+        if pc_generator is not None:
+            pcs_step = pc_generator.generate_transformed_cropped_point_cloud_for_all_env()
+            if len(pcs_step) > 0:
+                obs["point_cloud"] = torch.stack(pcs_step)
+        else:
+            pcs_step = None
 
         video_obs = deepcopy(obs)
 
@@ -228,8 +244,7 @@ def rollout(
             parts_poses.append(video_obs["parts_poses"].cpu())
 
             # Collect point clouds at each step
-            if pc_generator is not None:
-                pcs_step = pc_generator.generate_transformed_cropped_point_cloud_for_all_env()
+            if pcs_step is not None:
                 pcs_step_np = []
                 for env_idx, pc in enumerate(pcs_step):
                     pc_np = pc.detach().cpu().numpy()
