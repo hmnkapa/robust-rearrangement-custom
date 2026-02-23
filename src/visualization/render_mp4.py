@@ -170,6 +170,30 @@ def create_in_memory_mp4(np_images, fps=10):
     output.seek(0)
     return output
 
+def depth2heatmap(depth_images):
+    heatmap_frames = []
+    
+    for img in depth_images:
+        if torch.is_tensor(img):
+            img = img.detach().cpu().numpy()
+        
+        img = np.nan_to_num(img)
+
+        img_min, img_max = img.min(), img.max()
+        if img_max - img_min > 1e-5:
+            img_norm = (img - img_min) / (img_max - img_min) * 255
+        else:
+            img_norm = np.zeros_like(img)
+        
+        img_uint8 = img_norm.astype(np.uint8)
+
+        # cv2 generates BGR, videos need RGB
+        color_map = cv2.applyColorMap(img_uint8, cv2.COLORMAP_VIRIDIS)
+        color_map_rgb = cv2.cvtColor(color_map, cv2.COLOR_BGR2RGB)
+        
+        heatmap_frames.append(color_map_rgb)
+        
+    return heatmap_frames
 
 def render_mp4(ims1, ims2, filename=None):
     # Initialize plot with two subplots

@@ -51,6 +51,8 @@ RolloutSaveValues = collections.namedtuple(
         "rewards",
         "parts_poses",
         "point_clouds",
+        "depth_image1",
+        "depth_image2",
     ],
 )
 
@@ -61,6 +63,13 @@ def resize_image(obs, key):
     except KeyError:
         pass
 
+def resize_depth(obs, key):
+    # key : [B, H, W]
+    depth_image = obs[key].unsqueeze(-1) # [B, H, W, C]
+    try:
+        obs[key] = resize(depth_image).squeeze(-1)
+    except KeyError:
+        pass
 
 def resize_crop_image(obs, key):
     try:
@@ -68,6 +77,13 @@ def resize_crop_image(obs, key):
     except KeyError:
         pass
 
+def resize_crop_depth(obs, key):
+    # key : [B, H, W]
+    depth_image = obs[key].unsqueeze(-1) # [B, H, W, C]
+    try:
+        obs[key] = resize_crop(depth_image).squeeze(-1)
+    except KeyError:
+        pass
 
 def squeeze_and_numpy(d: Dict[str, Union[torch.Tensor, np.ndarray, float, int, None]]):
     """
@@ -161,15 +177,22 @@ def rollout(
     # Resize the images in the observation if they exist
     resize_image(obs, "color_image1")
     resize_crop_image(obs, "color_image2")
+    # Resize the depth image
+    resize_depth(obs, "depth_image1")
+    resize_crop_depth(obs, "depth_image2")
 
     if resize_video:
         resize_image(video_obs, "color_image1")
         resize_crop_image(video_obs, "color_image2")
+        resize_depth(video_obs, "depth_image1")
+        resize_crop_depth(video_obs, "depth_image2")
 
     # save initial visualization and rewards
     robot_states = [TensorDict(video_obs["robot_state"], batch_size=env.num_envs)]
     imgs1 = [] if "color_image1" not in video_obs else [video_obs["color_image1"].cpu()]
     imgs2 = [] if "color_image2" not in video_obs else [video_obs["color_image2"].cpu()]
+    depth_image1 = [] if "depth_image1" not in video_obs else [video_obs["depth_image1"]]
+    depth_image2 = [] if "depth_image2" not in video_obs else [video_obs["depth_image2"]]
     parts_poses = [video_obs["parts_poses"].cpu()]
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
@@ -211,7 +234,7 @@ def rollout(
         # action_pred = actor.normalizer(action_pred, "action", forward=False)
 
         obs, reward, done, _ = env.step(action_pred, sample_perturbations=False)
-        
+
         # Generate point clouds for the new observation
         if pc_generator is not None:
             pcs_step = pc_generator.generate_transformed_cropped_point_cloud_for_all_env()
@@ -225,11 +248,15 @@ def rollout(
         # Resize the images in the observation if they exist
         resize_image(obs, "color_image1")
         resize_crop_image(obs, "color_image2")
+        resize_depth(obs, "depth_image1")
+        resize_crop_depth(obs, "depth_image2")
 
         # Save observations for the policy
         if resize_video:
             resize_image(video_obs, "color_image1")
             resize_crop_image(video_obs, "color_image2")
+            resize_depth(video_obs, "depth_image1")
+            resize_crop_depth(video_obs, "depth_image2")
 
         # Store the results for visualization and logging
         if save_rollouts:
@@ -240,6 +267,10 @@ def rollout(
                 imgs1.append(video_obs["color_image1"].cpu())
             if "color_image2" in video_obs:
                 imgs2.append(video_obs["color_image2"].cpu())
+            if "depth_image1" in video_obs:
+                depth_image1.append(video_obs["depth_image1"])
+            if "depth_image2" in video_obs:
+                depth_image2.append(video_obs["depth_image2"])
             actions.append(action_pred.cpu())
             parts_poses.append(video_obs["parts_poses"].cpu())
 
@@ -283,6 +314,12 @@ def rollout(
     else:
         pcs_per_env = None
 
+    # print(f"[DEBUG] imgs1 shape: {(torch.stack(imgs1, dim=1) if imgs1 else []).shape}", flush=True)
+    # print(f"[DEBUG] imgs2 shape: {(torch.stack(imgs2, dim=1) if imgs2 else []).shape}", flush=True)
+    # print(f"[DEBUG] depth_image2 shape: {(torch.stack(depth_image2, dim=1) if depth_image2 else []).shape}", flush=True)
+    # for i, t in enumerate(depth_image2):
+    #     print(f"Index {i} device: {t.device}")
+
     return RolloutSaveValues(
         torch.stack(robot_states, dim=1) if robot_states else [],
         torch.stack(imgs1, dim=1) if imgs1 else [],
@@ -291,6 +328,8 @@ def rollout(
         rewards,
         torch.stack(parts_poses, dim=1) if parts_poses else [],
         pcs_per_env,
+        torch.stack(depth_image1, dim=1) if depth_image1 else [],
+        torch.stack(depth_image2, dim=1) if depth_image2 else [],
     )
 
 
@@ -369,6 +408,7 @@ def calculate_success_rate(
         # Save the results from the rollout immediately
         if save_rollouts:
             have_img_obs = rollout_data.imgs1 is not None and len(rollout_data.imgs1) > 0
+            have_depth_obs = rollout_data.depth_image1 is not None and len(rollout_data.depth_image1) > 0
 
             for env_idx in range(env.num_envs):
                 robot_states = tensordict_to_list_of_dicts(rollout_data.robot_states[env_idx])
@@ -400,6 +440,16 @@ def calculate_success_rate(
                 video2 = (
                     rollout_data.imgs2[env_idx].numpy()
                     if have_img_obs
+                    else np.zeros((len(robot_states), 2, 2, 3), dtype=np.uint8)
+                )
+                depth_video1 = (
+                    rollout_data.depth_image1[env_idx].cpu().numpy()
+                    if have_depth_obs
+                    else np.zeros((len(robot_states), 2, 2, 3), dtype=np.uint8)
+                )
+                depth_video2 = (
+                    rollout_data.depth_image2[env_idx].cpu().numpy()
+                    if have_depth_obs
                     else np.zeros((len(robot_states), 2, 2, 3), dtype=np.uint8)
                 )
 
@@ -436,6 +486,8 @@ def calculate_success_rate(
                         robot_states=robot_states[trim_start_steps : n_steps + 1],
                         imgs1=video1[trim_start_steps : n_steps + 1],
                         imgs2=video2[trim_start_steps : n_steps + 1],
+                        depth_image1=depth_video1[trim_start_steps : n_steps + 1],
+                        depth_image2=depth_video2[trim_start_steps : n_steps + 1],
                         parts_poses=parts_poses[trim_start_steps : n_steps + 1],
                         actions=actions[trim_start_steps:n_steps],
                         rewards=rewards[trim_start_steps:n_steps],
@@ -445,6 +497,7 @@ def calculate_success_rate(
                         rollout_save_dir=rollout_save_dir,
                         compress_pickles=compress_pickles,
                         have_img_obs=have_img_obs,
+                        have_depth_obs=have_depth_obs,
                         pcs=pcs_trimmed,
                     )
 
