@@ -19,10 +19,27 @@ from src.models.vit import vit_base_patch16
 # https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/model/vision/model_getter.py
 def get_resnet(model_name, weights=None, **kwargs):
     """
+    model_name: resnet18, resnet18_rgbd and so on
     size: 18, 34, 50
     """
+    in_channels = 3
+    if model_name.endswith("rgbd"):
+        weights = None
+        model_name = model_name.split('_')[0]
+        in_channels = 4
+
     func = getattr(torchvision.models, model_name)
     resnet = func(weights=weights, **kwargs)
+    original_conv = resnet.conv1
+
+    resnet.conv1 = torch.nn.Conv2d(
+        in_channels,
+        original_conv.out_channels,
+        kernel_size=original_conv.kernel_size,
+        stride=original_conv.stride,
+        padding=original_conv.padding,
+        bias=original_conv.bias
+    )
     resnet.encoding_dim = resnet.fc.in_features
     resnet.fc = torch.nn.Identity()
     return resnet
@@ -104,14 +121,23 @@ class ResnetEncoder(VisionEncoder):
         **kwargs,
     ) -> None:
         super().__init__()
-        assert model_name in ["resnet18", "resnet34", "resnet50"]
+        assert model_name in ["resnet18", "resnet34", "resnet50", "resnet18_rgbd", "resnet34_rgbd", "resnet50_rgbd"]
         assert not freeze or pretrained, "If not pretrained, then freeze must be False"
         print(f"Loading resnet, pretrained={pretrained}")
 
-        weights = "IMAGENET1K_V1" if pretrained else None
+        self.is_rgbd = model_name.endswith("rgbd")
+        weights = "IMAGENET1K_V1" if (pretrained and not self.is_rgbd) else None
 
         self.model = get_resnet(model_name=model_name, weights=weights)
         self.encoding_dim = self.model.encoding_dim
+
+        if self.is_rgbd:
+            self.normalize_rgb = torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )
+            self.normalize_depth = torchvision.transforms.Normalize(
+                mean=[-1.0], std=[0.5] # based on the distribution of depth values
+            )
 
         if use_groupnorm:
             self.model = replace_submodules(
@@ -127,11 +153,29 @@ class ResnetEncoder(VisionEncoder):
         if freeze:
             self.freeze()
 
-    # Expect input to be a batch of images of shape (batch_size, 3, 224, 224) in range [0, 255]
+    # Expect input to be a batch of images of shape (batch_size, 3, 224, 224) in range [0, 1]
+    # or RGBD images of shape (batch_size, 4, 224, 224)
+    # Depth values are negative and in range [-2.0, 0]
     def forward(self, x):
-        # Normalize images
-        x = x / 255.0
-        x = self.normalize(x)
+        # Debug: don't normalize images
+        # x = x / 255.0
+
+        # print(f'RGB Images: {x[0, :3, ...]}', flush=True)
+        # print(f'Depth Images: {x[0, -1:, ...]}', flush=True)
+        if self.is_rgbd:
+            rgb = x[:, :3, :, :]
+            depth = x[:, 3:, :, :]
+            # print(f"RGB - Max: {rgb.max()}, Min: {rgb.min()}, Mean: {rgb.mean()}", flush=True)
+            # print(f"Depth - Max: {depth.max()}, Min: {depth.min()}, Mean: {depth.mean()}", flush=True)
+            
+            rgb = self.normalize_rgb(rgb)
+            depth = torch.clamp(depth, min=-2.0, max=0.0)
+            depth = self.normalize_depth(depth)
+            
+            x = torch.cat([rgb, depth], dim=1)
+        else:
+            x = self.normalize(x)
+
         x = self.model(x)
         return x
 

@@ -42,7 +42,7 @@ def initialize_zarr_store(out_path, full_data_shapes, chunksize=32):
 
     # Initialize datasets with full shapes
     for name, shape, dtype in full_data_shapes:
-        if "color_image" in name:  # Apply compression to image data
+        if "image" in name:  # Apply compression to image data
             z.create_dataset(
                 name,
                 shape=shape,
@@ -98,10 +98,16 @@ def process_pickle_file(
     # Extract the observations from the pickle file and convert to 6D rotation
     color_image1 = np.array([o["color_image1"] for o in obs], dtype=np.uint8)
     color_image2 = np.array([o["color_image2"] for o in obs], dtype=np.uint8)
+    depth_image1 = np.array([o["depth_image1"] for o in obs], dtype=np.float32)
+    depth_image2 = np.array([o["depth_image2"] for o in obs], dtype=np.float32)
 
     assert (
         color_image1.shape == color_image2.shape
     ), "Color images have different shapes"
+
+    assert (
+        depth_image1.shape == depth_image2.shape
+    ), "Depth images have different shapes"
 
     if resize_image:
         if color_image1.shape[1:] != (240, 320, 3):
@@ -171,6 +177,7 @@ def process_pickle_file(
         if "rewards" in data
         else np.zeros(len(action_delta_6d))
     )
+    reward = reward[:len(action_delta_6d)]
     skill = (
         np.array(data["skills"], dtype=np.float32)
         if "skills" in data
@@ -185,6 +192,10 @@ def process_pickle_file(
         action_delta_6d
     ), f"Mismatch in {pickle_path}, lengths differ by {len(robot_state_6d) - len(action_delta_6d)}"
 
+    assert len(reward) == len(
+        action_delta_6d
+    ), f"Reward mismatch in {pickle_path}, lengths differ by {len(reward) - len(action_delta_6d)}"
+
     # Extract the pickle file name as the path after `raw` in the path
     pickle_file = "/".join(pickle_path.parts[pickle_path.parts.index("raw") + 1 :])
 
@@ -194,6 +205,8 @@ def process_pickle_file(
         "robot_state": robot_state_6d,
         "color_image1": color_image1,
         "color_image2": color_image2,
+        "depth_image1": depth_image1,
+        "depth_image2": depth_image2,
         "action/delta": action_delta_6d,
         "action/pos": action_pos_6d,
         "reward": reward,
@@ -224,6 +237,8 @@ def parallel_process_pickle_files(
         "robot_state": [],
         "color_image1": [],
         "color_image2": [],
+        "depth_image1": [],
+        "depth_image2": [],
         "action/delta": [],
         "action/pos": [],
         "reward": [],
@@ -281,6 +296,8 @@ def parallel_process_pickle_files(
             "robot_state",
             "color_image1",
             "color_image2",
+            "depth_image1",
+            "depth_image2",
             "action/delta",
             "action/pos",
             "reward",
@@ -378,6 +395,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-size", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--resize-image", action="store_true", help="Resize images to standard dimensions (240x320x3)")
+    parser.add_argument("--input-dir", type=str, help="Path to the directory containing pkl files", default=None)
+    parser.add_argument("--output-dir", type=str, help="Path to save the zarr file", default=None)
     args = parser.parse_args()
 
     assert not args.randomize_order or args.offset == 0, "Cannot offset with randomize"
@@ -514,6 +533,8 @@ if __name__ == "__main__":
             ("robot_state", (total_timesteps,) + sample_data["robot_state"].shape[1:], np.float32),
             ("color_image1", (total_timesteps,) + sample_data["color_image1"].shape[1:], np.uint8),
             ("color_image2", (total_timesteps,) + sample_data["color_image2"].shape[1:], np.uint8),
+            ("depth_image1", (total_timesteps,) + sample_data["depth_image1"].shape[1:], np.float32),
+            ("depth_image2", (total_timesteps,) + sample_data["depth_image2"].shape[1:], np.float32),
             ("action/delta", (total_timesteps,) + sample_data["action/delta"].shape[1:], np.float32),
             ("action/pos", (total_timesteps,) + sample_data["action/pos"].shape[1:], np.float32),
             ("parts_poses", (total_timesteps,) + sample_data["parts_poses"].shape[1:], np.float32),
@@ -554,6 +575,8 @@ if __name__ == "__main__":
                 "robot_state": [],
                 "color_image1": [],
                 "color_image2": [],
+                "depth_image1": [],
+                "depth_image2": [],
                 "action/delta": [],
                 "action/pos": [],
                 "reward": [],
@@ -629,6 +652,8 @@ if __name__ == "__main__":
         ("robot_state", all_data["robot_state"].shape, np.float32),
         ("color_image1", all_data["color_image1"].shape, np.uint8),
         ("color_image2", all_data["color_image2"].shape, np.uint8),
+        ("depth_image1", all_data["depth_image1"].shape, np.float32),
+        ("depth_image2", all_data["depth_image2"].shape, np.float32),
         ("action/delta", all_data["action/delta"].shape, np.float32),
         ("action/pos", all_data["action/pos"].shape, np.float32),
         ("parts_poses", all_data["parts_poses"].shape, np.float32),

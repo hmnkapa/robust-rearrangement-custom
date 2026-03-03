@@ -1,0 +1,5 @@
+# @package _global_
+defaults:
+  - rgbd/base
+  - override /actor: diffusion
+  - override /actor/diffusion_model: unet

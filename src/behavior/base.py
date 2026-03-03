@@ -2,6 +2,7 @@ import random
 from typing import Dict, Tuple, Union
 from collections import deque
 from omegaconf import DictConfig, OmegaConf
+from torchvision import transforms
 from src.models.utils import PrintParamCountMixin
 from src.models.vib import VIB
 from src.models.vision import VisionEncoder
@@ -98,7 +99,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         self.action_type = cfg.control.control_mode
 
         # Convert the stats to tensors on the device
-        if self.observation_type == "image":
+        if self.observation_type == "image" or self.observation_type == "rgbd":
             self._initiate_image_encoder(cfg)
 
             self.feature_noise = cfg.regularization.get("feature_noise", None)
@@ -485,6 +486,80 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
             # Images now have the channels first
             assert image1.shape[-3:] == (3, 240, 320)
+
+            # Reshape the images to (B * obs_horizon, C, H, W) for the encoder
+            image1 = image1.reshape(B * self.obs_horizon, *image1.shape[-3:])
+            image2 = image2.reshape(B * self.obs_horizon, *image2.shape[-3:])
+
+            # DONE: fix type error: int8 to float32
+            # DONE: fix value error: [0, 255] to [0, 1]
+            image1 = image1.float() / 255.0
+            image2 = image2.float() / 255.0
+            # Apply the transforms to resize the images to 224x224, (B * obs_horizon, C, 224, 224)
+            # Since we're in training mode, the transform also performs augmentation
+            image1: torch.Tensor = self.camera1_transform(image1)
+            image2: torch.Tensor = self.camera2_transform(image2)
+
+            # Encode images and reshape back to (B, obs_horizon, encoding_dim)
+            feature1 = self.encoder1_proj(self.encoder1(image1)).reshape(
+                B, self.obs_horizon, self.encoding_dim
+            )
+            feature2 = self.encoder2_proj(self.encoder2(image2)).reshape(
+                B, self.obs_horizon, self.encoding_dim
+            )
+
+            # Apply the regularization to the features
+            feature1, feature2 = self.regularize_features(feature1, feature2)
+
+            if self.feature_layernorm:
+                feature1 = self.layernorm1(feature1)
+                feature2 = self.layernorm2(feature2)
+
+            if self.camera_2_vib is not None:
+                feature2, mu, log_var = self.camera_2_vib.train_sample(feature2)
+
+                # Store the mu and log_var for the loss computation later
+                batch["mu"] = mu
+                batch["log_var"] = log_var
+
+            if self.confusion_loss_beta > 0:
+                # Apply the confusion loss to the front camera features
+                confusion_loss = self.confusion_loss(batch, feature1, feature2)
+                batch["confusion_loss"] = confusion_loss
+
+            # Combine the robot_state and image features, (B, obs_horizon, obs_dim)
+            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+
+        elif self.observation_type == "rgbd":
+            # The robot state is already normalized in the dataset
+            nrobot_state = batch["robot_state"]
+            B = nrobot_state.shape[0]
+
+            image1: torch.Tensor = batch["color_image1"]
+            image2: torch.Tensor = batch["color_image2"]
+            depth1: torch.Tensor = batch["depth_image1"]
+            depth2: torch.Tensor = batch["depth_image2"]
+            # print(f'image1: {image1[1]}', flush=True)
+            # print(f'image2: {image2[1]}', flush=True)
+            # print(f'depth1: {depth1[1]}', flush=True)
+            # print(f'depth2: {depth2[1]}', flush=True)
+            # print(f"RGB1 - Max: {image1[3].max()}, Min: {image1[3].min()}, Mean: {image1[3].float().mean()}", flush=True)
+            # print(f"Depth1 - Max: {depth1[3].max()}, Min: {depth1[3].min()}, Mean: {depth1[3].mean()}", flush=True)
+            # print(f"RGB2 - Max: {image2[3].max()}, Min: {image2[3].min()}, Mean: {image2[3].float().mean()}", flush=True)
+            # print(f"Depth2 - Max: {depth2[3].max()}, Min: {depth2[3].min()}, Mean: {depth2[3].mean()}", flush=True)
+            # assert 1 == 0
+
+            # Images now have the channels first
+            assert image1.shape[-3:] == (3, 240, 320)
+            assert depth1.shape[-3:] == (1, 240, 320)
+            # print(f'image1.shape: {image1.shape}', flush=True)
+            # print(f'image2.shape: {image2.shape}', flush=True)
+            # print(f'depth1.shape: {depth1.shape}', flush=True)
+            # print(f'depth2.shape: {depth2.shape}', flush=True)
+            image1 = image1.float() / 255.0
+            image2 = image2.float() / 255.0
+            image1 = torch.cat([image1, depth1], dim=-3)
+            image2 = torch.cat([image2, depth2], dim=-3)
 
             # Reshape the images to (B * obs_horizon, C, H, W) for the encoder
             image1 = image1.reshape(B * self.obs_horizon, *image1.shape[-3:])

@@ -1,0 +1,5 @@
+model: resnet18_rgbd
+freeze: false
+pretrained: false
+backbone: resnet18
+use_groupnorm: true
