@@ -139,6 +139,6 @@ def save_raw_rollout(
 
         # Write files
         with open(dep1_path, "wb") as f1:
-            f1.write(mp4_dep1.getvalue() if hasattr(mp4_dep1, "getvalue") else mp4_dep2)
+            f1.write(mp4_dep1.getvalue() if hasattr(mp4_dep1, "getvalue") else mp4_dep1)
         with open(dep2_path, "wb") as f2:
             f2.write(mp4_dep2.getvalue() if hasattr(mp4_dep2, "getvalue") else mp4_dep2)

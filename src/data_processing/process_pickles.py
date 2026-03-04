@@ -98,8 +98,18 @@ def process_pickle_file(
     # Extract the observations from the pickle file and convert to 6D rotation
     color_image1 = np.array([o["color_image1"] for o in obs], dtype=np.uint8)
     color_image2 = np.array([o["color_image2"] for o in obs], dtype=np.uint8)
-    depth_image1 = np.array([o["depth_image1"] for o in obs], dtype=np.float32)
-    depth_image2 = np.array([o["depth_image2"] for o in obs], dtype=np.float32)
+
+    # Backward compatibility: older pickles may not include depth images.
+    sample_depth1 = obs[0].get("depth_image1", None)
+    sample_depth2 = obs[0].get("depth_image2", None)
+    default_depth_shape = color_image1.shape[1:3]
+    if sample_depth1 is not None and sample_depth2 is not None:
+        depth_image1 = np.array([o["depth_image1"] for o in obs], dtype=np.float32)
+        depth_image2 = np.array([o["depth_image2"] for o in obs], dtype=np.float32)
+    else:
+        print(f"[WARN] Missing depth images in {pickle_path}, filling zeros for depth_image1/2.")
+        depth_image1 = np.zeros((len(obs),) + default_depth_shape, dtype=np.float32)
+        depth_image2 = np.zeros((len(obs),) + default_depth_shape, dtype=np.float32)
 
     assert (
         color_image1.shape == color_image2.shape
@@ -401,17 +411,24 @@ if __name__ == "__main__":
 
     assert not args.randomize_order or args.offset == 0, "Cannot offset with randomize"
 
-    pickle_paths: List[Path] = sorted(
-        get_raw_paths(
-            controller=args.controller,
-            domain=args.domain,
-            task=args.task,
-            demo_source=args.source,
-            randomness=args.randomness,
-            demo_outcome=args.demo_outcome,
-            suffix=args.suffix,
+    if args.input_dir is not None:
+        input_dir = Path(args.input_dir).expanduser().resolve()
+        if not input_dir.exists():
+            raise ValueError(f"Input directory does not exist: {input_dir}")
+        pickle_paths: List[Path] = sorted(input_dir.rglob("*.pkl*"))
+        print(f"Using explicit input directory: {input_dir}")
+    else:
+        pickle_paths = sorted(
+            get_raw_paths(
+                controller=args.controller,
+                domain=args.domain,
+                task=args.task,
+                demo_source=args.source,
+                randomness=args.randomness,
+                demo_outcome=args.demo_outcome,
+                suffix=args.suffix,
+            )
         )
-    )
 
     # Output the shape of the first pickle file
     total_files = len(pickle_paths)
@@ -451,15 +468,19 @@ if __name__ == "__main__":
 
     print(f"Found {len(pickle_paths)} pickle files")
 
-    output_path = get_processed_path(
-        controller=args.controller,
-        domain=args.domain,
-        task=args.task,
-        demo_source=args.source,
-        randomness=args.randomness,
-        demo_outcome=args.demo_outcome,
-        suffix=args.output_suffix,
-    )
+    if args.output_dir is not None:
+        output_path = Path(args.output_dir).expanduser().resolve()
+        print(f"Using explicit output path: {output_path}")
+    else:
+        output_path = get_processed_path(
+            controller=args.controller,
+            domain=args.domain,
+            task=args.task,
+            demo_source=args.source,
+            randomness=args.randomness,
+            demo_outcome=args.demo_outcome,
+            suffix=args.output_suffix,
+        )
 
     print(f"Output path: {output_path}")
 
@@ -467,6 +488,7 @@ if __name__ == "__main__":
         raise ValueError(
             f"Output path already exists: {output_path}. Use --overwrite to overwrite."
         )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Process all pickle files
     chunksize = args.chunk_size
