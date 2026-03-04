@@ -23,7 +23,7 @@ from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
 from src.dataset.dataloader import FixedStepsDataloader
-from src.dataset.dataset import ImageDataset, StateDataset
+from src.dataset.dataset import ImageDataset, StateDataset, RGBDDataset
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
 from src.gym import get_rl_env
@@ -201,6 +201,20 @@ def main(cfg: DictConfig):
             minority_class_power=cfg.data.get("minority_class_power", False),
             load_into_memory=cfg.data.get("load_into_memory", True),
         )
+    elif cfg.observation_type == "rgbd":
+        dataset = RGBDDataset(
+            dataset_paths=data_path,
+            pred_horizon=cfg.data.pred_horizon,
+            obs_horizon=cfg.data.obs_horizon,
+            action_horizon=cfg.data.action_horizon,
+            data_subset=cfg.data.data_subset,
+            control_mode=cfg.control.control_mode,
+            predict_past_actions=cfg.data.predict_past_actions,
+            pad_after=cfg.data.get("pad_after", True),
+            max_episode_count=cfg.data.get("max_episode_count", None),
+            minority_class_power=cfg.data.get("minority_class_power", False),
+            load_into_memory=cfg.data.get("load_into_memory", True),
+        )
     elif cfg.observation_type == "state":
         dataset = StateDataset(
             dataset_paths=data_path,
@@ -317,7 +331,7 @@ def main(cfg: DictConfig):
     optimizers = [("actor", opt_noise)]
     lr_schedulers = [lr_scheduler]
 
-    if cfg.observation_type == "image":
+    if cfg.observation_type == "image" or cfg.observation_type == "rgbd":
 
         opt_encoder = torch.optim.AdamW(
             params=actor.encoder_parameters(),
@@ -572,7 +586,7 @@ def main(cfg: DictConfig):
                 best_test_loss = test_loss_mean
                 save_path = str(model_save_dir / f"actor_chkpt_best_test_loss.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                # wandb.save(save_path)
 
             # Save the model if the success rate is the best so far
             if (
@@ -582,7 +596,7 @@ def main(cfg: DictConfig):
                 prev_best_success_rate = best_success_rate
                 save_path = str(model_save_dir / f"actor_chkpt_best_success_rate.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                # wandb.save(save_path)
 
             if (
                 cfg.training.checkpoint_interval > 0
@@ -590,7 +604,7 @@ def main(cfg: DictConfig):
             ):
                 save_path = str(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                # wandb.save(save_path)
 
             # Run diffusion sampling on a training batch
             if (
@@ -630,7 +644,7 @@ def main(cfg: DictConfig):
         if cfg.training.store_last_model:
             save_path = str(model_save_dir / f"actor_chkpt_last.pt")
             torch.save(save_dict, save_path)
-            wandb.save(save_path)
+            # wandb.save(save_path)
 
         # If switch is enabled, copy the the shadow to the model at the end of each epoch
         if cfg.training.ema.use and cfg.training.ema.switch:

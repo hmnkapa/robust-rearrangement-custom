@@ -280,6 +280,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
 
+    # params for RGBD
+    parser.add_argument("--save-depth-image", action="store_true", help="Enable depth images collection")
     # additional params for point cloud observation
     parser.add_argument("--save-pc-for-dp3", action="store_true", help="Enable point cloud generation and pickle export for DP3")
     parser.add_argument("--pc-points", type=int, default=4096, help="Downsampled point count for generated point clouds")
@@ -463,6 +465,9 @@ if __name__ == "__main__":
 
                 if args.save_pc_for_dp3:
                     suffix = f"pc/{args.pc_points}/{args.pc_downsample_mode}"
+
+                if args.save_depth_image:
+                    suffix = f"rgbd"
                 
                 save_dir = (
                     trajectory_save_dir(
@@ -492,14 +497,16 @@ if __name__ == "__main__":
                 if env is None:
                     # Prepare obs_keys with depth_image2 if needed for point cloud generation
                     env_obs_keys = None
-                    if args.save_pc_for_dp3 or actor_name == "dp3":
+                    if args.save_pc_for_dp3 or args.save_depth_image or actor_name == "dp3":
                         # Need to include depth_image2 for point cloud generation
                         from src.gym import FULL_OBS
                         env_obs_keys = list(FULL_OBS)
                         if args.observation_space == "state":
                             # Filter out color images but keep depth
                             env_obs_keys = [key for key in env_obs_keys if "color_image" not in key]
-                        # Ensure depth_image2 is included
+                        # Ensure depth_image is included
+                        if "depth_image1" not in env_obs_keys:
+                            env_obs_keys.append("depth_image1")
                         if "depth_image2" not in env_obs_keys:
                             env_obs_keys.append("depth_image2")
                     

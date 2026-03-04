@@ -8,7 +8,7 @@ def get_actor(cfg: DictConfig, device) -> Actor:
     actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
     obs_type = cfg.observation_type
 
-    assert obs_type in ["image", "state", "point_cloud"], f"Invalid observation type: {obs_type}"
+    assert obs_type in ["image", "state", "point_cloud", "rgbd"], f"Invalid observation type: {obs_type}"
 
     if actor_name == "mlp":
 

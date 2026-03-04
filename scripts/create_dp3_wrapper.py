@@ -14,7 +14,7 @@ def create_dp3_wrapper(dp3_ckpt_path, output_path):
         "actor": {
             "name": "dp3",
             "checkpoint_path": os.path.abspath(dp3_ckpt_path),
-            "point_cloud_points": 1024,
+            "point_cloud_points": 4096,
             "obs_horizon": 2,
             "pred_horizon": 16,
             "action_horizon": 8,

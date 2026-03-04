@@ -10,13 +10,15 @@ from src.common.types import Trajectory, Observation
 from src.common.geometry import np_action_6d_to_quat
 
 from ipdb import set_trace as bp
-from src.visualization.render_mp4 import create_in_memory_mp4
+from src.visualization.render_mp4 import create_in_memory_mp4, depth2heatmap
 
 
 def save_raw_rollout(
     robot_states: np.ndarray,
     imgs1: np.ndarray,
     imgs2: np.ndarray,
+    depth_image1: np.ndarray,
+    depth_image2: np.ndarray,
     actions: np.ndarray,
     rewards: np.ndarray,
     parts_poses: np.ndarray,
@@ -26,6 +28,7 @@ def save_raw_rollout(
     rollout_save_dir: Path,
     compress_pickles: bool = False,
     have_img_obs:  bool = False,
+    have_depth_obs: bool = False,
     pcs: List[np.ndarray] = None,
 ):
     observations: List[Observation] = list()
@@ -34,14 +37,16 @@ def save_raw_rollout(
     if pcs is None:
         pcs = [None] * len(robot_states)
 
-    for robot_state, image1, image2, parts_pose, pc in zip(
-        robot_states, imgs1, imgs2, parts_poses, pcs
+    for robot_state, image1, image2, depth1, depth2, parts_pose, pc in zip(
+        robot_states, imgs1, imgs2, depth_image1, depth_image2, parts_poses, pcs
     ):
         observations.append(
             {
                 "robot_state": robot_state,
                 "color_image1": image1,
                 "color_image2": image2,
+                "depth_image1": depth1,
+                "depth_image2": depth2,
                 "parts_poses": parts_pose,
                 "point_cloud": pc,
             }
@@ -114,3 +119,26 @@ def save_raw_rollout(
             f1.write(mp4_cam1.getvalue() if hasattr(mp4_cam1, "getvalue") else mp4_cam1)
         with open(cam2_path, "wb") as f2:
             f2.write(mp4_cam2.getvalue() if hasattr(mp4_cam2, "getvalue") else mp4_cam2)
+
+    # Additionally save depth videos as MP4 for video1 and video2
+    if have_depth_obs:
+        # Ensure output directory exists (with success/failure subdirectory)
+        status_dir = Path(rollout_save_dir) / ("success" if success else "failure")
+        status_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create MP4 bytes for each camera stream
+        depth1_heatmap_frames = depth2heatmap(depth_image1)
+        depth2_heatmap_frames = depth2heatmap(depth_image2)
+
+        mp4_dep1 = create_in_memory_mp4(depth1_heatmap_frames, fps=20)
+        mp4_dep2 = create_in_memory_mp4(depth2_heatmap_frames, fps=20)
+
+        # Build filenames
+        dep1_path = status_dir / f"{timestamp}_dep1.mp4"
+        dep2_path = status_dir / f"{timestamp}_dep2.mp4"
+
+        # Write files
+        with open(dep1_path, "wb") as f1:
+            f1.write(mp4_dep1.getvalue() if hasattr(mp4_dep1, "getvalue") else mp4_dep1)
+        with open(dep2_path, "wb") as f2:
+            f2.write(mp4_dep2.getvalue() if hasattr(mp4_dep2, "getvalue") else mp4_dep2)
