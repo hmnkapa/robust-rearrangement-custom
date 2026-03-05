@@ -170,30 +170,145 @@ def create_in_memory_mp4(np_images, fps=10):
     output.seek(0)
     return output
 
+def _depth_sequence_to_numpy(depth_images) -> np.ndarray:
+    if torch.is_tensor(depth_images):
+        depth_np = depth_images.detach().cpu().numpy()
+    else:
+        depth_np = np.asarray(
+            [
+                img.detach().cpu().numpy() if torch.is_tensor(img) else img
+                for img in depth_images
+            ]
+        )
+    if depth_np.ndim != 3:
+        raise ValueError(f"Expected depth sequence with shape [T,H,W], got {depth_np.shape}")
+    return depth_np.astype(np.float32, copy=False)
+
+
+def _prepare_depth_sequence(depth_images):
+    depth_np = _depth_sequence_to_numpy(depth_images)
+    finite = np.isfinite(depth_np)
+    finite_values = depth_np[finite]
+
+    if finite_values.size == 0:
+        depth_distance = np.zeros_like(depth_np, dtype=np.float32)
+        valid = np.zeros_like(depth_np, dtype=bool)
+        return {
+            "depth_distance": depth_distance,
+            "valid": valid,
+            "depth_sign_mode": "as_is",
+            "valid_pixel_ratio_global": 0.0,
+        }
+
+    non_pos_ratio = float((finite_values <= 0).mean())
+    if non_pos_ratio > 0.5:
+        depth_distance = -depth_np
+        depth_sign_mode = "negated"
+    else:
+        depth_distance = depth_np
+        depth_sign_mode = "as_is"
+
+    valid = np.isfinite(depth_distance) & (depth_distance > 0)
+    return {
+        "depth_distance": depth_distance,
+        "valid": valid,
+        "depth_sign_mode": depth_sign_mode,
+        "valid_pixel_ratio_global": float(valid.mean()),
+    }
+
+
 def depth2heatmap(depth_images):
+    prepared = _prepare_depth_sequence(depth_images)
+    depth_np = prepared["depth_distance"]
+    valid = prepared["valid"]
     heatmap_frames = []
-    
-    for img in depth_images:
-        if torch.is_tensor(img):
-            img = img.detach().cpu().numpy()
-        
-        img = np.nan_to_num(img)
 
-        img_min, img_max = img.min(), img.max()
-        if img_max - img_min > 1e-5:
-            img_norm = (img - img_min) / (img_max - img_min) * 255
-        else:
-            img_norm = np.zeros_like(img)
-        
-        img_uint8 = img_norm.astype(np.uint8)
+    if valid.any():
+        valid_values = depth_np[valid]
+        # Use one global window for the whole sequence to prevent frame-wise color flicker.
+        depth_min = np.percentile(valid_values, 1.0)
+        depth_max = np.percentile(valid_values, 99.0)
+        if depth_max - depth_min < 1e-6:
+            depth_max = depth_min + 1e-6
+    else:
+        depth_min, depth_max = 0.0, 1.0
 
-        # cv2 generates BGR, videos need RGB
+    for i in range(depth_np.shape[0]):
+        img = np.nan_to_num(depth_np[i], nan=0.0, posinf=0.0, neginf=0.0)
+        img = np.clip(img, depth_min, depth_max)
+        img_norm = (img - depth_min) / (depth_max - depth_min)
+        # Invert so near (small depth) -> yellow, far (large depth) -> blue.
+        img_norm = 1.0 - img_norm
+        img_uint8 = (img_norm * 255).astype(np.uint8)
+        img_uint8[~valid[i]] = 0
+
         color_map = cv2.applyColorMap(img_uint8, cv2.COLORMAP_VIRIDIS)
         color_map_rgb = cv2.cvtColor(color_map, cv2.COLOR_BGR2RGB)
-        
         heatmap_frames.append(color_map_rgb)
-        
+
     return heatmap_frames
+
+
+def analyze_depth_smoothness(depth_images, jump_ratio=0.08):
+    prepared = _prepare_depth_sequence(depth_images)
+    depth_np = prepared["depth_distance"]
+    valid = prepared["valid"]
+    valid_values = depth_np[valid]
+
+    if not valid.any():
+        return {
+            "global_min": 0.0,
+            "global_max": 0.0,
+            "threshold": 0.0,
+            "per_frame": [],
+            "n_jumps": 0,
+            "n_frames": int(depth_np.shape[0]),
+            "depth_sign_mode": prepared["depth_sign_mode"],
+            "valid_pixel_ratio_global": prepared["valid_pixel_ratio_global"],
+        }
+
+    global_min = float(np.percentile(valid_values, 1.0))
+    global_max = float(np.percentile(valid_values, 99.0))
+    depth_range = max(global_max - global_min, 1e-6)
+    threshold = max(1e-3, depth_range * float(jump_ratio))
+
+    per_frame = []
+    n_jumps = 0
+    for i in range(depth_np.shape[0]):
+        frame_valid = valid[i]
+        frame_vals = depth_np[i][frame_valid]
+        frame_stats = {
+            "frame": i,
+            "valid_ratio": float(frame_valid.mean()),
+            "depth_mean": float(frame_vals.mean()) if frame_vals.size > 0 else 0.0,
+            "depth_p95": float(np.percentile(frame_vals, 95.0)) if frame_vals.size > 0 else 0.0,
+            "delta_mean": 0.0,
+            "delta_p95": 0.0,
+            "delta_max": 0.0,
+            "is_jump": False,
+        }
+        if i > 0:
+            overlap = valid[i] & valid[i - 1]
+            if overlap.any():
+                delta = np.abs(depth_np[i][overlap] - depth_np[i - 1][overlap])
+                frame_stats["delta_mean"] = float(delta.mean())
+                frame_stats["delta_p95"] = float(np.percentile(delta, 95.0))
+                frame_stats["delta_max"] = float(delta.max())
+                frame_stats["is_jump"] = frame_stats["delta_p95"] > threshold
+        if frame_stats["is_jump"]:
+            n_jumps += 1
+        per_frame.append(frame_stats)
+
+    return {
+        "global_min": global_min,
+        "global_max": global_max,
+        "threshold": float(threshold),
+        "per_frame": per_frame,
+        "n_jumps": int(n_jumps),
+        "n_frames": int(depth_np.shape[0]),
+        "depth_sign_mode": prepared["depth_sign_mode"],
+        "valid_pixel_ratio_global": prepared["valid_pixel_ratio_global"],
+    }
 
 def render_mp4(ims1, ims2, filename=None):
     # Initialize plot with two subplots

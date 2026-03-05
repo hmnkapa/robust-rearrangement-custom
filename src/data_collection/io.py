@@ -10,7 +10,32 @@ from src.common.types import Trajectory, Observation
 from src.common.geometry import np_action_6d_to_quat
 
 from ipdb import set_trace as bp
-from src.visualization.render_mp4 import create_in_memory_mp4, depth2heatmap
+from src.visualization.render_mp4 import (
+    create_in_memory_mp4,
+    depth2heatmap,
+    analyze_depth_smoothness,
+)
+
+
+def _write_depth_smoothness_report(report_path: Path, camera_name: str, smoothness: dict):
+    lines = [
+        f"camera={camera_name}",
+        f"depth_sign_mode={smoothness.get('depth_sign_mode', 'as_is')}",
+        f"valid_pixel_ratio_global={smoothness.get('valid_pixel_ratio_global', 0.0):.6f}",
+        f"global_min_p1={smoothness['global_min']:.6f}",
+        f"global_max_p99={smoothness['global_max']:.6f}",
+        f"jump_threshold_p95={smoothness['threshold']:.6f}",
+        f"jump_frames={smoothness['n_jumps']}/{max(smoothness['n_frames'] - 1, 0)}",
+        "frame_idx,valid_ratio,depth_mean,depth_p95,delta_mean,delta_p95,delta_max,status",
+    ]
+    for row in smoothness["per_frame"]:
+        status = "JUMP" if row["is_jump"] else "OK"
+        lines.append(
+            f"{row['frame']},{row['valid_ratio']:.6f},{row['depth_mean']:.6f},"
+            f"{row['depth_p95']:.6f},{row['delta_mean']:.6f},{row['delta_p95']:.6f},"
+            f"{row['delta_max']:.6f},{status}"
+        )
+    report_path.write_text("\n".join(lines) + "\n")
 
 
 def save_raw_rollout(
@@ -125,6 +150,23 @@ def save_raw_rollout(
         # Ensure output directory exists (with success/failure subdirectory)
         status_dir = Path(rollout_save_dir) / ("success" if success else "failure")
         status_dir.mkdir(parents=True, exist_ok=True)
+
+        smooth1 = analyze_depth_smoothness(depth_image1)
+        smooth2 = analyze_depth_smoothness(depth_image2)
+        report1_path = status_dir / f"{timestamp}_dep1_smoothness.txt"
+        report2_path = status_dir / f"{timestamp}_dep2_smoothness.txt"
+        _write_depth_smoothness_report(report1_path, "depth_image1", smooth1)
+        _write_depth_smoothness_report(report2_path, "depth_image2", smooth2)
+        print(
+            f"[DepthSmoothness] dep1 jump_frames={smooth1['n_jumps']}/"
+            f"{max(smooth1['n_frames'] - 1, 0)}, threshold={smooth1['threshold']:.6f}, "
+            f"report={report1_path}"
+        )
+        print(
+            f"[DepthSmoothness] dep2 jump_frames={smooth2['n_jumps']}/"
+            f"{max(smooth2['n_frames'] - 1, 0)}, threshold={smooth2['threshold']:.6f}, "
+            f"report={report2_path}"
+        )
 
         # Create MP4 bytes for each camera stream
         depth1_heatmap_frames = depth2heatmap(depth_image1)
