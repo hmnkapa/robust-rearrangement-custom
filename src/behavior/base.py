@@ -150,7 +150,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
     def __post_init__(self, *args, **kwargs):
 
-        if self.observation_type == "image":
+        if self.observation_type in ("image", "rgbd"):
             assert self.encoder1 is not None, "encoder1 is not defined"
             assert self.encoder2 is not None, "encoder2 is not defined"
 
@@ -211,21 +211,36 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         actor_cfg = cfg.actor
         encoder_name = cfg.vision_encoder.model
         self.freeze_encoder = cfg.vision_encoder.freeze
+        is_rgbd = cfg.observation_type == "rgbd"
 
-        self.encoder1 = get_encoder(
-            encoder_name,
-            device=device,
-            **encoder_kwargs,
-        )
-        self.encoder2 = (
-            self.encoder1
-            if self.freeze_encoder
-            else get_encoder(
+        if is_rgbd:
+            self.encoder1 = get_encoder(
+                encoder_name,
+                device=device,
+                camera_name="wrist",
+                **encoder_kwargs,
+            )
+            self.encoder2 = get_encoder(
+                encoder_name,
+                device=device,
+                camera_name="front",
+                **encoder_kwargs,
+            )
+        else:
+            self.encoder1 = get_encoder(
                 encoder_name,
                 device=device,
                 **encoder_kwargs,
             )
-        )
+            self.encoder2 = (
+                self.encoder1
+                if self.freeze_encoder
+                else get_encoder(
+                    encoder_name,
+                    device=device,
+                    **encoder_kwargs,
+                )
+            )
         self.encoding_dim = self.encoder1.encoding_dim
 
         if actor_cfg.get("projection_dim") is not None:
@@ -282,6 +297,8 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             # Move the channel to the front (B * obs_horizon, H, W, C) -> (B * obs_horizon, C, H, W)
             image1 = image1.permute(0, 3, 1, 2)
             image2 = image2.permute(0, 3, 1, 2)
+            image1 = image1.float() / 255.0
+            image2 = image2.float() / 255.0
 
             # Apply the transforms to resize the images to 224x224, (B * obs_horizon, C, 224, 224)
             image1: torch.Tensor = self.camera1_transform(image1)
@@ -305,6 +322,48 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
                 feature2 = self.camera_2_vib(feature2)
 
             # Reshape concatenate the features
+            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+        elif self.observation_type == "rgbd":
+            img_size = obs[0]["color_image1"].shape[-3:]
+            depth_size = obs[0]["depth_image1"].shape[-2:]
+
+            image1 = torch.cat(
+                [o["color_image1"].unsqueeze(1) for o in obs], dim=1
+            ).reshape(B * self.obs_horizon, *img_size)
+            image2 = torch.cat(
+                [o["color_image2"].unsqueeze(1) for o in obs], dim=1
+            ).reshape(B * self.obs_horizon, *img_size)
+            depth1 = torch.cat(
+                [o["depth_image1"].unsqueeze(1) for o in obs], dim=1
+            ).reshape(B * self.obs_horizon, *depth_size).unsqueeze(1)
+            depth2 = torch.cat(
+                [o["depth_image2"].unsqueeze(1) for o in obs], dim=1
+            ).reshape(B * self.obs_horizon, *depth_size).unsqueeze(1)
+
+            image1 = image1.permute(0, 3, 1, 2)
+            image2 = image2.permute(0, 3, 1, 2)
+            image1 = image1.float() / 255.0
+            image2 = image2.float() / 255.0
+            image1 = torch.cat([image1, depth1], dim=1)
+            image2 = torch.cat([image2, depth2], dim=1)
+
+            image1 = self.camera1_transform(image1)
+            image2 = self.camera2_transform(image2)
+
+            feature1 = self.encoder1_proj(self.encoder1(image1)).reshape(
+                B, self.obs_horizon, -1
+            )
+            feature2 = self.encoder2_proj(self.encoder2(image2)).reshape(
+                B, self.obs_horizon, -1
+            )
+
+            if self.feature_layernorm:
+                feature1 = self.layernorm1(feature1)
+                feature2 = self.layernorm2(feature2)
+
+            if self.camera_2_vib is not None:
+                feature2 = self.camera_2_vib(feature2)
+
             nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
         elif self.observation_type == "state":
             # Convert parts_poses from obs_horizon x (n_envs, parts_poses_dim) -> (n_envs, obs_horizon, parts_poses_dim)

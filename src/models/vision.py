@@ -22,24 +22,27 @@ def get_resnet(model_name, weights=None, **kwargs):
     model_name: resnet18, resnet18_rgbd and so on
     size: 18, 34, 50
     """
-    in_channels = 3
-    if model_name.endswith("rgbd"):
-        weights = None
-        model_name = model_name.split('_')[0]
-        in_channels = 4
+    is_rgbd = model_name.endswith("rgbd")
+    if is_rgbd:
+        model_name = model_name.split("_")[0]
 
     func = getattr(torchvision.models, model_name)
     resnet = func(weights=weights, **kwargs)
-    original_conv = resnet.conv1
 
-    resnet.conv1 = torch.nn.Conv2d(
-        in_channels,
-        original_conv.out_channels,
-        kernel_size=original_conv.kernel_size,
-        stride=original_conv.stride,
-        padding=original_conv.padding,
-        bias=original_conv.bias
-    )
+    if is_rgbd:
+        original_conv = resnet.conv1
+        rgbd_conv1 = torch.nn.Conv2d(
+            4,
+            original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=False,
+        )
+        rgbd_conv1.weight.data[:, :3, :, :] = original_conv.weight.data
+        rgbd_conv1.weight.data[:, 3, :, :] = 0
+        resnet.conv1 = rgbd_conv1
+
     resnet.encoding_dim = resnet.fc.in_features
     resnet.fc = torch.nn.Identity()
     return resnet
@@ -110,6 +113,11 @@ class SpatialSoftmaxEncoder(VisionEncoder):
 
 
 class ResnetEncoder(VisionEncoder):
+    depth_stats = {
+        "wrist": (0.107, 0.05),
+        "front": (1.03, 0.493),
+    }
+
     def __init__(
         self,
         model_name,
@@ -117,6 +125,7 @@ class ResnetEncoder(VisionEncoder):
         device="cuda",
         use_groupnorm=True,
         pretrained=True,
+        camera_name=None,
         *args,
         **kwargs,
     ) -> None:
@@ -126,18 +135,26 @@ class ResnetEncoder(VisionEncoder):
         print(f"Loading resnet, pretrained={pretrained}")
 
         self.is_rgbd = model_name.endswith("rgbd")
-        weights = "IMAGENET1K_V1" if (pretrained and not self.is_rgbd) else None
+        weights = "IMAGENET1K_V1" if pretrained else None
 
         self.model = get_resnet(model_name=model_name, weights=weights)
         self.encoding_dim = self.model.encoding_dim
 
         if self.is_rgbd:
+            if camera_name not in self.depth_stats:
+                raise ValueError(
+                    f"RGBD resnet requires camera_name in {tuple(self.depth_stats.keys())}, got {camera_name}"
+                )
             self.normalize_rgb = torchvision.transforms.Normalize(
                 mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             )
+            depth_mean, depth_std = self.depth_stats[camera_name]
             self.normalize_depth = torchvision.transforms.Normalize(
-                mean=[-1.0], std=[0.5] # based on the distribution of depth values
+                mean=[depth_mean], std=[depth_std]
             )
+            self.camera_name = camera_name
+        else:
+            self.camera_name = None
 
         if use_groupnorm:
             self.model = replace_submodules(
@@ -157,21 +174,11 @@ class ResnetEncoder(VisionEncoder):
     # or RGBD images of shape (batch_size, 4, 224, 224)
     # Depth values are negative and in range [-2.0, 0]
     def forward(self, x):
-        # Debug: don't normalize images
-        # x = x / 255.0
-
-        # print(f'RGB Images: {x[0, :3, ...]}', flush=True)
-        # print(f'Depth Images: {x[0, -1:, ...]}', flush=True)
         if self.is_rgbd:
             rgb = x[:, :3, :, :]
             depth = x[:, 3:, :, :]
-            # print(f"RGB - Max: {rgb.max()}, Min: {rgb.min()}, Mean: {rgb.mean()}", flush=True)
-            # print(f"Depth - Max: {depth.max()}, Min: {depth.min()}, Mean: {depth.mean()}", flush=True)
-            
             rgb = self.normalize_rgb(rgb)
-            depth = torch.clamp(depth, min=-2.0, max=0.0)
             depth = self.normalize_depth(depth)
-            
             x = torch.cat([rgb, depth], dim=1)
         else:
             x = self.normalize(x)
