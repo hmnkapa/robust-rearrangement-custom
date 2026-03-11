@@ -47,7 +47,11 @@ def _to_numpy_single(x, env_idx: int):
     return arr
 
 
-def _extract_obs_single(step_obs: Dict[str, Any], env_idx: int) -> Dict[str, Any]:
+def _extract_obs_single(
+    step_obs: Dict[str, Any],
+    env_idx: int,
+    include_depth: bool,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
     robot_state = step_obs.get("robot_state")
@@ -58,7 +62,10 @@ def _extract_obs_single(step_obs: Dict[str, Any], env_idx: int) -> Dict[str, Any
     elif robot_state is not None:
         out["robot_state"] = _to_numpy_single(robot_state, env_idx)
 
-    for key in ["color_image1", "color_image2", "depth_image1", "depth_image2", "parts_poses"]:
+    keys = ["color_image1", "color_image2", "parts_poses"]
+    if include_depth:
+        keys += ["depth_image1", "depth_image2"]
+    for key in keys:
         if key in step_obs:
             out[key] = _to_numpy_single(step_obs[key], env_idx)
 
@@ -91,6 +98,7 @@ def _run_batch(
     batch_items: List[Tuple[Path, Dict[str, Any], int]],
     action_src: str,
     save_pc_for_dp3: bool,
+    save_rgbd_image: bool,
     pc_points: int,
     pc_downsample_mode: str,
     pc_generator: Optional[PointCloudGenerator],
@@ -161,7 +169,9 @@ def _run_batch(
     if isinstance(reset_obs, dict):
         for env_idx, ctx in enumerate(contexts):
             if ctx.get("active", False):
-                ctx["new_observations"].append(_extract_obs_single(reset_obs, env_idx))
+                ctx["new_observations"].append(
+                    _extract_obs_single(reset_obs, env_idx, include_depth=save_rgbd_image)
+                )
 
     # Keep stepping while any env still has pending trajectory to replay.
     while any(ctx.get("active", False) for ctx in contexts):
@@ -207,7 +217,9 @@ def _run_batch(
                 continue
 
             try:
-                obs_item = _extract_obs_single(step_obs, env_idx)
+                obs_item = _extract_obs_single(
+                    step_obs, env_idx, include_depth=save_rgbd_image
+                )
                 rew_item = float(_to_numpy_single(reward, env_idx))
                 done_item = bool(_to_numpy_single(done, env_idx))
 
@@ -332,7 +344,7 @@ def main(argv=None):
     )
     parser.add_argument("--task", "-f", type=str, required=True, choices=TASK_CHOICES)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--max-success-replay", type=int, default=50)
     parser.add_argument("--max-retry", type=int, default=3)
     parser.add_argument("--visualize", action="store_true")
@@ -351,6 +363,11 @@ def main(argv=None):
     )
 
     parser.add_argument("--save-pc-for-dp3", action="store_true")
+    parser.add_argument(
+        "--save-rgbd-image",
+        action="store_true",
+        help="Include depth_image1/2 in saved observations.",
+    )
     parser.add_argument("--pc-points", type=int, default=4096)
     parser.add_argument("--pc-bbox-half-extent", type=float, default=0.2)
     parser.add_argument(
@@ -422,19 +439,22 @@ def main(argv=None):
             )
 
         pc_generator = None
-        if args.save_pc_for_dp3:
+        if args.save_pc_for_dp3 or args.save_rgbd_image:
             extra_obs_keys = []
+            if "depth_image1" not in env.obs_keys:
+                extra_obs_keys.append("depth_image1")
             if "depth_image2" not in env.obs_keys:
                 extra_obs_keys.append("depth_image2")
             if extra_obs_keys:
                 env.obs_keys = list(env.obs_keys) + extra_obs_keys
                 env.set_camera()
-            pc_generator = PointCloudGenerator(
-                env=env,
-                camera_name="front",
-                max_points=args.pc_points,
-                bbox_half_extent=args.pc_bbox_half_extent,
-            )
+            if args.save_pc_for_dp3:
+                pc_generator = PointCloudGenerator(
+                    env=env,
+                    camera_name="front",
+                    max_points=args.pc_points,
+                    bbox_half_extent=args.pc_bbox_half_extent,
+                )
 
         results = _run_batch(
             env=env,
@@ -442,6 +462,7 @@ def main(argv=None):
             batch_items=batch_items,
             action_src=args.action_src,
             save_pc_for_dp3=args.save_pc_for_dp3,
+            save_rgbd_image=args.save_rgbd_image,
             pc_points=args.pc_points,
             pc_downsample_mode=args.pc_downsample_mode,
             pc_generator=pc_generator,

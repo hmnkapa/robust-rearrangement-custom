@@ -222,6 +222,9 @@ def main(argv=None):
     parser.add_argument("--visualize-axis", action="store_true", help="Draw world coordinate axes at origin")
     parser.add_argument("--debug-action", action="store_true", help="Run debug action: move EE +X,+Y,+Z (10 steps each) with overlays")
     parser.add_argument("--save-pc-for-dp3", action="store_true", help="Enable point cloud generation and pickle export for DP3")
+    parser.add_argument("--reset-eepos-steps", type=int, default=30, help="If joint_positions near zero, apply absolute ee_pos/ee_quat control for N steps after reset")
+    parser.add_argument("--reset-eepos-eps", type=float, default=1e-4, help="Epsilon to detect zero joint_positions for reset-to-ee-pos fallback")
+    parser.add_argument("--init-state-frame", type=int, default=5, help="Observation index used as init_state for reset_to")
     parser.add_argument("--pc-points", type=int, default=4096, help="Downsampled point count for generated point clouds")
     parser.add_argument("--pc-bbox-half-extent", type=float, default=0.2, help="Half-extent of the cubic bbox for point cloud cropping (in meters)")
     parser.add_argument(
@@ -288,8 +291,84 @@ def main(argv=None):
 
     # Reset env to initial observation (single env assumed)
     # FurnitureSim.reset_to expects a list of per-env states
-    init_state = observations[5]
+    init_state_idx = max(0, min(args.init_state_frame, len(observations) - 1))
+    init_state = observations[init_state_idx]
+    def _print_value(name, v):
+        try:
+            arr = np.asarray(v)
+            if arr.ndim == 0:
+                print(f"    {name}: {arr.item()}")
+                return
+            arr = np.round(arr.astype(float), 2)
+            print(f"    {name}: {arr.tolist()}")
+        except Exception:
+            print(f"    {name}: {v}")
+
+    print("[DEBUG] reset_to init_state contents:")
+    print(f"  keys: {sorted(init_state.keys())}")
+    if "robot_state" in init_state:
+        rs = init_state["robot_state"]
+        if isinstance(rs, dict):
+            print(f"  robot_state keys: {sorted(rs.keys())}")
+            for k in sorted(rs.keys()):
+                _print_value(f"robot_state/{k}", rs[k])
+        else:
+            _print_value("robot_state", rs)
+    if "parts_poses" in init_state:
+        _print_value("parts_poses", init_state["parts_poses"])
     env.reset_to([init_state])
+
+    def _maybe_recover_eepos_after_reset(state):
+        rs = state.get("robot_state") if isinstance(state, dict) else None
+        if not isinstance(rs, dict):
+            return
+        jp = rs.get("joint_positions", None)
+        if jp is None:
+            return
+        jp_arr = np.asarray(jp, dtype=np.float32).reshape(-1)
+        if jp_arr.size == 0:
+            return
+        if np.all(np.abs(jp_arr) < args.reset_eepos_eps):
+            print("[INFO] Detected near-zero joint_positions after reset; applying absolute EE pose control for stabilization.")
+            ee_pos = rs.get("ee_pos", None)
+            ee_quat = rs.get("ee_quat", None)
+            if ee_pos is None or ee_quat is None:
+                return
+            ee_pos = np.asarray(ee_pos, dtype=np.float32).reshape(-1)
+            ee_quat = np.asarray(ee_quat, dtype=np.float32).reshape(-1)
+            gw = rs.get("gripper_width", 0.0)
+            gw = float(np.asarray(gw).reshape(-1)[0]) if isinstance(gw, (np.ndarray, list)) else float(gw)
+            grip = -1 * (2 * (gw / 0.065) - 1)
+            pos_action = np.concatenate([ee_pos, ee_quat, np.array([grip], dtype=np.float32)], axis=0)
+
+            prev_action_type = env.get_action_type()
+            env.set_action_type("pos")
+            try:
+                cur_pos_t, cur_quat_t = env.get_ee_pose()
+                cur_pos = cur_pos_t.cpu().numpy()[0]
+                cur_quat = cur_quat_t.cpu().numpy()[0]
+                target_quat = ee_quat.astype(np.float32)
+                target_quat_wxyz = np.array(
+                    [target_quat[3], target_quat[0], target_quat[1], target_quat[2]],
+                    dtype=np.float32,
+                )
+                dot_xyzw = float(np.abs(np.dot(cur_quat, target_quat)))
+                dot_wxyz = float(np.abs(np.dot(cur_quat, target_quat_wxyz)))
+                print("[DEBUG] reset ee-pos fallback")
+                print(f"  current ee_pos: {np.round(cur_pos, 3).tolist()}")
+                print(f"  target ee_pos:  {np.round(ee_pos, 3).tolist()}")
+                print(f"  current ee_quat(xyzw): {np.round(cur_quat, 3).tolist()}")
+                print(f"  target ee_quat(xyzw):  {np.round(target_quat, 3).tolist()}")
+                print(f"  target ee_quat(wxyz):  {np.round(target_quat_wxyz, 3).tolist()}")
+                print(f"  quat dot |xyzw|={dot_xyzw:.3f} |wxyz|={dot_wxyz:.3f}")
+            except Exception as e:
+                print(f"[DEBUG] reset ee-pos fallback: failed to read current ee pose: {e}")
+            for _ in range(args.reset_eepos_steps):
+                ac_t = _to_tensor_action(pos_action, num_envs=args.num_envs, device=device)
+                env.step(ac_t)
+            env.set_action_type(prev_action_type)
+
+    _maybe_recover_eepos_after_reset(init_state)
 
     # Optional buffers for recording
     imgs1_list = []
@@ -302,7 +381,7 @@ def main(argv=None):
     # Use robot_state to compute absolute pos actions; iterate over subsequent observations
     # We step from obs[0] to obs[-1], using obs[t] as target pose at step t
     last_done = None
-    for t in range(5, len(observations)):
+    for t in range(init_state_idx, len(observations)):
         if t < len(actions):
             formatted_action = [f"{x:.3f}" for x in actions[t]]
             print(f"[DEBUG] Step {t}: Original Action in Pickle: {formatted_action}")
