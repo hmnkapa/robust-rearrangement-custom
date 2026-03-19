@@ -137,7 +137,7 @@ pyrealsense2==2.54.2.5684
 PySocks==1.7.1
 python-dateutil==2.8.2
 python-xlib==0.33
-pytorch3d==0.3.0
+# pytorch3d==0.3.0
 pytz==2023.3
 PyYAML==6.0.1
 pyzmq==25.1.2
@@ -174,8 +174,8 @@ timm==0.9.16
 tokenizers==0.15.2
 tomli==2.0.1
 toolz==0.12.1
-torch==2.3.0
-torchvision==0.18.0
+# torch==2.3.0
+# torchvision==0.18.0
 tornado==6.4
 tqdm==4.66.2
 traitlets==5.14.1

@@ -125,3 +125,5 @@ scene.xml
 
 # wandb
 /wandb_cache/
+
+/isaacgym/
