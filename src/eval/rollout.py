@@ -27,6 +27,8 @@ import wandb
 import zarr
 from datetime import datetime
 
+from src.eval.skill_annotation_util import draw_skill_on_image, get_skill_label, reset_skill_annotator
+
 
 RolloutStats = collections.namedtuple(
     "RolloutStats",
@@ -53,6 +55,7 @@ RolloutSaveValues = collections.namedtuple(
         "point_clouds",
         "depth_image1",
         "depth_image2",
+        "skills",
     ],
 )
 
@@ -166,13 +169,23 @@ def rollout(
     n_parts_assemble: int = 1,
     save_rollouts: bool = False,
     pc_generator = None,
+    annotate_skill: bool = False,
+    skill_on_image: bool = False,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
         obs = env.reset()
         actor.reset()
+    if annotate_skill:
+        reset_skill_annotator(env)
 
     video_obs = deepcopy(obs)
+    previous_skill = None
+    initial_skill = get_skill_label(env, previous_skill) if annotate_skill else None
+    if initial_skill is not None:
+        previous_skill = initial_skill
+    if annotate_skill:
+        print(f"[skill-debug] step=0 skill={initial_skill}", flush=True)
 
     # Resize the images in the observation if they exist
     resize_image(obs, "color_image1")
@@ -194,6 +207,7 @@ def rollout(
     depth_image1 = [] if "depth_image1" not in video_obs else [video_obs["depth_image1"]]
     depth_image2 = [] if "depth_image2" not in video_obs else [video_obs["depth_image2"]]
     parts_poses = [video_obs["parts_poses"].cpu()]
+    skills = [initial_skill]
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
     done = torch.zeros((env.num_envs, 1), dtype=torch.bool, device="cuda")
@@ -244,6 +258,11 @@ def rollout(
             pcs_step = None
 
         video_obs = deepcopy(obs)
+        current_skill = get_skill_label(env, previous_skill) if annotate_skill else None
+        if current_skill is not None:
+            previous_skill = current_skill
+        if annotate_skill:
+            print(f"[skill-debug] step={step_idx + 1} skill={current_skill}", flush=True)
 
         # Resize the images in the observation if they exist
         resize_image(obs, "color_image1")
@@ -273,6 +292,7 @@ def rollout(
                 depth_image2.append(video_obs["depth_image2"])
             actions.append(action_pred.cpu())
             parts_poses.append(video_obs["parts_poses"].cpu())
+            skills.append(current_skill)
 
             # Collect point clouds at each step
             if pcs_step is not None:
@@ -330,6 +350,7 @@ def rollout(
         pcs_per_env,
         torch.stack(depth_image1, dim=1) if depth_image1 else [],
         torch.stack(depth_image2, dim=1) if depth_image2 else [],
+        skills,
     )
 
 
@@ -352,6 +373,8 @@ def calculate_success_rate(
     stop_after_n_success: int = 0,
     record_first_state_only: bool = False,
     pc_generator = None,
+    annotate_skill: bool = False,
+    skill_on_image: bool = False,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -399,6 +422,8 @@ def calculate_success_rate(
             n_parts_assemble=n_parts_assemble,
             save_rollouts=save_rollouts,
             pc_generator=pc_generator,
+            annotate_skill=annotate_skill,
+            skill_on_image=skill_on_image,
         )
 
         # Calculate the success rate
@@ -415,6 +440,7 @@ def calculate_success_rate(
                 actions = rollout_data.actions[env_idx].numpy()
                 rewards = rollout_data.rewards[env_idx].numpy()
                 parts_poses = rollout_data.parts_poses[env_idx].numpy()
+                skills = [s for s in rollout_data.skills]
                 success = success_flags[env_idx].item()
                 task = env.furniture_name
                 
@@ -442,6 +468,16 @@ def calculate_success_rate(
                     if have_img_obs
                     else np.zeros((len(robot_states), 2, 2, 3), dtype=np.uint8)
                 )
+                video2_for_video = video2.copy()
+                if annotate_skill and skill_on_image:
+                    n_annotated = min(len(video2_for_video), len(skills))
+                    for frame_idx in range(n_annotated):
+                        skill = skills[frame_idx]
+                        if skill is None:
+                            continue
+                        video2_for_video[frame_idx] = draw_skill_on_image(
+                            video2_for_video[frame_idx], skill
+                        )
                 depth_video1 = (
                     rollout_data.depth_image1[env_idx].cpu().numpy()
                     if have_depth_obs
@@ -462,7 +498,9 @@ def calculate_success_rate(
 
                 # Stack the two videos side by side
                 if have_img_obs:
-                    video = np.concatenate([video1, video2], axis=2)[trim_start_steps:n_steps]
+                    video = np.concatenate([video1, video2_for_video], axis=2)[
+                        trim_start_steps:n_steps
+                    ]
                     video = create_in_memory_mp4(video, fps=20)
 
                 if save_rollouts_to_wandb and have_img_obs:
@@ -489,6 +527,7 @@ def calculate_success_rate(
                         depth_image1=depth_video1[trim_start_steps : n_steps + 1],
                         depth_image2=depth_video2[trim_start_steps : n_steps + 1],
                         parts_poses=parts_poses[trim_start_steps : n_steps + 1],
+                        skills=skills[trim_start_steps : n_steps + 1],
                         actions=actions[trim_start_steps:n_steps],
                         rewards=rewards[trim_start_steps:n_steps],
                         success=success,
@@ -499,6 +538,7 @@ def calculate_success_rate(
                         have_img_obs=have_img_obs,
                         have_depth_obs=have_depth_obs,
                         pcs=pcs_trimmed,
+                        skill_on_image=skill_on_image,
                     )
 
         if break_on_n_success and n_success >= stop_after_n_success:

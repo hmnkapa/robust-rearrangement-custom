@@ -119,6 +119,12 @@ def validate_args(args: argparse.Namespace):
     assert not args.leaderboard, "Leaderboard mode is not supported as of now"
 
     assert not args.store_video_wandb or args.wandb, "store-video-wandb requires wandb"
+    assert not args.skill_on_image or args.annotate_skill, (
+        "--skill-on-image requires --annotate-skill"
+    )
+    assert not args.annotate_skill or args.n_envs == 1, (
+        "--annotate-skill currently supports only --n-envs 1"
+    )
 
 
 def get_runs(args: argparse.Namespace, map_location: Optional[torch.device] = None) -> List[Run]:
@@ -277,6 +283,8 @@ if __name__ == "__main__":
     parser.add_argument("--stop-after-n-success", type=int, default=0)
     parser.add_argument("--break-on-n-success", action="store_true")
     parser.add_argument("--record-for-coverage", action="store_true")
+    parser.add_argument("--annotate-skill", action="store_true")
+    parser.add_argument("--skill-on-image", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
 
@@ -561,6 +569,8 @@ if __name__ == "__main__":
                     stop_after_n_success=args.stop_after_n_success,
                     record_first_state_only=args.record_for_coverage,
                     pc_generator=pc_generator,
+                    annotate_skill=args.annotate_skill,
+                    skill_on_image=args.skill_on_image,
                 )
 
                 if args.store_video_wandb:

@@ -15,6 +15,7 @@ from src.visualization.render_mp4 import (
     depth2heatmap,
     analyze_depth_smoothness,
 )
+from src.eval.skill_annotation_util import draw_skill_on_image
 
 
 def _write_depth_smoothness_report(report_path: Path, camera_name: str, smoothness: dict):
@@ -44,6 +45,7 @@ def save_raw_rollout(
     imgs2: np.ndarray,
     depth_image1: np.ndarray,
     depth_image2: np.ndarray,
+    skills: List[str],
     actions: np.ndarray,
     rewards: np.ndarray,
     parts_poses: np.ndarray,
@@ -55,6 +57,7 @@ def save_raw_rollout(
     have_img_obs:  bool = False,
     have_depth_obs: bool = False,
     pcs: List[np.ndarray] = None,
+    skill_on_image: bool = False,
 ):
     observations: List[Observation] = list()
 
@@ -62,8 +65,11 @@ def save_raw_rollout(
     if pcs is None:
         pcs = [None] * len(robot_states)
 
-    for robot_state, image1, image2, depth1, depth2, parts_pose, pc in zip(
-        robot_states, imgs1, imgs2, depth_image1, depth_image2, parts_poses, pcs
+    if skills is None:
+        skills = [None] * len(robot_states)
+
+    for robot_state, image1, image2, depth1, depth2, parts_pose, pc, skill in zip(
+        robot_states, imgs1, imgs2, depth_image1, depth_image2, parts_poses, pcs, skills
     ):
         observations.append(
             {
@@ -74,6 +80,7 @@ def save_raw_rollout(
                 "depth_image2": depth2,
                 "parts_poses": parts_pose,
                 "point_cloud": pc,
+                "skill": skill,
             }
         )
 
@@ -131,9 +138,20 @@ def save_raw_rollout(
         status_dir = Path(rollout_save_dir) / ("success" if success else "failure")
         status_dir.mkdir(parents=True, exist_ok=True)
 
+        imgs2_for_video = imgs2.copy()
+        if skill_on_image:
+            n_annotated = min(len(imgs2_for_video), len(skills))
+            for frame_idx in range(n_annotated):
+                skill = skills[frame_idx]
+                if skill is None:
+                    continue
+                imgs2_for_video[frame_idx] = draw_skill_on_image(
+                    imgs2_for_video[frame_idx], skill
+                )
+
         # Create MP4 bytes for each camera stream
         mp4_cam1 = create_in_memory_mp4(imgs1, fps=20)
-        mp4_cam2 = create_in_memory_mp4(imgs2, fps=20)
+        mp4_cam2 = create_in_memory_mp4(imgs2_for_video, fps=20)
 
         # Build filenames
         cam1_path = status_dir / f"{timestamp}_cam1.mp4"
