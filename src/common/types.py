@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple, TypedDict, Literal
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Literal
 
 
 class Observation(TypedDict):
@@ -8,12 +8,16 @@ class Observation(TypedDict):
     robot_state: dict
     image_size: Tuple[int]
     parts_poses: np.ndarray
+    skill: Optional[str]
+    guidance_point: Optional[np.ndarray]
+    guidance_point_2d: Dict[str, Optional[np.ndarray]]
 
 
 class Trajectory(TypedDict):
     observations: List[Observation]
     actions: List[np.ndarray]
     rewards: List[float]
+    camera_info: Dict[str, Any]
     skills: List[str]
     success: bool
     furniture: str

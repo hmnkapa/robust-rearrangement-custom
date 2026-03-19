@@ -20,8 +20,17 @@ def inspect_pickle(pickle_path: str, max_steps: int):
     # Explicitly requested fields
     print(f"success: {data.get('success', 'N/A')}")
     print(f"action_type: {data.get('action_type', 'N/A')}")
+    camera_info = data.get("camera_info", None)
+    if isinstance(camera_info, dict):
+        front = camera_info.get("front_camera")
+        wrist = camera_info.get("wrist_camera")
+        print(f"camera_info/front_camera: {'dict' if isinstance(front, dict) else front}")
+        if isinstance(wrist, list):
+            print(f"camera_info/wrist_camera: len={len(wrist)}")
+        else:
+            print(f"camera_info/wrist_camera: {wrist}")
     
-    sequence_keys = ['observations', 'actions', 'rewards', 'success', 'action_type']
+    sequence_keys = ['observations', 'actions', 'rewards', 'camera_info', 'success', 'action_type']
     for key in sorted(data.keys()):
         if key not in sequence_keys:
              print(f"{key}: {data[key]}")
@@ -48,21 +57,14 @@ def inspect_pickle(pickle_path: str, max_steps: int):
         # --- Observation ---
         print("[Observation]:")
         if i < n_obs:
-            def find_and_print_gripper(d, current_prefix=""):
-                found = False
-                if isinstance(d, dict):
-                    for k, v in sorted(d.items()):
-                        path = f"{current_prefix}/{k}" if current_prefix else k
-                        if "gripper_width" in k:
-                             print_val(v, prefix=f"  {path}")
-                             found = True
-                        elif isinstance(v, dict):
-                             if find_and_print_gripper(v, path):
-                                 found = True
-                return found
-
-            if not find_and_print_gripper(observations[i]):
-                 print("  (gripper_width not found)")
+            obs = observations[i]
+            if not find_and_print_gripper(obs):
+                print("  (gripper_width not found)")
+            for key in ["skill", "guidance_point", "guidance_point_2d"]:
+                if key in obs:
+                    print_val(obs[key], prefix=f"  {key}")
+                else:
+                    print(f"  {key}: (missing)")
         else:
             print("  (None)")
             
@@ -93,6 +95,20 @@ def recursive_inspect(data: Any, prefix: str = ""):
     else:
          print_val(data, prefix)
 
+
+def find_and_print_gripper(d, current_prefix=""):
+    found = False
+    if isinstance(d, dict):
+        for k, v in sorted(d.items()):
+            path = f"{current_prefix}/{k}" if current_prefix else k
+            if "gripper_width" in k:
+                print_val(v, prefix=f"  {path}")
+                found = True
+            elif isinstance(v, dict):
+                if find_and_print_gripper(v, path):
+                    found = True
+    return found
+
 def print_val(value, prefix):
     if isinstance(value, np.ndarray) or (hasattr(value, 'shape') and hasattr(value, 'dtype')):
         # Handle numpy-like objects
@@ -121,6 +137,9 @@ def print_val(value, prefix):
             else:
                  print(f"{prefix}: {shape_str}")
                  
+    elif isinstance(value, dict):
+         print(f"{prefix}: dict keys={sorted(str(k) for k in value.keys())}")
+
     elif isinstance(value, (list, tuple)):
          # If list of numbers or small list, print content
          is_numeric = False

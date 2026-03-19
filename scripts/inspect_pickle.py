@@ -21,6 +21,12 @@ def _shape_str(value: Any) -> str:
             return str(value.shape)
     if isinstance(value, (list, tuple)):
         return f"(len={len(value)})"
+    if isinstance(value, dict):
+        return f"(dict keys={sorted(str(k) for k in value.keys())})"
+    if value is None:
+        return "(None)"
+    if isinstance(value, str):
+        return f"(str len={len(value)})"
     return "()"
 
 
@@ -132,6 +138,31 @@ def _print_top_field(name: str, value: Any) -> None:
     print(f"{name}: {value} (type: {type(value)})")
 
 
+def _print_camera_info_summary(camera_info: Any) -> None:
+    if not isinstance(camera_info, dict):
+        _print_top_field("camera_info", camera_info)
+        return
+
+    print("camera_info:")
+
+    front = camera_info.get("front_camera")
+    if isinstance(front, dict):
+        print(f"  front_camera: dict keys={sorted(str(k) for k in front.keys())}")
+    else:
+        print(f"  front_camera: {front}")
+
+    wrist = camera_info.get("wrist_camera")
+    if isinstance(wrist, (list, tuple)):
+        print(f"  wrist_camera: len {len(wrist)}")
+        first_valid = next((item for item in wrist if isinstance(item, dict)), None)
+        if first_valid is not None:
+            print(
+                f"    first_valid_keys: {sorted(str(k) for k in first_valid.keys())}"
+            )
+    else:
+        print(f"  wrist_camera: {wrist}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect a pickle and print a compact structure summary.")
     parser.add_argument("path", type=str, help="Path to .pkl/.pickle file")
@@ -163,12 +194,23 @@ def main() -> None:
         if k in data:
             _print_top_field(k, data[k])
 
+    if "camera_info" in data:
+        _print_camera_info_summary(data["camera_info"])
+
     for k in ["success", "task", "action_type"]:
         if k in data:
             _print_top_field(k, data[k])
 
     # Print any remaining top-level fields not covered above.
-    covered = {"observations", "actions", "rewards", "success", "task", "action_type"}
+    covered = {
+        "observations",
+        "actions",
+        "rewards",
+        "camera_info",
+        "success",
+        "task",
+        "action_type",
+    }
     extra_keys = [k for k in data.keys() if k not in covered]
     for k in sorted(extra_keys):
         _print_top_field(str(k), data[k])

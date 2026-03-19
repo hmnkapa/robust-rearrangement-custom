@@ -46,6 +46,9 @@ def save_raw_rollout(
     depth_image1: np.ndarray,
     depth_image2: np.ndarray,
     skills: List[str],
+    guidance_points: List[np.ndarray],
+    guidance_points_2d: List[dict],
+    camera_infos: List[dict],
     actions: np.ndarray,
     rewards: np.ndarray,
     parts_poses: np.ndarray,
@@ -67,9 +70,24 @@ def save_raw_rollout(
 
     if skills is None:
         skills = [None] * len(robot_states)
+    if guidance_points is None:
+        guidance_points = [None] * len(robot_states)
+    if guidance_points_2d is None:
+        guidance_points_2d = [None] * len(robot_states)
+    if camera_infos is None:
+        camera_infos = [None] * len(robot_states)
 
-    for robot_state, image1, image2, depth1, depth2, parts_pose, pc, skill in zip(
-        robot_states, imgs1, imgs2, depth_image1, depth_image2, parts_poses, pcs, skills
+    for robot_state, image1, image2, depth1, depth2, parts_pose, pc, skill, guidance_point, guidance_point_2d in zip(
+        robot_states,
+        imgs1,
+        imgs2,
+        depth_image1,
+        depth_image2,
+        parts_poses,
+        pcs,
+        skills,
+        guidance_points,
+        guidance_points_2d,
     ):
         observations.append(
             {
@@ -81,8 +99,22 @@ def save_raw_rollout(
                 "parts_poses": parts_pose,
                 "point_cloud": pc,
                 "skill": skill,
+                "guidance_point": guidance_point,
+                "guidance_point_2d": guidance_point_2d,
             }
         )
+
+    front_camera_info = None
+    wrist_camera_info = []
+    for camera_info in camera_infos:
+        if not isinstance(camera_info, dict):
+            wrist_camera_info.append(None)
+            continue
+
+        if front_camera_info is None and "color_image2" in camera_info:
+            front_camera_info = camera_info["color_image2"]
+
+        wrist_camera_info.append(camera_info.get("color_image1"))
 
     if action_type == "pos":
 
@@ -116,6 +148,10 @@ def save_raw_rollout(
         "observations": observations,
         "actions": actions.tolist(),
         "rewards": rewards.tolist(),
+        "camera_info": {
+            "front_camera": front_camera_info,
+            "wrist_camera": wrist_camera_info,
+        },
         "success": success,
         "task": task,
         "action_type": action_type,

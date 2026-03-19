@@ -285,6 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--record-for-coverage", action="store_true")
     parser.add_argument("--annotate-skill", action="store_true")
     parser.add_argument("--skill-on-image", action="store_true")
+    parser.add_argument("--annotate-wrist-camera", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
 
@@ -571,6 +572,7 @@ if __name__ == "__main__":
                     pc_generator=pc_generator,
                     annotate_skill=args.annotate_skill,
                     skill_on_image=args.skill_on_image,
+                    annotate_wrist_camera=args.annotate_wrist_camera,
                 )
 
                 if args.store_video_wandb:

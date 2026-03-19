@@ -27,7 +27,12 @@ import wandb
 import zarr
 from datetime import datetime
 
-from src.eval.skill_annotation_util import draw_skill_on_image, get_skill_label, reset_skill_annotator
+from src.eval.skill_annotation_util import (
+    draw_guidance_point_on_image,
+    draw_skill_on_image,
+    get_annotation_bundle,
+    reset_skill_annotator,
+)
 
 
 RolloutStats = collections.namedtuple(
@@ -56,6 +61,9 @@ RolloutSaveValues = collections.namedtuple(
         "depth_image1",
         "depth_image2",
         "skills",
+        "guidance_points",
+        "guidance_points_2d",
+        "camera_infos",
     ],
 )
 
@@ -171,6 +179,7 @@ def rollout(
     pc_generator = None,
     annotate_skill: bool = False,
     skill_on_image: bool = False,
+    annotate_wrist_camera: bool = True,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
@@ -181,11 +190,31 @@ def rollout(
 
     video_obs = deepcopy(obs)
     previous_skill = None
-    initial_skill = get_skill_label(env, previous_skill) if annotate_skill else None
+    initial_annotation = (
+        get_annotation_bundle(
+            env,
+            previous_skill,
+            annotate_wrist_camera=annotate_wrist_camera,
+            resize_images=resize_video,
+        )
+        if annotate_skill
+        else None
+    )
+    initial_skill = initial_annotation["skill"] if initial_annotation is not None else None
+    initial_guidance_point = (
+        None if initial_annotation is None else initial_annotation["guidance_point"]
+    )
+    initial_guidance_point_2d = (
+        {} if initial_annotation is None else initial_annotation["guidance_point_2d"]
+    )
     if initial_skill is not None:
         previous_skill = initial_skill
     if annotate_skill:
         print(f"[skill-debug] step=0 skill={initial_skill}", flush=True)
+        print(
+            f"[guidance-debug] step=0 gp={initial_guidance_point} gp_2d={initial_guidance_point_2d}",
+            flush=True,
+        )
 
     # Resize the images in the observation if they exist
     resize_image(obs, "color_image1")
@@ -200,6 +229,25 @@ def rollout(
         resize_depth(video_obs, "depth_image1")
         resize_crop_depth(video_obs, "depth_image2")
 
+    if annotate_skill and initial_annotation is not None:
+        initial_guidance = initial_annotation["guidance_point_2d"]
+        if "color_image2" in video_obs:
+            img2 = video_obs["color_image2"].cpu().numpy()
+            print(
+                f"[guidance-draw-debug] step=0 image=color_image2 shape={img2.shape} uv={initial_guidance.get('color_image2')}",
+                flush=True,
+            )
+            img2 = draw_guidance_point_on_image(img2, initial_guidance.get("color_image2"))
+            video_obs["color_image2"] = torch.from_numpy(img2).to(video_obs["color_image2"].device)
+        if annotate_wrist_camera and "color_image1" in video_obs:
+            img1 = video_obs["color_image1"].cpu().numpy()
+            print(
+                f"[guidance-draw-debug] step=0 image=color_image1 shape={img1.shape} uv={initial_guidance.get('color_image1')}",
+                flush=True,
+            )
+            img1 = draw_guidance_point_on_image(img1, initial_guidance.get("color_image1"))
+            video_obs["color_image1"] = torch.from_numpy(img1).to(video_obs["color_image1"].device)
+
     # save initial visualization and rewards
     robot_states = [TensorDict(video_obs["robot_state"], batch_size=env.num_envs)]
     imgs1 = [] if "color_image1" not in video_obs else [video_obs["color_image1"].cpu()]
@@ -208,6 +256,15 @@ def rollout(
     depth_image2 = [] if "depth_image2" not in video_obs else [video_obs["depth_image2"]]
     parts_poses = [video_obs["parts_poses"].cpu()]
     skills = [initial_skill]
+    guidance_points = [
+        None if initial_annotation is None else initial_annotation["guidance_point"]
+    ]
+    guidance_points_2d = [
+        {} if initial_annotation is None else initial_annotation["guidance_point_2d"]
+    ]
+    camera_infos = [
+        {} if initial_annotation is None else initial_annotation["camera_info"]
+    ]
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
     done = torch.zeros((env.num_envs, 1), dtype=torch.bool, device="cuda")
@@ -258,11 +315,31 @@ def rollout(
             pcs_step = None
 
         video_obs = deepcopy(obs)
-        current_skill = get_skill_label(env, previous_skill) if annotate_skill else None
+        current_annotation = (
+            get_annotation_bundle(
+                env,
+                previous_skill,
+                annotate_wrist_camera=annotate_wrist_camera,
+                resize_images=resize_video,
+            )
+            if annotate_skill
+            else None
+        )
+        current_skill = current_annotation["skill"] if current_annotation is not None else None
+        current_guidance_point = (
+            None if current_annotation is None else current_annotation["guidance_point"]
+        )
+        current_guidance_point_2d = (
+            {} if current_annotation is None else current_annotation["guidance_point_2d"]
+        )
         if current_skill is not None:
             previous_skill = current_skill
         if annotate_skill:
             print(f"[skill-debug] step={step_idx + 1} skill={current_skill}", flush=True)
+            print(
+                f"[guidance-debug] step={step_idx + 1} gp={current_guidance_point} gp_2d={current_guidance_point_2d}",
+                flush=True,
+            )
 
         # Resize the images in the observation if they exist
         resize_image(obs, "color_image1")
@@ -276,6 +353,31 @@ def rollout(
             resize_crop_image(video_obs, "color_image2")
             resize_depth(video_obs, "depth_image1")
             resize_crop_depth(video_obs, "depth_image2")
+
+        if annotate_skill:
+            guidance_for_draw = current_annotation["guidance_point_2d"]
+            if "color_image2" in video_obs:
+                img2 = video_obs["color_image2"].cpu().numpy()
+                print(
+                    f"[guidance-draw-debug] step={step_idx + 1} image=color_image2 shape={img2.shape} uv={guidance_for_draw.get('color_image2')}",
+                    flush=True,
+                )
+                img2 = draw_guidance_point_on_image(
+                    img2,
+                    guidance_for_draw.get("color_image2"),
+                )
+                video_obs["color_image2"] = torch.from_numpy(img2).to(obs["color_image2"].device)
+            if annotate_wrist_camera and "color_image1" in video_obs:
+                img1 = video_obs["color_image1"].cpu().numpy()
+                print(
+                    f"[guidance-draw-debug] step={step_idx + 1} image=color_image1 shape={img1.shape} uv={guidance_for_draw.get('color_image1')}",
+                    flush=True,
+                )
+                img1 = draw_guidance_point_on_image(
+                    img1,
+                    guidance_for_draw.get("color_image1"),
+                )
+                video_obs["color_image1"] = torch.from_numpy(img1).to(obs["color_image1"].device)
 
         # Store the results for visualization and logging
         if save_rollouts:
@@ -293,6 +395,15 @@ def rollout(
             actions.append(action_pred.cpu())
             parts_poses.append(video_obs["parts_poses"].cpu())
             skills.append(current_skill)
+            guidance_points.append(
+                None if current_annotation is None else current_annotation["guidance_point"]
+            )
+            guidance_points_2d.append(
+                {} if current_annotation is None else current_annotation["guidance_point_2d"]
+            )
+            camera_infos.append(
+                {} if current_annotation is None else current_annotation["camera_info"]
+            )
 
             # Collect point clouds at each step
             if pcs_step is not None:
@@ -351,6 +462,9 @@ def rollout(
         torch.stack(depth_image1, dim=1) if depth_image1 else [],
         torch.stack(depth_image2, dim=1) if depth_image2 else [],
         skills,
+        guidance_points,
+        guidance_points_2d,
+        camera_infos,
     )
 
 
@@ -375,6 +489,7 @@ def calculate_success_rate(
     pc_generator = None,
     annotate_skill: bool = False,
     skill_on_image: bool = False,
+    annotate_wrist_camera: bool = True,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -424,6 +539,7 @@ def calculate_success_rate(
             pc_generator=pc_generator,
             annotate_skill=annotate_skill,
             skill_on_image=skill_on_image,
+            annotate_wrist_camera=annotate_wrist_camera,
         )
 
         # Calculate the success rate
@@ -441,6 +557,9 @@ def calculate_success_rate(
                 rewards = rollout_data.rewards[env_idx].numpy()
                 parts_poses = rollout_data.parts_poses[env_idx].numpy()
                 skills = [s for s in rollout_data.skills]
+                guidance_points = [g for g in rollout_data.guidance_points]
+                guidance_points_2d = [g for g in rollout_data.guidance_points_2d]
+                camera_infos = [c for c in rollout_data.camera_infos]
                 success = success_flags[env_idx].item()
                 task = env.furniture_name
                 
@@ -528,6 +647,9 @@ def calculate_success_rate(
                         depth_image2=depth_video2[trim_start_steps : n_steps + 1],
                         parts_poses=parts_poses[trim_start_steps : n_steps + 1],
                         skills=skills[trim_start_steps : n_steps + 1],
+                        guidance_points=guidance_points[trim_start_steps : n_steps + 1],
+                        guidance_points_2d=guidance_points_2d[trim_start_steps : n_steps + 1],
+                        camera_infos=camera_infos[trim_start_steps : n_steps + 1],
                         actions=actions[trim_start_steps:n_steps],
                         rewards=rewards[trim_start_steps:n_steps],
                         success=success,
