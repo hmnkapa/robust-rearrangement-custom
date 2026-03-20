@@ -10,6 +10,8 @@ import torch
 
 import furniture_bench.controllers.control_utils as C
 from furniture_bench.furniture import furniture_factory
+from furniture_bench.furniture.parts.table_top import TableTop
+from furniture_bench.furniture.parts.round_table_top import RoundTableTop
 from furniture_bench.utils.pose import rot_mat
 
 
@@ -232,22 +234,34 @@ class SkillAnnotator:
     def __post_init__(self):
         self.furniture = furniture_factory(self.furniture_name)
         self.furniture.reset()
-        self._reset_parts()
         self.assemble_idx = 0
 
     def _reset_parts(self):
-        for part in self.furniture.parts:
-            reset_fn = getattr(part, "reset_skill_state", None)
-            if callable(reset_fn):
-                reset_fn()
+        self.furniture.reset()
 
     def reset(self):
-        self._reset_parts()
+        self.furniture.reset()
         self.assemble_idx = 0
         self.previous_skill = None
         self.previous_guidance_point_robot = None
 
     def _assembled(self, annotation_inputs, part_idx1, part_idx2):
+        pair = (part_idx1, part_idx2)
+        if "assembled_mask" in annotation_inputs and annotation_inputs["assembled_mask"] is not None:
+            try:
+                pair_idx = self.furniture.should_be_assembled.index(pair)
+                assembled_mask = annotation_inputs["assembled_mask"]
+                assembled = bool(assembled_mask[pair_idx].item())
+                # if self.furniture_name == "round_table":
+                #     print(
+                #         "[util assembled_debug] "
+                #         f"source=env_mask pair={pair} pair_idx={pair_idx} assembled={assembled} "
+                #         f"assembled_mask={assembled_mask.tolist()}"
+                #     )
+                return assembled
+            except ValueError:
+                pass
+
         part1 = self.furniture.parts[part_idx1]
         part2 = self.furniture.parts[part_idx2]
         rb_states = annotation_inputs["rb_states"]
@@ -263,10 +277,89 @@ class SkillAnnotator:
         )
         rel_pose = torch_inv(part1_pose) @ part2_pose
         assembled_rel_poses = self.furniture.assembled_rel_poses[(part_idx1, part_idx2)]
-        return self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses)
+        assembled = self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses)
+        # if self.furniture_name == "round_table":
+        #     print(
+        #         "[util assembled_debug] "
+        #         f"source=local_recompute pair={pair} assembled={assembled}"
+        #     )
+        return assembled
+
+    def _update_part1_skill_state(self, part, annotation_inputs):
+        if isinstance(part, RoundTableTop):
+            skill_state = part.update_skill_state(
+                annotation_inputs["ee_pos"],
+                annotation_inputs["ee_quat"],
+                annotation_inputs["rb_states"],
+                annotation_inputs["part_idxs"],
+                annotation_inputs["sim_to_april_mat"],
+                annotation_inputs["april_to_robot_mat"],
+                annotation_inputs["left_finger_pos"],
+                annotation_inputs["right_finger_pos"],
+                annotation_inputs["left_finger_force"],
+                annotation_inputs["right_finger_force"],
+            )
+        else:
+            skill_state = part.update_skill_state(
+                annotation_inputs["ee_pos"],
+                annotation_inputs["ee_quat"],
+                annotation_inputs["gripper_width"],
+                annotation_inputs["rb_states"],
+                annotation_inputs["part_idxs"],
+                annotation_inputs["sim_to_april_mat"],
+                annotation_inputs["april_to_robot_mat"],
+                annotation_inputs["left_finger_pos"],
+                annotation_inputs["right_finger_pos"],
+                annotation_inputs["left_finger_force"],
+                annotation_inputs["right_finger_force"],
+                annotation_inputs["part_contact_forces"].get(part.name),
+            )
+        skill = part.get_skill_label()
+        guidance_point_robot = part.get_guidance_point()
+        return skill_state, skill, guidance_point_robot
+
+    def _update_operated_part(self, part, annotation_inputs, assemble_to_name, assembled):
+        skill_state = part.update_skill_state(
+            annotation_inputs["ee_pos"],
+            annotation_inputs["ee_quat"],
+            annotation_inputs["gripper_width"],
+            annotation_inputs["rb_states"],
+            annotation_inputs["part_idxs"],
+            annotation_inputs["sim_to_april_mat"],
+            annotation_inputs["april_to_robot_mat"],
+            annotation_inputs["left_finger_pos"],
+            annotation_inputs["right_finger_pos"],
+            annotation_inputs["left_finger_force"],
+            annotation_inputs["right_finger_force"],
+            annotation_inputs["part_contact_forces"].get(part.name),
+            assemble_to_name,
+            assembled=assembled,
+        )
+        skill = part.get_skill_label()
+        guidance_point_robot = part.get_guidance_point()
+        return skill_state, skill, guidance_point_robot
+
+    def _reset_next_pair(self, pair_idx):
+        if pair_idx >= len(self.furniture.should_be_assembled):
+            return
+        part1_idx, part2_idx = self.furniture.should_be_assembled[pair_idx]
+        part1 = self.furniture.parts[part1_idx]
+        part2 = self.furniture.parts[part2_idx]
+
+        reset_fn = getattr(part1, "reset", None)
+        if callable(reset_fn):
+            reset_fn()
+        else:
+            reset_skill_state_fn = getattr(part1, "reset_skill_state", None)
+            if callable(reset_skill_state_fn):
+                reset_skill_state_fn()
+
+        reset_skill_state_fn = getattr(part2, "reset_skill_state", None)
+        if callable(reset_skill_state_fn):
+            reset_skill_state_fn()
 
     def step(self, env, annotate_wrist_camera: bool = True, resize_images: bool = True):
-        if self.furniture_name != "one_leg":
+        if self.furniture_name not in {"one_leg", "round_table"}:
             return {
                 "skill": None,
                 "guidance_point": None,
@@ -282,51 +375,71 @@ class SkillAnnotator:
             }
 
         annotation_inputs = env.get_skill_annotation_inputs()
+        incoming_assemble_idx = annotation_inputs.get("current_assemble_idx")
+        num_pairs = len(self.furniture.should_be_assembled)
+        if incoming_assemble_idx is not None:
+            incoming_assemble_idx = int(incoming_assemble_idx)
+            if self.assemble_idx >= num_pairs or incoming_assemble_idx < self.assemble_idx:
+                self.assemble_idx = incoming_assemble_idx
         camera_info = _build_camera_info(
             annotation_inputs,
             resize_images=resize_images,
             annotate_wrist_camera=annotate_wrist_camera,
         )
-        table_top = self.furniture.parts[0]
-        leg = self.furniture.parts[4]
+        if self.assemble_idx >= num_pairs:
+            return {
+                "skill": self.previous_skill,
+                "guidance_point": self.previous_guidance_point_robot,
+                "guidance_point_2d": {},
+                "camera_info": camera_info,
+            }
 
-        if table_top.skill_state != "done":
-            skill_state = table_top.update_skill_state(
-                annotation_inputs["ee_pos"],
-                annotation_inputs["ee_quat"],
-                annotation_inputs["rb_states"],
-                annotation_inputs["part_idxs"],
-                annotation_inputs["sim_to_april_mat"],
-                annotation_inputs["april_to_robot_mat"],
-                annotation_inputs["left_finger_pos"],
-                annotation_inputs["right_finger_pos"],
-                annotation_inputs["left_finger_force"],
-                annotation_inputs["right_finger_force"],
+        part1_idx, part2_idx = self.furniture.should_be_assembled[self.assemble_idx]
+        part1 = self.furniture.parts[part1_idx]
+        part2 = self.furniture.parts[part2_idx]
+
+        skill_state = None
+        skill = None
+        guidance_point_robot = None
+        debug_info = {
+            "assemble_idx": self.assemble_idx,
+            "active_part": None,
+            "phase": None,
+        }
+
+        part1_phase_active = (
+            not getattr(part1, "pre_assemble_done", True)
+            and getattr(part1, "skill_state", None) != "done"
+        )
+        if part1_phase_active:
+            skill_state, skill, guidance_point_robot = self._update_part1_skill_state(
+                part1, annotation_inputs
             )
-            skill = table_top.get_skill_label()
-            guidance_point_robot = table_top.get_guidance_point()
-        else:
-            assembled = self._assembled(annotation_inputs, 0, 4)
-            skill_state = leg.update_skill_state(
-                annotation_inputs["ee_pos"],
-                annotation_inputs["ee_quat"],
-                annotation_inputs["gripper_width"],
-                annotation_inputs["rb_states"],
-                annotation_inputs["part_idxs"],
-                annotation_inputs["sim_to_april_mat"],
-                annotation_inputs["april_to_robot_mat"],
-                annotation_inputs["left_finger_pos"],
-                annotation_inputs["right_finger_pos"],
-                annotation_inputs["left_finger_force"],
-                annotation_inputs["right_finger_force"],
-                annotation_inputs["part_contact_forces"].get(leg.name),
-                table_top.name,
+            if skill_state == "done":
+                part1.pre_assemble_done = True
+            debug_info["active_part"] = part1.name
+            debug_info["phase"] = "pre_assemble"
+
+        assembled = self._assembled(annotation_inputs, part1_idx, part2_idx)
+        part1_phase_complete = getattr(part1, "pre_assemble_done", True) or (
+            getattr(part1, "skill_state", None) == "done"
+        )
+        if part1_phase_complete:
+            skill_state, skill, guidance_point_robot = self._update_operated_part(
+                part2,
+                annotation_inputs,
+                assemble_to_name=part1.name,
                 assembled=assembled,
             )
-            if assembled:
-                self.assemble_idx = 1
-            skill = leg.get_skill_label()
-            guidance_point_robot = leg.get_guidance_point()
+            debug_info["active_part"] = part2.name
+            debug_info["phase"] = "assemble"
+
+        if assembled:
+            self.assemble_idx = min(self.assemble_idx + 1, num_pairs)
+            self._reset_next_pair(self.assemble_idx)
+
+        if incoming_assemble_idx is not None:
+            self.assemble_idx = max(self.assemble_idx, incoming_assemble_idx)
 
         if skill is None or skill_state == "done":
             skill = self.previous_skill
@@ -357,6 +470,7 @@ class SkillAnnotator:
             "guidance_point": guidance_point,
             "guidance_point_2d": guidance_point_2d,
             "camera_info": camera_info,
+            "debug": debug_info,
         }
 
 
@@ -374,12 +488,13 @@ def get_annotation_bundle(
     annotate_wrist_camera: bool = True,
     resize_images: bool = True,
 ):
-    if getattr(env, "furniture_name", None) != "one_leg":
+    if getattr(env, "furniture_name", None) not in {"one_leg", "round_table"}:
         return {
             "skill": None,
             "guidance_point": None,
             "guidance_point_2d": {},
             "camera_info": {},
+            "debug": {},
         }
 
     annotator = getattr(env, "_skill_annotator", None)

@@ -210,7 +210,16 @@ def rollout(
     if initial_skill is not None:
         previous_skill = initial_skill
     if annotate_skill:
-        print(f"[skill-debug] step=0 skill={initial_skill}", flush=True)
+        initial_debug = {} if initial_annotation is None else initial_annotation.get("debug", {})
+        if initial_debug:
+            print(
+                f"[skill-debug] step=0 idx={initial_debug.get('assemble_idx')} "
+                f"part={initial_debug.get('active_part')} phase={initial_debug.get('phase')} "
+                f"skill={initial_skill}",
+                flush=True,
+            )
+        else:
+            print(f"[skill-debug] step=0 skill={initial_skill}", flush=True)
         print(
             f"[guidance-debug] step=0 gp={initial_guidance_point} gp_2d={initial_guidance_point_2d}",
             flush=True,
@@ -233,18 +242,18 @@ def rollout(
         initial_guidance = initial_annotation["guidance_point_2d"]
         if "color_image2" in video_obs:
             img2 = video_obs["color_image2"].cpu().numpy()
-            print(
-                f"[guidance-draw-debug] step=0 image=color_image2 shape={img2.shape} uv={initial_guidance.get('color_image2')}",
-                flush=True,
-            )
+            # print(
+            #     f"[guidance-draw-debug] step=0 image=color_image2 shape={img2.shape} uv={initial_guidance.get('color_image2')}",
+            #     flush=True,
+            # )
             img2 = draw_guidance_point_on_image(img2, initial_guidance.get("color_image2"))
             video_obs["color_image2"] = torch.from_numpy(img2).to(video_obs["color_image2"].device)
         if annotate_wrist_camera and "color_image1" in video_obs:
             img1 = video_obs["color_image1"].cpu().numpy()
-            print(
-                f"[guidance-draw-debug] step=0 image=color_image1 shape={img1.shape} uv={initial_guidance.get('color_image1')}",
-                flush=True,
-            )
+            # print(
+            #     f"[guidance-draw-debug] step=0 image=color_image1 shape={img1.shape} uv={initial_guidance.get('color_image1')}",
+            #     flush=True,
+            # )
             img1 = draw_guidance_point_on_image(img1, initial_guidance.get("color_image1"))
             video_obs["color_image1"] = torch.from_numpy(img1).to(video_obs["color_image1"].device)
 
@@ -335,7 +344,16 @@ def rollout(
         if current_skill is not None:
             previous_skill = current_skill
         if annotate_skill:
-            print(f"[skill-debug] step={step_idx + 1} skill={current_skill}", flush=True)
+            current_debug = {} if current_annotation is None else current_annotation.get("debug", {})
+            if current_debug:
+                print(
+                    f"[skill-debug] step={step_idx + 1} idx={current_debug.get('assemble_idx')} "
+                    f"part={current_debug.get('active_part')} phase={current_debug.get('phase')} "
+                    f"skill={current_skill}",
+                    flush=True,
+                )
+            else:
+                print(f"[skill-debug] step={step_idx + 1} skill={current_skill}", flush=True)
             print(
                 f"[guidance-debug] step={step_idx + 1} gp={current_guidance_point} gp_2d={current_guidance_point_2d}",
                 flush=True,
@@ -358,10 +376,10 @@ def rollout(
             guidance_for_draw = current_annotation["guidance_point_2d"]
             if "color_image2" in video_obs:
                 img2 = video_obs["color_image2"].cpu().numpy()
-                print(
-                    f"[guidance-draw-debug] step={step_idx + 1} image=color_image2 shape={img2.shape} uv={guidance_for_draw.get('color_image2')}",
-                    flush=True,
-                )
+                # print(
+                #     f"[guidance-draw-debug] step={step_idx + 1} image=color_image2 shape={img2.shape} uv={guidance_for_draw.get('color_image2')}",
+                #     flush=True,
+                # )
                 img2 = draw_guidance_point_on_image(
                     img2,
                     guidance_for_draw.get("color_image2"),
@@ -369,10 +387,10 @@ def rollout(
                 video_obs["color_image2"] = torch.from_numpy(img2).to(obs["color_image2"].device)
             if annotate_wrist_camera and "color_image1" in video_obs:
                 img1 = video_obs["color_image1"].cpu().numpy()
-                print(
-                    f"[guidance-draw-debug] step={step_idx + 1} image=color_image1 shape={img1.shape} uv={guidance_for_draw.get('color_image1')}",
-                    flush=True,
-                )
+                # print(
+                #     f"[guidance-draw-debug] step={step_idx + 1} image=color_image1 shape={img1.shape} uv={guidance_for_draw.get('color_image1')}",
+                #     flush=True,
+                # )
                 img1 = draw_guidance_point_on_image(
                     img1,
                     guidance_for_draw.get("color_image1"),
