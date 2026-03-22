@@ -10,6 +10,7 @@ import torch
 
 import furniture_bench.controllers.control_utils as C
 from furniture_bench.furniture import furniture_factory
+from furniture_bench.furniture.parts.lamp_base import LampBase
 from furniture_bench.furniture.parts.table_top import TableTop
 from furniture_bench.furniture.parts.round_table_top import RoundTableTop
 from furniture_bench.utils.pose import rot_mat
@@ -286,7 +287,7 @@ class SkillAnnotator:
         return assembled
 
     def _update_part1_skill_state(self, part, annotation_inputs):
-        if isinstance(part, RoundTableTop):
+        if isinstance(part, (RoundTableTop, LampBase)):
             skill_state = part.update_skill_state(
                 annotation_inputs["ee_pos"],
                 annotation_inputs["ee_quat"],
@@ -346,20 +347,26 @@ class SkillAnnotator:
         part1 = self.furniture.parts[part1_idx]
         part2 = self.furniture.parts[part2_idx]
 
-        reset_fn = getattr(part1, "reset", None)
-        if callable(reset_fn):
-            reset_fn()
-        else:
-            reset_skill_state_fn = getattr(part1, "reset_skill_state", None)
-            if callable(reset_skill_state_fn):
-                reset_skill_state_fn()
+        should_skip_part1_reset = (
+            self.furniture_name == "lamp"
+            and getattr(part1, "name", None) == "lamp_base"
+            and getattr(part1, "pre_assemble_done", False)
+        )
+        if not should_skip_part1_reset:
+            reset_fn = getattr(part1, "reset", None)
+            if callable(reset_fn):
+                reset_fn()
+            else:
+                reset_skill_state_fn = getattr(part1, "reset_skill_state", None)
+                if callable(reset_skill_state_fn):
+                    reset_skill_state_fn()
 
         reset_skill_state_fn = getattr(part2, "reset_skill_state", None)
         if callable(reset_skill_state_fn):
             reset_skill_state_fn()
 
     def step(self, env, annotate_wrist_camera: bool = True, resize_images: bool = True):
-        if self.furniture_name not in {"one_leg", "round_table"}:
+        if self.furniture_name not in {"one_leg", "round_table", "lamp"}:
             return {
                 "skill": None,
                 "guidance_point": None,
@@ -488,7 +495,7 @@ def get_annotation_bundle(
     annotate_wrist_camera: bool = True,
     resize_images: bool = True,
 ):
-    if getattr(env, "furniture_name", None) not in {"one_leg", "round_table"}:
+    if getattr(env, "furniture_name", None) not in {"one_leg", "round_table", "lamp"}:
         return {
             "skill": None,
             "guidance_point": None,
