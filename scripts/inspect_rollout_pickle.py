@@ -23,12 +23,13 @@ def inspect_pickle(pickle_path: str, max_steps: int):
     camera_info = data.get("camera_info", None)
     if isinstance(camera_info, dict):
         front = camera_info.get("front_camera")
-        wrist = camera_info.get("wrist_camera")
         print(f"camera_info/front_camera: {'dict' if isinstance(front, dict) else front}")
-        if isinstance(wrist, list):
-            print(f"camera_info/wrist_camera: len={len(wrist)}")
-        else:
-            print(f"camera_info/wrist_camera: {wrist}")
+        if "wrist_camera" in camera_info:
+            wrist = camera_info.get("wrist_camera")
+            if isinstance(wrist, list):
+                print(f"camera_info/wrist_camera: len={len(wrist)}")
+            else:
+                print(f"camera_info/wrist_camera: {wrist}")
     
     sequence_keys = ['observations', 'actions', 'rewards', 'camera_info', 'success', 'action_type']
     for key in sorted(data.keys()):

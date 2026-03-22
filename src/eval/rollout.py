@@ -179,7 +179,7 @@ def rollout(
     pc_generator = None,
     annotate_skill: bool = False,
     skill_on_image: bool = False,
-    annotate_wrist_camera: bool = True,
+    annotate_wrist_camera: bool = False,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
@@ -507,7 +507,7 @@ def calculate_success_rate(
     pc_generator = None,
     annotate_skill: bool = False,
     skill_on_image: bool = False,
-    annotate_wrist_camera: bool = True,
+    annotate_wrist_camera: bool = False,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(

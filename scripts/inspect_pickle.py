@@ -151,16 +151,17 @@ def _print_camera_info_summary(camera_info: Any) -> None:
     else:
         print(f"  front_camera: {front}")
 
-    wrist = camera_info.get("wrist_camera")
-    if isinstance(wrist, (list, tuple)):
-        print(f"  wrist_camera: len {len(wrist)}")
-        first_valid = next((item for item in wrist if isinstance(item, dict)), None)
-        if first_valid is not None:
-            print(
-                f"    first_valid_keys: {sorted(str(k) for k in first_valid.keys())}"
-            )
-    else:
-        print(f"  wrist_camera: {wrist}")
+    if "wrist_camera" in camera_info:
+        wrist = camera_info.get("wrist_camera")
+        if isinstance(wrist, (list, tuple)):
+            print(f"  wrist_camera: len {len(wrist)}")
+            first_valid = next((item for item in wrist if isinstance(item, dict)), None)
+            if first_valid is not None:
+                print(
+                    f"    first_valid_keys: {sorted(str(k) for k in first_valid.keys())}"
+                )
+        else:
+            print(f"  wrist_camera: {wrist}")
 
 
 def main() -> None:

@@ -365,7 +365,7 @@ class SkillAnnotator:
         if callable(reset_skill_state_fn):
             reset_skill_state_fn()
 
-    def step(self, env, annotate_wrist_camera: bool = True, resize_images: bool = True):
+    def step(self, env, annotate_wrist_camera: bool = False, resize_images: bool = True):
         if self.furniture_name not in {"one_leg", "round_table", "lamp"}:
             return {
                 "skill": None,
@@ -492,7 +492,7 @@ def reset_skill_annotator(env):
 def get_annotation_bundle(
     env,
     previous_skill: str | None = None,
-    annotate_wrist_camera: bool = True,
+    annotate_wrist_camera: bool = False,
     resize_images: bool = True,
 ):
     if getattr(env, "furniture_name", None) not in {"one_leg", "round_table", "lamp"}:
@@ -522,7 +522,7 @@ def get_annotation_bundle(
 def get_skill_label(
     env,
     previous_skill: str | None = None,
-    annotate_wrist_camera: bool = True,
+    annotate_wrist_camera: bool = False,
     resize_images: bool = True,
 ) -> str | None:
     bundle = get_annotation_bundle(

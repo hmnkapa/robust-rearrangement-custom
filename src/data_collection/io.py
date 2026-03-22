@@ -105,16 +105,12 @@ def save_raw_rollout(
         )
 
     front_camera_info = None
-    wrist_camera_info = []
     for camera_info in camera_infos:
         if not isinstance(camera_info, dict):
-            wrist_camera_info.append(None)
             continue
 
         if front_camera_info is None and "color_image2" in camera_info:
             front_camera_info = camera_info["color_image2"]
-
-        wrist_camera_info.append(camera_info.get("color_image1"))
 
     if action_type == "pos":
 
@@ -150,7 +146,6 @@ def save_raw_rollout(
         "rewards": rewards.tolist(),
         "camera_info": {
             "front_camera": front_camera_info,
-            "wrist_camera": wrist_camera_info,
         },
         "success": success,
         "task": task,
