@@ -180,6 +180,8 @@ def main(cfg: DictConfig):
 
     OmegaConf.set_struct(cfg, False)
     cfg.robot_state_dim = dataset.robot_state_dim
+    if hasattr(dataset, "skill_dim"):
+        cfg.skill_dim = dataset.skill_dim
 
     if cfg.observation_type == "state":
         cfg.parts_poses_dim = dataset.parts_poses_dim

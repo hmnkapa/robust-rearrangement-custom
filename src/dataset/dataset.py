@@ -142,6 +142,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.train_data = {
             "robot_state": torch.from_numpy(combined_data["robot_state"]),
             "action": torch.from_numpy(combined_data[f"action/{control_mode}"]),
+            "skill": torch.from_numpy(combined_data["skill"]),
         }
 
         # Fit the normalizer to the data
@@ -208,6 +209,7 @@ class ImageDataset(torch.utils.data.Dataset):
         # Add action and observation dimensions to the dataset
         self.action_dim = self.train_data["action"].shape[-1]
         self.robot_state_dim = self.train_data["robot_state"].shape[-1]
+        self.skill_dim = self.train_data["skill"].shape[-1]
 
         # Set the limits for the action indices based on wether we predict past actions or not
         # First action refers to the first action we predict, not necessarily the first action executed
@@ -319,6 +321,7 @@ class ImageDataset(torch.utils.data.Dataset):
         nsample["color_image1"] = nsample["color_image1"][: self.obs_horizon, :]
         nsample["color_image2"] = nsample["color_image2"][: self.obs_horizon, :]
         nsample["robot_state"] = nsample["robot_state"][: self.obs_horizon, :]
+        nsample["skill"] = nsample["skill"][: self.obs_horizon, :]
 
         # Discard unused actions
         nsample["action"] = nsample["action"][
@@ -455,6 +458,7 @@ class RGBDDataset(torch.utils.data.Dataset):
         self.train_data = {
             "robot_state": torch.from_numpy(combined_data["robot_state"]),
             "action": torch.from_numpy(combined_data[f"action/{control_mode}"]),
+            "skill": torch.from_numpy(combined_data["skill"]),
         }
 
         # Fit the normalizer to the data
@@ -527,6 +531,7 @@ class RGBDDataset(torch.utils.data.Dataset):
         # Add action and observation dimensions to the dataset
         self.action_dim = self.train_data["action"].shape[-1]
         self.robot_state_dim = self.train_data["robot_state"].shape[-1]
+        self.skill_dim = self.train_data["skill"].shape[-1]
 
         # Set the limits for the action indices based on wether we predict past actions or not
         # First action refers to the first action we predict, not necessarily the first action executed
@@ -646,6 +651,7 @@ class RGBDDataset(torch.utils.data.Dataset):
         nsample["depth_image1"] = nsample["depth_image1"][: self.obs_horizon, :]
         nsample["depth_image2"] = nsample["depth_image2"][: self.obs_horizon, :]
         nsample["robot_state"] = nsample["robot_state"][: self.obs_horizon, :]
+        nsample["skill"] = nsample["skill"][: self.obs_horizon, :]
 
         # Discard unused actions
         nsample["action"] = nsample["action"][

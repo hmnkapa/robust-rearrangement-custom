@@ -60,6 +60,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
     encoder2_proj: nn.Module
 
     camera_2_vib: VIB
+    skill_dim: int = 5
 
     def __init__(
         self,
@@ -255,7 +256,10 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             self.encoder1_proj = nn.Identity()
             self.encoder2_proj = nn.Identity()
 
-        self.timestep_obs_dim = cfg.robot_state_dim + 2 * self.encoding_dim
+        self.skill_dim = getattr(cfg, "skill_dim", self.skill_dim)
+        self.timestep_obs_dim = (
+            cfg.robot_state_dim + self.skill_dim + 2 * self.encoding_dim
+        )
 
     # === Inference Observations ===
     def _normalized_obs(self, obs: deque, flatten: bool = True):
@@ -278,6 +282,11 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         # Normalize the robot_state
         nrobot_state = self.normalizer(robot_state, "robot_state", forward=True)
+        skill = torch.zeros(
+            (*nrobot_state.shape[:2], self.skill_dim),
+            device=nrobot_state.device,
+            dtype=nrobot_state.dtype,
+        )
 
         B = nrobot_state.shape[0]
 
@@ -322,7 +331,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
                 feature2 = self.camera_2_vib(feature2)
 
             # Reshape concatenate the features
-            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+            nobs = torch.cat([nrobot_state, skill, feature1, feature2], dim=-1)
         elif self.observation_type == "rgbd":
             img_size = obs[0]["color_image1"].shape[-3:]
             depth_size = obs[0]["depth_image1"].shape[-2:]
@@ -364,7 +373,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             if self.camera_2_vib is not None:
                 feature2 = self.camera_2_vib(feature2)
 
-            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+            nobs = torch.cat([nrobot_state, skill, feature1, feature2], dim=-1)
         elif self.observation_type == "state":
             # Convert parts_poses from obs_horizon x (n_envs, parts_poses_dim) -> (n_envs, obs_horizon, parts_poses_dim)
             parts_poses = torch.cat([o["parts_poses"].unsqueeze(1) for o in obs], dim=1)
@@ -538,6 +547,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         if self.observation_type == "image":
             # The robot state is already normalized in the dataset
             nrobot_state = batch["robot_state"]
+            skill = batch["skill"].to(nrobot_state.dtype)
             B = nrobot_state.shape[0]
 
             image1: torch.Tensor = batch["color_image1"]
@@ -587,11 +597,12 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
                 batch["confusion_loss"] = confusion_loss
 
             # Combine the robot_state and image features, (B, obs_horizon, obs_dim)
-            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+            nobs = torch.cat([nrobot_state, skill, feature1, feature2], dim=-1)
 
         elif self.observation_type == "rgbd":
             # The robot state is already normalized in the dataset
             nrobot_state = batch["robot_state"]
+            skill = batch["skill"].to(nrobot_state.dtype)
             B = nrobot_state.shape[0]
 
             image1: torch.Tensor = batch["color_image1"]
@@ -657,7 +668,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
                 batch["confusion_loss"] = confusion_loss
 
             # Combine the robot_state and image features, (B, obs_horizon, obs_dim)
-            nobs = torch.cat([nrobot_state, feature1, feature2], dim=-1)
+            nobs = torch.cat([nrobot_state, skill, feature1, feature2], dim=-1)
 
         elif self.observation_type == "state":
             # Parts poses are already normalized in the dataset

@@ -27,6 +27,12 @@ from src.data_processing.utils import clip_quat_xyzw_magnitude
 from ipdb import set_trace as bp  # noqa
 import sys
 
+SKILL_ORDER = ("pick", "place", "insert", "screw", "push")
+SKILL_TO_ONEHOT = {
+    skill: np.eye(len(SKILL_ORDER), dtype=np.float32)[idx]
+    for idx, skill in enumerate(SKILL_ORDER)
+}
+
 
 # === Modified Function to Initialize Zarr Store with Full Dimensions ===
 def initialize_zarr_store(out_path, full_data_shapes, chunksize=32):
@@ -181,18 +187,29 @@ def process_pickle_file(
     # Convert delta action to use 6D rotation
     action_delta_6d = np_action_quat_to_6d_rotation(action_delta_quat)
 
-    # Extract the rewards and skills from the pickle file
+    # Extract the rewards from the pickle file
     reward = (
         np.array(data["rewards"], dtype=np.float32)
         if "rewards" in data
         else np.zeros(len(action_delta_6d))
     )
     reward = reward[:len(action_delta_6d)]
-    skill = (
-        np.array(data["skills"], dtype=np.float32)
-        if "skills" in data
-        else np.zeros_like(reward)
-    )
+
+    # Use observation-level skill labels as the authoritative source.
+    skill = np.zeros((len(obs), len(SKILL_ORDER)), dtype=np.float32)
+    for idx, observation in enumerate(obs):
+        skill_label = observation.get("skill")
+        if skill_label is None:
+            continue
+        if isinstance(skill_label, bytes):
+            skill_label = skill_label.decode("utf-8")
+        if skill_label not in SKILL_TO_ONEHOT:
+            raise ValueError(
+                f"Unknown skill label {skill_label!r} in {pickle_path}. "
+                f"Expected one of {SKILL_ORDER}."
+            )
+        skill[idx] = SKILL_TO_ONEHOT[skill_label]
+
     augment_states = (
         data["augment_states"] if "augment_states" in data else np.zeros_like(reward)
     )
@@ -561,7 +578,7 @@ if __name__ == "__main__":
             ("action/pos", (total_timesteps,) + sample_data["action/pos"].shape[1:], np.float32),
             ("parts_poses", (total_timesteps,) + sample_data["parts_poses"].shape[1:], np.float32),
             ("reward", (total_timesteps,), np.float32),
-            ("skill", (total_timesteps,), np.float32),
+            ("skill", (total_timesteps,) + sample_data["skill"].shape[1:], np.float32),
             ("augment_states", (total_timesteps,), np.float32),
             ("episode_ends", (len(episode_lengths),), np.uint32),
             ("task", (len(episode_lengths),), str),
@@ -621,7 +638,7 @@ if __name__ == "__main__":
                     batch_timeseries[k] = np.concatenate(batch_timeseries[k])
                 else:
                     # Create empty array with correct trailing dims
-                    if k in ["robot_state", "action/delta", "action/pos", "parts_poses"]:
+                    if k in ["robot_state", "action/delta", "action/pos", "parts_poses", "skill"]:
                         batch_timeseries[k] = np.empty((0, batch_timeseries[k][0].shape[1] if batch_timeseries[k] else 0), dtype=np.float32)
                     else:
                         batch_timeseries[k] = np.empty((0,), dtype=np.float32)
