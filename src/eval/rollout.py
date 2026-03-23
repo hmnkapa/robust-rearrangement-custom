@@ -30,7 +30,7 @@ from datetime import datetime
 from src.eval.skill_annotation_util import (
     draw_guidance_point_on_image,
     draw_skill_on_image,
-    get_annotation_bundle,
+    get_annotation_bundle_all_envs,
     reset_skill_annotator,
 )
 
@@ -134,6 +134,30 @@ def tensordict_to_list_of_dicts(tensordict):
     return list_of_dicts
 
 
+def _draw_guidance_points_for_all_envs(video_obs, annotation_bundles, annotate_wrist_camera: bool):
+    image_keys = ["color_image2"]
+    if annotate_wrist_camera:
+        image_keys.append("color_image1")
+
+    for image_key in image_keys:
+        if image_key not in video_obs:
+            continue
+        image_batch = video_obs[image_key].cpu().numpy()
+        annotated_batch = image_batch.copy()
+        for env_idx, bundle in enumerate(annotation_bundles):
+            guidance = bundle.get("guidance_point_2d", {}).get(image_key)
+            annotated_batch[env_idx] = draw_guidance_point_on_image(
+                annotated_batch[env_idx], guidance
+            )
+        video_obs[image_key] = torch.from_numpy(annotated_batch).to(video_obs[image_key].device)
+
+
+def _transpose_step_env_annotations(values, num_envs: int):
+    if not values:
+        return [[] for _ in range(num_envs)]
+    return [[values[step_idx][env_idx] for step_idx in range(len(values))] for env_idx in range(num_envs)]
+
+
 class SuccessTqdm(tqdm):
     def __init__(
         self,
@@ -189,41 +213,45 @@ def rollout(
         reset_skill_annotator(env)
 
     video_obs = deepcopy(obs)
-    previous_skill = None
-    initial_annotation = (
-        get_annotation_bundle(
+    previous_skills = [None] * env.num_envs
+    initial_annotations = (
+        get_annotation_bundle_all_envs(
             env,
-            previous_skill,
+            previous_skills=previous_skills,
             annotate_wrist_camera=annotate_wrist_camera,
             resize_images=resize_video,
         )
         if annotate_skill
-        else None
+        else [{} for _ in range(env.num_envs)]
     )
-    initial_skill = initial_annotation["skill"] if initial_annotation is not None else None
-    initial_guidance_point = (
-        None if initial_annotation is None else initial_annotation["guidance_point"]
-    )
-    initial_guidance_point_2d = (
-        {} if initial_annotation is None else initial_annotation["guidance_point_2d"]
-    )
-    if initial_skill is not None:
-        previous_skill = initial_skill
+    initial_skills = [bundle.get("skill") for bundle in initial_annotations]
+    initial_guidance_points = [bundle.get("guidance_point") for bundle in initial_annotations]
+    initial_guidance_points_2d = [
+        bundle.get("guidance_point_2d", {}) for bundle in initial_annotations
+    ]
+    for env_idx, skill in enumerate(initial_skills):
+        if skill is not None:
+            previous_skills[env_idx] = skill
     if annotate_skill:
-        initial_debug = {} if initial_annotation is None else initial_annotation.get("debug", {})
-        if initial_debug:
+        for env_idx, initial_annotation in enumerate(initial_annotations):
+            initial_debug = initial_annotation.get("debug", {})
+            if initial_debug:
+                print(
+                    f"[skill-debug] env={env_idx} step=0 idx={initial_debug.get('assemble_idx')} "
+                    f"part={initial_debug.get('active_part')} phase={initial_debug.get('phase')} "
+                    f"skill={initial_skills[env_idx]}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[skill-debug] env={env_idx} step=0 skill={initial_skills[env_idx]}",
+                    flush=True,
+                )
             print(
-                f"[skill-debug] step=0 idx={initial_debug.get('assemble_idx')} "
-                f"part={initial_debug.get('active_part')} phase={initial_debug.get('phase')} "
-                f"skill={initial_skill}",
+                f"[guidance-debug] env={env_idx} step=0 gp={initial_guidance_points[env_idx]} "
+                f"gp_2d={initial_guidance_points_2d[env_idx]}",
                 flush=True,
             )
-        else:
-            print(f"[skill-debug] step=0 skill={initial_skill}", flush=True)
-        print(
-            f"[guidance-debug] step=0 gp={initial_guidance_point} gp_2d={initial_guidance_point_2d}",
-            flush=True,
-        )
 
     # Resize the images in the observation if they exist
     resize_image(obs, "color_image1")
@@ -238,24 +266,10 @@ def rollout(
         resize_depth(video_obs, "depth_image1")
         resize_crop_depth(video_obs, "depth_image2")
 
-    if annotate_skill and initial_annotation is not None:
-        initial_guidance = initial_annotation["guidance_point_2d"]
-        if "color_image2" in video_obs:
-            img2 = video_obs["color_image2"].cpu().numpy()
-            # print(
-            #     f"[guidance-draw-debug] step=0 image=color_image2 shape={img2.shape} uv={initial_guidance.get('color_image2')}",
-            #     flush=True,
-            # )
-            img2 = draw_guidance_point_on_image(img2, initial_guidance.get("color_image2"))
-            video_obs["color_image2"] = torch.from_numpy(img2).to(video_obs["color_image2"].device)
-        if annotate_wrist_camera and "color_image1" in video_obs:
-            img1 = video_obs["color_image1"].cpu().numpy()
-            # print(
-            #     f"[guidance-draw-debug] step=0 image=color_image1 shape={img1.shape} uv={initial_guidance.get('color_image1')}",
-            #     flush=True,
-            # )
-            img1 = draw_guidance_point_on_image(img1, initial_guidance.get("color_image1"))
-            video_obs["color_image1"] = torch.from_numpy(img1).to(video_obs["color_image1"].device)
+    if annotate_skill:
+        _draw_guidance_points_for_all_envs(
+            video_obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
+        )
 
     # save initial visualization and rewards
     robot_states = [TensorDict(video_obs["robot_state"], batch_size=env.num_envs)]
@@ -264,16 +278,10 @@ def rollout(
     depth_image1 = [] if "depth_image1" not in video_obs else [video_obs["depth_image1"]]
     depth_image2 = [] if "depth_image2" not in video_obs else [video_obs["depth_image2"]]
     parts_poses = [video_obs["parts_poses"].cpu()]
-    skills = [initial_skill]
-    guidance_points = [
-        None if initial_annotation is None else initial_annotation["guidance_point"]
-    ]
-    guidance_points_2d = [
-        {} if initial_annotation is None else initial_annotation["guidance_point_2d"]
-    ]
-    camera_infos = [
-        {} if initial_annotation is None else initial_annotation["camera_info"]
-    ]
+    skills = [initial_skills]
+    guidance_points = [initial_guidance_points]
+    guidance_points_2d = [initial_guidance_points_2d]
+    camera_infos = [[bundle.get("camera_info", {}) for bundle in initial_annotations]]
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
     done = torch.zeros((env.num_envs, 1), dtype=torch.bool, device="cuda")
@@ -324,40 +332,44 @@ def rollout(
             pcs_step = None
 
         video_obs = deepcopy(obs)
-        current_annotation = (
-            get_annotation_bundle(
+        current_annotations = (
+            get_annotation_bundle_all_envs(
                 env,
-                previous_skill,
+                previous_skills=previous_skills,
                 annotate_wrist_camera=annotate_wrist_camera,
                 resize_images=resize_video,
             )
             if annotate_skill
-            else None
+            else [{} for _ in range(env.num_envs)]
         )
-        current_skill = current_annotation["skill"] if current_annotation is not None else None
-        current_guidance_point = (
-            None if current_annotation is None else current_annotation["guidance_point"]
-        )
-        current_guidance_point_2d = (
-            {} if current_annotation is None else current_annotation["guidance_point_2d"]
-        )
-        if current_skill is not None:
-            previous_skill = current_skill
+        current_skills = [bundle.get("skill") for bundle in current_annotations]
+        current_guidance_points = [bundle.get("guidance_point") for bundle in current_annotations]
+        current_guidance_points_2d = [
+            bundle.get("guidance_point_2d", {}) for bundle in current_annotations
+        ]
+        for env_idx, skill in enumerate(current_skills):
+            if skill is not None:
+                previous_skills[env_idx] = skill
         if annotate_skill:
-            current_debug = {} if current_annotation is None else current_annotation.get("debug", {})
-            if current_debug:
+            for env_idx, current_annotation in enumerate(current_annotations):
+                current_debug = current_annotation.get("debug", {})
+                if current_debug:
+                    print(
+                        f"[skill-debug] env={env_idx} step={step_idx + 1} idx={current_debug.get('assemble_idx')} "
+                        f"part={current_debug.get('active_part')} phase={current_debug.get('phase')} "
+                        f"skill={current_skills[env_idx]}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[skill-debug] env={env_idx} step={step_idx + 1} skill={current_skills[env_idx]}",
+                        flush=True,
+                    )
                 print(
-                    f"[skill-debug] step={step_idx + 1} idx={current_debug.get('assemble_idx')} "
-                    f"part={current_debug.get('active_part')} phase={current_debug.get('phase')} "
-                    f"skill={current_skill}",
+                    f"[guidance-debug] env={env_idx} step={step_idx + 1} gp={current_guidance_points[env_idx]} "
+                    f"gp_2d={current_guidance_points_2d[env_idx]}",
                     flush=True,
                 )
-            else:
-                print(f"[skill-debug] step={step_idx + 1} skill={current_skill}", flush=True)
-            print(
-                f"[guidance-debug] step={step_idx + 1} gp={current_guidance_point} gp_2d={current_guidance_point_2d}",
-                flush=True,
-            )
 
         # Resize the images in the observation if they exist
         resize_image(obs, "color_image1")
@@ -373,29 +385,9 @@ def rollout(
             resize_crop_depth(video_obs, "depth_image2")
 
         if annotate_skill:
-            guidance_for_draw = current_annotation["guidance_point_2d"]
-            if "color_image2" in video_obs:
-                img2 = video_obs["color_image2"].cpu().numpy()
-                # print(
-                #     f"[guidance-draw-debug] step={step_idx + 1} image=color_image2 shape={img2.shape} uv={guidance_for_draw.get('color_image2')}",
-                #     flush=True,
-                # )
-                img2 = draw_guidance_point_on_image(
-                    img2,
-                    guidance_for_draw.get("color_image2"),
-                )
-                video_obs["color_image2"] = torch.from_numpy(img2).to(obs["color_image2"].device)
-            if annotate_wrist_camera and "color_image1" in video_obs:
-                img1 = video_obs["color_image1"].cpu().numpy()
-                # print(
-                #     f"[guidance-draw-debug] step={step_idx + 1} image=color_image1 shape={img1.shape} uv={guidance_for_draw.get('color_image1')}",
-                #     flush=True,
-                # )
-                img1 = draw_guidance_point_on_image(
-                    img1,
-                    guidance_for_draw.get("color_image1"),
-                )
-                video_obs["color_image1"] = torch.from_numpy(img1).to(obs["color_image1"].device)
+            _draw_guidance_points_for_all_envs(
+                video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
+            )
 
         # Store the results for visualization and logging
         if save_rollouts:
@@ -412,16 +404,10 @@ def rollout(
                 depth_image2.append(video_obs["depth_image2"])
             actions.append(action_pred.cpu())
             parts_poses.append(video_obs["parts_poses"].cpu())
-            skills.append(current_skill)
-            guidance_points.append(
-                None if current_annotation is None else current_annotation["guidance_point"]
-            )
-            guidance_points_2d.append(
-                {} if current_annotation is None else current_annotation["guidance_point_2d"]
-            )
-            camera_infos.append(
-                {} if current_annotation is None else current_annotation["camera_info"]
-            )
+            skills.append(current_skills)
+            guidance_points.append(current_guidance_points)
+            guidance_points_2d.append(current_guidance_points_2d)
+            camera_infos.append([bundle.get("camera_info", {}) for bundle in current_annotations])
 
             # Collect point clouds at each step
             if pcs_step is not None:
@@ -463,6 +449,13 @@ def rollout(
     else:
         pcs_per_env = None
 
+    skills_per_env = _transpose_step_env_annotations(skills, env.num_envs)
+    guidance_points_per_env = _transpose_step_env_annotations(guidance_points, env.num_envs)
+    guidance_points_2d_per_env = _transpose_step_env_annotations(
+        guidance_points_2d, env.num_envs
+    )
+    camera_infos_per_env = _transpose_step_env_annotations(camera_infos, env.num_envs)
+
     # print(f"[DEBUG] imgs1 shape: {(torch.stack(imgs1, dim=1) if imgs1 else []).shape}", flush=True)
     # print(f"[DEBUG] imgs2 shape: {(torch.stack(imgs2, dim=1) if imgs2 else []).shape}", flush=True)
     # print(f"[DEBUG] depth_image2 shape: {(torch.stack(depth_image2, dim=1) if depth_image2 else []).shape}", flush=True)
@@ -479,10 +472,10 @@ def rollout(
         pcs_per_env,
         torch.stack(depth_image1, dim=1) if depth_image1 else [],
         torch.stack(depth_image2, dim=1) if depth_image2 else [],
-        skills,
-        guidance_points,
-        guidance_points_2d,
-        camera_infos,
+        skills_per_env,
+        guidance_points_per_env,
+        guidance_points_2d_per_env,
+        camera_infos_per_env,
     )
 
 
@@ -574,10 +567,22 @@ def calculate_success_rate(
                 actions = rollout_data.actions[env_idx].numpy()
                 rewards = rollout_data.rewards[env_idx].numpy()
                 parts_poses = rollout_data.parts_poses[env_idx].numpy()
-                skills = [s for s in rollout_data.skills]
-                guidance_points = [g for g in rollout_data.guidance_points]
-                guidance_points_2d = [g for g in rollout_data.guidance_points_2d]
-                camera_infos = [c for c in rollout_data.camera_infos]
+                skills = rollout_data.skills[env_idx] if rollout_data.skills else []
+                guidance_points = (
+                    rollout_data.guidance_points[env_idx]
+                    if rollout_data.guidance_points
+                    else []
+                )
+                guidance_points_2d = (
+                    rollout_data.guidance_points_2d[env_idx]
+                    if rollout_data.guidance_points_2d
+                    else []
+                )
+                camera_infos = (
+                    rollout_data.camera_infos[env_idx]
+                    if rollout_data.camera_infos
+                    else []
+                )
                 success = success_flags[env_idx].item()
                 task = env.furniture_name
                 

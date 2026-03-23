@@ -122,9 +122,6 @@ def validate_args(args: argparse.Namespace):
     assert not args.skill_on_image or args.annotate_skill, (
         "--skill-on-image requires --annotate-skill"
     )
-    assert not args.annotate_skill or args.n_envs == 1, (
-        "--annotate-skill currently supports only --n-envs 1"
-    )
 
 
 def get_runs(args: argparse.Namespace, map_location: Optional[torch.device] = None) -> List[Run]:

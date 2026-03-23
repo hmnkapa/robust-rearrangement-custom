@@ -31,6 +31,17 @@ def _to_numpy(x):
     return np.asarray(x)
 
 
+def _to_torch(x, device=None, dtype=None):
+    if torch.is_tensor(x):
+        out = x.clone()
+        if device is not None:
+            out = out.to(device)
+        if dtype is not None:
+            out = out.to(dtype=dtype)
+        return out
+    return torch.as_tensor(x, device=device, dtype=dtype)
+
+
 def _homogeneous_from_pos_rot(pos, rot):
     mat = np.eye(4, dtype=np.float32)
     mat[:3, :3] = rot
@@ -226,6 +237,97 @@ def _build_camera_info(
     return camera_info
 
 
+def _get_env_offset(env, env_idx: int, base_pos_global: torch.Tensor) -> torch.Tensor:
+    franka_origin = _to_torch(
+        np.asarray(env.franka_from_origin_mat, dtype=np.float32)[:3, 3],
+        device=base_pos_global.device,
+        dtype=base_pos_global.dtype,
+    )
+    return base_pos_global - franka_origin
+
+
+def _make_env_local_annotation_inputs(env, env_idx: int, annotation_inputs):
+    if "base_pos" in annotation_inputs and annotation_inputs["base_pos"] is not None:
+        base_pos_global = _to_torch(
+            annotation_inputs["base_pos"], device=env.device, dtype=torch.float32
+        )
+    else:
+        base_pos_global = env.rb_states[env.base_idxs[env_idx], :3].clone().to(torch.float32)
+
+    env_offset = _get_env_offset(env, env_idx, base_pos_global)
+
+    local_inputs = dict(annotation_inputs)
+    local_inputs["env_idx"] = env_idx
+    local_inputs["env_offset"] = env_offset.clone()
+
+    if "camera_cfgs" not in local_inputs and hasattr(env, "camera_cfgs"):
+        local_inputs["camera_cfgs"] = env.camera_cfgs
+    elif "camera_cfgs" not in local_inputs and hasattr(env, "camera_cfg"):
+        local_inputs["camera_cfgs"] = {
+            "front": {
+                "width": env.camera_cfg.width,
+                "height": env.camera_cfg.height,
+                "near_plane": env.camera_cfg.near_plane,
+                "far_plane": env.camera_cfg.far_plane,
+                "horizontal_fov": env.camera_cfg.horizontal_fov,
+            },
+            "wrist": {
+                "width": env.camera_cfg.width,
+                "height": env.camera_cfg.height,
+                "near_plane": env.camera_cfg.near_plane,
+                "far_plane": env.camera_cfg.far_plane,
+                "horizontal_fov": 55.0 if getattr(env, "resize_img", False) else 69.4,
+            },
+        }
+
+    if "front_cam_pos" not in local_inputs and hasattr(env, "front_cam_pos"):
+        local_inputs["front_cam_pos"] = np.asarray(env.front_cam_pos, dtype=np.float32)
+    if "front_cam_target" not in local_inputs and hasattr(env, "front_cam_target"):
+        local_inputs["front_cam_target"] = np.asarray(env.front_cam_target, dtype=np.float32)
+    if "wrist_cam_offset_pos" not in local_inputs and hasattr(env, "wrist_cam_offset_pos"):
+        local_inputs["wrist_cam_offset_pos"] = np.asarray(env.wrist_cam_offset_pos, dtype=np.float32)
+    if "wrist_cam_offset_euler" not in local_inputs and hasattr(env, "wrist_cam_offset_euler"):
+        local_inputs["wrist_cam_offset_euler"] = np.asarray(env.wrist_cam_offset_euler, dtype=np.float32)
+
+    local_inputs["base_pos"] = (base_pos_global - env_offset).clone()
+
+    if "ee_pos_sim" in local_inputs and local_inputs["ee_pos_sim"] is not None:
+        local_inputs["ee_pos_sim"] = (
+            _to_torch(local_inputs["ee_pos_sim"], device=env.device, dtype=torch.float32)
+            - env_offset
+        )
+    elif hasattr(env, "ee_idxs"):
+        local_inputs["ee_pos_sim"] = env.rb_states[env.ee_idxs[env_idx], :3].clone() - env_offset
+
+    if "ee_quat_sim" not in local_inputs and hasattr(env, "ee_idxs"):
+        local_inputs["ee_quat_sim"] = env.rb_states[env.ee_idxs[env_idx], 3:7].clone()
+
+    for key in ["left_finger_pos", "right_finger_pos"]:
+        if key in local_inputs and local_inputs[key] is not None:
+            local_inputs[key] = (
+                _to_torch(local_inputs[key], device=env.device, dtype=torch.float32) - env_offset
+            )
+
+    compact_indices = []
+    compact_part_idxs = {}
+    for name, part_indices in env.part_idxs.items():
+        if len(part_indices) <= env_idx:
+            continue
+        compact_part_idxs[name] = [len(compact_indices)]
+        compact_indices.append(int(part_indices[env_idx]))
+
+    if compact_indices:
+        compact_rb_states = env.rb_states[compact_indices].clone()
+        compact_rb_states[:, :3] -= env_offset.unsqueeze(0)
+    else:
+        compact_rb_states = env.rb_states.new_zeros((0, env.rb_states.shape[1]))
+
+    local_inputs["rb_states"] = compact_rb_states
+    local_inputs["part_idxs"] = compact_part_idxs
+
+    return local_inputs
+
+
 @dataclass
 class SkillAnnotator:
     furniture_name: str
@@ -365,7 +467,13 @@ class SkillAnnotator:
         if callable(reset_skill_state_fn):
             reset_skill_state_fn()
 
-    def step(self, env, annotate_wrist_camera: bool = False, resize_images: bool = True):
+    def step(
+        self,
+        env,
+        env_idx: int = 0,
+        annotate_wrist_camera: bool = False,
+        resize_images: bool = True,
+    ):
         if self.furniture_name not in {"one_leg", "round_table", "lamp"}:
             return {
                 "skill": None,
@@ -373,15 +481,10 @@ class SkillAnnotator:
                 "guidance_point_2d": {},
                 "camera_info": {},
             }
-        if getattr(env, "num_envs", 1) != 1:
-            return {
-                "skill": None,
-                "guidance_point": None,
-                "guidance_point_2d": {},
-                "camera_info": {},
-            }
 
-        annotation_inputs = env.get_skill_annotation_inputs()
+        annotation_inputs = _make_env_local_annotation_inputs(
+            env, env_idx, env.get_skill_annotation_inputs(env_idx=env_idx)
+        )
         incoming_assemble_idx = annotation_inputs.get("current_assemble_idx")
         num_pairs = len(self.furniture.should_be_assembled)
         if incoming_assemble_idx is not None:
@@ -485,12 +588,41 @@ def torch_inv(mat):
     return mat.inverse()
 
 
-def reset_skill_annotator(env):
-    env._skill_annotator = SkillAnnotator(getattr(env, "furniture_name", ""))
+def reset_skill_annotator(env, env_idx: Optional[int] = None):
+    furniture_name = getattr(env, "furniture_name", "")
+    num_envs = max(int(getattr(env, "num_envs", 1)), 1)
+    if env_idx is None:
+        env._skill_annotators = [SkillAnnotator(furniture_name) for _ in range(num_envs)]
+        env._skill_annotator = env._skill_annotators[0]
+        return
+
+    annotators = getattr(env, "_skill_annotators", None)
+    if annotators is None or len(annotators) != num_envs:
+        reset_skill_annotator(env)
+        annotators = env._skill_annotators
+
+    annotators[env_idx] = SkillAnnotator(furniture_name)
+    env._skill_annotator = annotators[0]
 
 
-def get_annotation_bundle(
+def _get_or_create_skill_annotator(env, env_idx: int) -> SkillAnnotator:
+    num_envs = max(int(getattr(env, "num_envs", 1)), 1)
+    annotators = getattr(env, "_skill_annotators", None)
+    if (
+        annotators is None
+        or len(annotators) != num_envs
+        or any(getattr(a, "furniture_name", None) != getattr(env, "furniture_name", None) for a in annotators)
+    ):
+        reset_skill_annotator(env)
+        annotators = env._skill_annotators
+
+    env._skill_annotator = annotators[0]
+    return annotators[env_idx]
+
+
+def get_annotation_bundle_for_env(
     env,
+    env_idx: int,
     previous_skill: str | None = None,
     annotate_wrist_camera: bool = False,
     resize_images: bool = True,
@@ -504,16 +636,53 @@ def get_annotation_bundle(
             "debug": {},
         }
 
-    annotator = getattr(env, "_skill_annotator", None)
-    if annotator is None or getattr(annotator, "furniture_name", None) != env.furniture_name:
-        reset_skill_annotator(env)
-        annotator = env._skill_annotator
+    annotator = _get_or_create_skill_annotator(env, env_idx)
 
     if previous_skill is not None and annotator.previous_skill is None:
         annotator.previous_skill = previous_skill
 
     return annotator.step(
         env,
+        env_idx=env_idx,
+        annotate_wrist_camera=annotate_wrist_camera,
+        resize_images=resize_images,
+    )
+
+
+def get_annotation_bundle_all_envs(
+    env,
+    previous_skills: Optional[list[str | None]] = None,
+    annotate_wrist_camera: bool = False,
+    resize_images: bool = True,
+):
+    num_envs = max(int(getattr(env, "num_envs", 1)), 1)
+    bundles = []
+    for env_idx in range(num_envs):
+        previous_skill = None
+        if previous_skills is not None and env_idx < len(previous_skills):
+            previous_skill = previous_skills[env_idx]
+        bundles.append(
+            get_annotation_bundle_for_env(
+                env,
+                env_idx=env_idx,
+                previous_skill=previous_skill,
+                annotate_wrist_camera=annotate_wrist_camera,
+                resize_images=resize_images,
+            )
+        )
+    return bundles
+
+
+def get_annotation_bundle(
+    env,
+    previous_skill: str | None = None,
+    annotate_wrist_camera: bool = False,
+    resize_images: bool = True,
+):
+    return get_annotation_bundle_for_env(
+        env,
+        env_idx=0,
+        previous_skill=previous_skill,
         annotate_wrist_camera=annotate_wrist_camera,
         resize_images=resize_images,
     )
