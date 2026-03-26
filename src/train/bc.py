@@ -91,21 +91,37 @@ def _checkpoint_epoch(path: Path) -> int:
 
 
 def find_local_resume_checkpoint(
-    model_save_dir: Union[str, Path], run_name_candidates
+    model_save_dir: Union[str, Path], run_name_candidates, search_roots
 ) -> Optional[Path]:
     model_save_dir = Path(model_save_dir)
     candidate_dirs = []
     seen_dirs = set()
 
-    for run_name in run_name_candidates:
-        if not run_name:
-            continue
-        run_dir = model_save_dir / run_name
-        run_dir_key = str(run_dir)
-        if run_dir_key in seen_dirs:
-            continue
-        seen_dirs.add(run_dir_key)
-        candidate_dirs.append(run_dir)
+    for root in search_roots:
+        root = Path(root)
+        base_model_dir = model_save_dir if model_save_dir.is_absolute() else root / model_save_dir
+
+        for run_name in run_name_candidates:
+            if not run_name:
+                continue
+
+            direct_run_dir = base_model_dir / run_name
+            direct_run_dir_key = str(direct_run_dir)
+            if direct_run_dir_key not in seen_dirs:
+                seen_dirs.add(direct_run_dir_key)
+                candidate_dirs.append(direct_run_dir)
+
+            outputs_root = root / "outputs"
+            if not outputs_root.exists():
+                continue
+
+            search_pattern = str(model_save_dir / run_name)
+            for output_run_dir in outputs_root.glob(f"**/{search_pattern}"):
+                output_run_dir_key = str(output_run_dir)
+                if output_run_dir_key in seen_dirs:
+                    continue
+                seen_dirs.add(output_run_dir_key)
+                candidate_dirs.append(output_run_dir)
 
     for run_dir in candidate_dirs:
         last_checkpoint = run_dir / "actor_chkpt_last.pt"
@@ -134,6 +150,7 @@ def resolve_resume_state(
     run_path = f"{cfg.wandb.project}/{run_id}"
     wandb_mode = cfg.wandb.mode
     data_paths_override = cfg.data.data_paths_override
+    original_cwd = Path(hydra.utils.get_original_cwd())
 
     run_name_candidates = [cfg.wandb.name, run_id]
     remote_error = None
@@ -171,7 +188,9 @@ def resolve_resume_state(
 
     if state_dict is None:
         local_checkpoint_path = find_local_resume_checkpoint(
-            cfg.training.model_save_dir, run_name_candidates
+            cfg.training.model_save_dir,
+            run_name_candidates,
+            search_roots=[Path.cwd(), original_cwd],
         )
 
         if local_checkpoint_path is None:
@@ -180,7 +199,8 @@ def resolve_resume_state(
             )
             raise FileNotFoundError(
                 "Could not resume training. No checkpoint was found in W&B or in "
-                f"'{cfg.training.model_save_dir}' for run '{run_id}'."
+                f"'{cfg.training.model_save_dir}' or under '{original_cwd / 'outputs'}' "
+                f"for run '{run_id}'."
                 f"{remote_error_message}"
             )
 
