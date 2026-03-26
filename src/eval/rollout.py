@@ -219,6 +219,7 @@ def rollout(
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
+    full_length_rollout: bool = False,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
@@ -329,7 +330,7 @@ def rollout(
     actor.normalizer = actor.normalizer.to(actor.device)
     actor.model = actor.model.to(actor.device)
 
-    while not done.all():
+    while True:
         # Convert from robot state dict to robot state tensor
         if not getattr(actor, "expects_raw_robot_state", False):
             obs["robot_state"] = env.filter_and_concat_robot_state(obs["robot_state"])
@@ -456,7 +457,10 @@ def rollout(
         if step_idx >= rollout_max_steps:
             done = torch.ones((env.num_envs, 1), dtype=torch.bool, device="cuda")
 
-        if done.all():
+        if done.all() and not full_length_rollout:
+            break
+
+        if step_idx >= rollout_max_steps:
             break
 
     # Reorganize point_clouds from [step][env] to [env][step]
@@ -524,6 +528,7 @@ def calculate_success_rate(
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
+    full_length_rollout: bool = False,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -575,6 +580,7 @@ def calculate_success_rate(
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
+            full_length_rollout=full_length_rollout,
         )
 
         # Calculate the success rate
@@ -656,10 +662,15 @@ def calculate_success_rate(
                 )
 
                 # Number of steps until success
-                n_steps = (
-                    np.where(rewards == 1)[0][-1] + 1 if success else rollout_max_steps
-                )
-                n_steps += n_steps_padding
+                if full_length_rollout:
+                    n_steps = rollout_max_steps
+                else:
+                    n_steps = (
+                        np.where(rewards == 1)[0][-1] + 1
+                        if success
+                        else rollout_max_steps
+                    )
+                    n_steps += n_steps_padding
                 trim_start_steps = 0
 
                 # Stack the two videos side by side

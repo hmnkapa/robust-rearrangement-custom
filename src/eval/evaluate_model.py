@@ -280,6 +280,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--stop-after-n-success", type=int, default=0)
     parser.add_argument("--break-on-n-success", action="store_true")
+    parser.add_argument(
+        "--full-length-rollout",
+        action="store_true",
+        help="Continue each rollout until max rollout steps even after success, and save the full trajectory.",
+    )
     parser.add_argument("--record-for-coverage", action="store_true")
     parser.add_argument("--annotate-skill", action="store_true")
     parser.add_argument("--skill-on-image", action="store_true")
@@ -578,6 +583,7 @@ if __name__ == "__main__":
                     resize_video=not args.store_full_resolution_video,
                     break_on_n_success=args.break_on_n_success,
                     stop_after_n_success=args.stop_after_n_success,
+                    full_length_rollout=args.full_length_rollout,
                     record_first_state_only=args.record_for_coverage,
                     pc_generator=pc_generator,
                     annotate_skill=args.annotate_skill,
