@@ -15,6 +15,7 @@ from numcodecs import Blosc, JSON
 from tqdm import tqdm, trange
 from src.common.types import Trajectory
 from src.common.files import get_processed_path, get_raw_paths
+from src.common.skills import SKILL_ORDER, SKILL_TO_ONEHOT
 from src.visualization.render_mp4 import unpickle_data
 from src.common.geometry import (
     np_proprioceptive_quat_to_6d_rotation,
@@ -26,13 +27,6 @@ from src.data_processing.utils import clip_quat_xyzw_magnitude
 
 from ipdb import set_trace as bp  # noqa
 import sys
-
-SKILL_ORDER = ("pick", "place", "insert", "screw", "push")
-SKILL_TO_ONEHOT = {
-    skill: np.eye(len(SKILL_ORDER), dtype=np.float32)[idx]
-    for idx, skill in enumerate(SKILL_ORDER)
-}
-
 
 # === Modified Function to Initialize Zarr Store with Full Dimensions ===
 def initialize_zarr_store(out_path, full_data_shapes, chunksize=32):

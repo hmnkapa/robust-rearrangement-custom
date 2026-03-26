@@ -2,6 +2,7 @@ from typing import List
 import furniture_bench
 from furniture_bench.envs.furniture_sim_env import FurnitureSimEnv
 from src.behavior.base import Actor  # noqa
+from src.behavior.base import model_requires_skill_input
 import torch
 from omegaconf import OmegaConf, DictConfig
 from src.eval.rollout import calculate_success_rate
@@ -151,6 +152,7 @@ if __name__ == "__main__":
         n_parts_assemble=n_parts_assemble,
         compress_pickles=compress_pickles,
         resize_video=True,
+        provide_skill_input=model_requires_skill_input(config),
     )
 
     success_rate = rollout_stats.success_rate

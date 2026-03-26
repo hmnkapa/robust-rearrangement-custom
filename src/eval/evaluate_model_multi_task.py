@@ -21,6 +21,7 @@ from gymnasium import Env
 import torch  # needs to be after isaac gym imports
 from omegaconf import DictConfig, OmegaConf
 from src.behavior.base import Actor  # noqa
+from src.behavior.base import model_requires_skill_input
 from src.behavior.diffusion import DiffusionPolicy  # noqa
 from src.eval.rollout import calculate_success_rate
 from src.behavior import get_actor
@@ -656,6 +657,7 @@ if __name__ == "__main__":
                     # Perform the rollouts
                     print(f"Starting rollout of run: {run.name} task: {task}")
                     actor.set_task(task2idx[task])
+                    requires_skill_input = model_requires_skill_input(cfg)
                     rollout_stats = calculate_success_rate(
                         actor=actor,
                         env=env,
@@ -672,6 +674,7 @@ if __name__ == "__main__":
                         stop_after_n_success=args.stop_after_n_success,
                         record_first_state_only=args.record_for_coverage,
                         pc_generator=pc_generator,
+                        provide_skill_input=requires_skill_input,
                     )
 
                     if args.store_video_wandb:

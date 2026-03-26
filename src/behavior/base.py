@@ -18,6 +18,15 @@ from src.common.vision import FrontCameraTransform, WristCameraTransform
 import src.common.geometry as C
 
 
+def actor_name_from_config(cfg: DictConfig) -> str:
+    return cfg.actor_name if "actor_name" in cfg else cfg.actor.name
+
+
+def model_requires_skill_input(cfg: DictConfig) -> bool:
+    skill_dim = cfg.get("skill_dim", None)
+    return skill_dim is not None and int(skill_dim) > 0
+
+
 # Update the PostInitCaller to be compatible
 class PostInitCaller(type(torch.nn.Module)):
     def __call__(cls, *args, **kwargs):
@@ -83,6 +92,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         self.actions = deque(maxlen=self.action_horizon)
 
         self.observation_type = cfg.observation_type
+        self.requires_skill_input = model_requires_skill_input(cfg)
 
         # Define what parts of the robot state to use
         self.include_proprioceptive_pos = actor_cfg.get(
@@ -256,10 +266,71 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             self.encoder1_proj = nn.Identity()
             self.encoder2_proj = nn.Identity()
 
-        self.skill_dim = getattr(cfg, "skill_dim", self.skill_dim)
+        self.skill_dim = int(getattr(cfg, "skill_dim", 0)) if self.requires_skill_input else 0
         self.timestep_obs_dim = (
             cfg.robot_state_dim + self.skill_dim + 2 * self.encoding_dim
         )
+
+    def _zero_skill_tensor(self, batch_shape, device, dtype):
+        return torch.zeros((*batch_shape, self.skill_dim), device=device, dtype=dtype)
+
+    def _training_skill(self, batch, nrobot_state):
+        if self.skill_dim == 0:
+            return self._zero_skill_tensor(
+                nrobot_state.shape[:2],
+                device=nrobot_state.device,
+                dtype=nrobot_state.dtype,
+            )
+
+        if "skill" not in batch:
+            raise KeyError(
+                "This model was trained with skill input, but the batch does not contain a `skill` tensor."
+            )
+
+        skill = batch["skill"].to(device=nrobot_state.device, dtype=nrobot_state.dtype)
+        if skill.shape[-1] != self.skill_dim:
+            raise ValueError(
+                f"Expected training skill dim {self.skill_dim}, got {skill.shape[-1]}."
+            )
+        return skill
+
+    def _inference_skill(self, obs: deque, nrobot_state):
+        if self.skill_dim == 0:
+            return self._zero_skill_tensor(
+                nrobot_state.shape[:2],
+                device=nrobot_state.device,
+                dtype=nrobot_state.dtype,
+            )
+
+        skill_steps = []
+        for step_obs in obs:
+            if "skill" not in step_obs or step_obs["skill"] is None:
+                raise KeyError(
+                    "This model was trained with skill input, but eval observations do not contain `skill`. "
+                    "Enable skill annotation for policy input."
+                )
+
+            skill = step_obs["skill"]
+            if not torch.is_tensor(skill):
+                skill = torch.as_tensor(
+                    skill,
+                    device=nrobot_state.device,
+                    dtype=nrobot_state.dtype,
+                )
+            else:
+                skill = skill.to(device=nrobot_state.device, dtype=nrobot_state.dtype)
+
+            if skill.dim() == 1:
+                skill = skill.unsqueeze(0)
+
+            if skill.shape[-1] != self.skill_dim:
+                raise ValueError(
+                    f"Expected inference skill dim {self.skill_dim}, got {skill.shape[-1]}."
+                )
+
+            skill_steps.append(skill.unsqueeze(1))
+
+        return torch.cat(skill_steps, dim=1)
 
     # === Inference Observations ===
     def _normalized_obs(self, obs: deque, flatten: bool = True):
@@ -282,11 +353,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         # Normalize the robot_state
         nrobot_state = self.normalizer(robot_state, "robot_state", forward=True)
-        skill = torch.zeros(
-            (*nrobot_state.shape[:2], self.skill_dim),
-            device=nrobot_state.device,
-            dtype=nrobot_state.dtype,
-        )
+        skill = self._inference_skill(obs, nrobot_state)
 
         B = nrobot_state.shape[0]
 
@@ -547,7 +614,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         if self.observation_type == "image":
             # The robot state is already normalized in the dataset
             nrobot_state = batch["robot_state"]
-            skill = batch["skill"].to(nrobot_state.dtype)
+            skill = self._training_skill(batch, nrobot_state)
             B = nrobot_state.shape[0]
 
             image1: torch.Tensor = batch["color_image1"]
@@ -602,7 +669,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         elif self.observation_type == "rgbd":
             # The robot state is already normalized in the dataset
             nrobot_state = batch["robot_state"]
-            skill = batch["skill"].to(nrobot_state.dtype)
+            skill = self._training_skill(batch, nrobot_state)
             B = nrobot_state.shape[0]
 
             image1: torch.Tensor = batch["color_image1"]

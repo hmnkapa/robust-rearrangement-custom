@@ -18,6 +18,7 @@ from gymnasium import Env
 import torch  # needs to be after isaac gym imports
 from omegaconf import DictConfig, OmegaConf
 from src.behavior.base import Actor  # noqa
+from src.behavior.base import model_requires_skill_input
 from src.behavior.diffusion import DiffusionPolicy  # noqa
 from src.eval.rollout import calculate_success_rate
 from src.behavior import get_actor
@@ -439,6 +440,14 @@ if __name__ == "__main__":
                     cfg.discount = cfg.base_policy.discount
 
                 # Make the actor
+                requires_skill_input = model_requires_skill_input(cfg)
+                actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
+                print(
+                    "Skill input requirement: "
+                    f"{requires_skill_input} "
+                    f"(observation_type={cfg.observation_type}, "
+                    f"actor={actor_name}, skill_dim={cfg.get('skill_dim', None)})"
+                )
                 actor: Actor = get_actor(cfg=cfg, device=device)
 
                 # Set the inference steps of the actor
@@ -464,7 +473,6 @@ if __name__ == "__main__":
 
                 suffix = args.save_rollouts_suffix
 
-                actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
                 if actor_name == "dp3":
                     suffix = "dp3"
 
@@ -473,6 +481,12 @@ if __name__ == "__main__":
 
                 if args.save_depth_image:
                     suffix = f"rgbd"
+                
+                if args.annotate_skill:
+                    if args.save_depth_image:
+                        suffix = "rgbd-skill"
+                    else:
+                        suffix = "rgb-skill"
                 
                 save_dir = (
                     trajectory_save_dir(
@@ -568,6 +582,7 @@ if __name__ == "__main__":
                     pc_generator=pc_generator,
                     annotate_skill=args.annotate_skill,
                     skill_on_image=args.skill_on_image,
+                    provide_skill_input=requires_skill_input,
                 )
 
                 if args.store_video_wandb:

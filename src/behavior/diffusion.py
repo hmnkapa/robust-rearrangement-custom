@@ -201,6 +201,7 @@ class AttentionPoolDiffusionPolicy(DiffusionPolicy):
 
         # The robot state is already normalized in the dataset
         nrobot_state = batch["robot_state"]
+        skill = self._training_skill(batch, nrobot_state)
         B = nrobot_state.shape[0]
 
         image1: torch.Tensor = batch["color_image1"]
@@ -236,7 +237,7 @@ class AttentionPoolDiffusionPolicy(DiffusionPolicy):
         )
 
         # Combine the robot_state and image features, (B, obs_horizon, obs_dim)
-        nobs = torch.cat([nrobot_state, image_features], dim=-1)
+        nobs = torch.cat([nrobot_state, skill, image_features], dim=-1)
 
         if flatten:
             # (B, obs_horizon, obs_dim) --> (B, obs_horizon * obs_dim)
@@ -260,6 +261,7 @@ class AttentionPoolDiffusionPolicy(DiffusionPolicy):
 
         # Normalize the robot_state
         nrobot_state = self.normalizer(robot_state, "robot_state", forward=True)
+        skill = self._inference_skill(obs, nrobot_state)
 
         B = nrobot_state.shape[0]
 
@@ -302,7 +304,7 @@ class AttentionPoolDiffusionPolicy(DiffusionPolicy):
         )
 
         # Combine the robot_state and image features, (B, obs_horizon, obs_dim)
-        nobs = torch.cat([nrobot_state, image_features], dim=-1)
+        nobs = torch.cat([nrobot_state, skill, image_features], dim=-1)
 
         if flatten:
             # (B, obs_horizon, obs_dim) --> (B, obs_horizon * obs_dim)

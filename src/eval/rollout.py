@@ -12,6 +12,8 @@ from typing import Dict, Optional, Union
 from pathlib import Path
 
 from src.behavior.base import Actor
+from src.behavior.base import model_requires_skill_input
+from src.common.skills import batch_skills_to_onehot_tensor
 from src.visualization.render_mp4 import create_in_memory_mp4
 from src.common.context import suppress_all_output
 from src.common.tasks import task2idx
@@ -192,6 +194,18 @@ class SuccessTqdm(tqdm):
         self.pbar_desc(0)
 
 
+def _attach_skill_tensor_to_obs(obs, actor: Actor, skills):
+    if not getattr(actor, "requires_skill_input", False):
+        return
+
+    obs["skill"] = batch_skills_to_onehot_tensor(
+        skills,
+        skill_dim=getattr(actor, "skill_dim", 0),
+        device=actor.device,
+        dtype=torch.float32,
+    )
+
+
 def rollout(
     env: Env,
     actor: Actor,
@@ -204,12 +218,14 @@ def rollout(
     annotate_skill: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
+    provide_skill_input: bool = False,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
         obs = env.reset()
         actor.reset()
-    if annotate_skill:
+    collect_skill_annotations = annotate_skill or provide_skill_input
+    if collect_skill_annotations:
         reset_skill_annotator(env)
 
     video_obs = deepcopy(obs)
@@ -221,7 +237,7 @@ def rollout(
             annotate_wrist_camera=annotate_wrist_camera,
             resize_images=resize_video,
         )
-        if annotate_skill
+        if collect_skill_annotations
         else [{} for _ in range(env.num_envs)]
     )
     initial_skills = [bundle.get("skill") for bundle in initial_annotations]
@@ -232,6 +248,10 @@ def rollout(
     for env_idx, skill in enumerate(initial_skills):
         if skill is not None:
             previous_skills[env_idx] = skill
+    if provide_skill_input and all(skill is None for skill in initial_skills):
+        raise ValueError(
+            f"Actor requires skill one-hot input, but no skill labels were produced for task `{env.furniture_name}`."
+        )
     if annotate_skill:
         for env_idx, initial_annotation in enumerate(initial_annotations):
             initial_debug = initial_annotation.get("debug", {})
@@ -259,6 +279,7 @@ def rollout(
     # Resize the depth image
     resize_depth(obs, "depth_image1")
     resize_crop_depth(obs, "depth_image2")
+    _attach_skill_tensor_to_obs(obs, actor, initial_skills)
 
     if resize_video:
         resize_image(video_obs, "color_image1")
@@ -339,7 +360,7 @@ def rollout(
                 annotate_wrist_camera=annotate_wrist_camera,
                 resize_images=resize_video,
             )
-            if annotate_skill
+            if collect_skill_annotations
             else [{} for _ in range(env.num_envs)]
         )
         current_skills = [bundle.get("skill") for bundle in current_annotations]
@@ -376,6 +397,7 @@ def rollout(
         resize_crop_image(obs, "color_image2")
         resize_depth(obs, "depth_image1")
         resize_crop_depth(obs, "depth_image2")
+        _attach_skill_tensor_to_obs(obs, actor, current_skills)
 
         # Save observations for the policy
         if resize_video:
@@ -501,6 +523,7 @@ def calculate_success_rate(
     annotate_skill: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
+    provide_skill_input: bool = False,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -551,6 +574,7 @@ def calculate_success_rate(
             annotate_skill=annotate_skill,
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
+            provide_skill_input=provide_skill_input,
         )
 
         # Calculate the success rate
@@ -752,6 +776,7 @@ def do_rollout_evaluation(
         )
 
     actor.set_task(task2idx[config.task])
+    provide_skill_input = model_requires_skill_input(config)
 
     rollout_stats = calculate_success_rate(
         env,
@@ -763,6 +788,7 @@ def do_rollout_evaluation(
         rollout_save_dir=rollout_save_dir,
         save_rollouts_to_wandb=save_rollouts_to_wandb,
         save_failures=config.rollout.save_failures,
+        provide_skill_input=provide_skill_input,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)
