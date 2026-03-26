@@ -474,13 +474,26 @@ def main(cfg: DictConfig):
     run = wandb.init(
         id=cfg.wandb.continue_run_id,
         name=cfg.wandb.name,
-        resume=None if cfg.wandb.continue_run_id is None else "must",
+        resume=None if cfg.wandb.continue_run_id is None else "allow",
         project=cfg.wandb.project,
         entity=cfg.wandb.get("entity"),
         config=config_dict,
         mode=cfg.wandb.mode,
         notes=cfg.wandb.notes,
     )
+
+    if cfg.wandb.continue_run_id is not None:
+        if run.id != cfg.wandb.continue_run_id:
+            raise RuntimeError(
+                "W&B initialized an unexpected run id: "
+                f"expected '{cfg.wandb.continue_run_id}', got '{run.id}'."
+            )
+        if not run.resumed:
+            raise RuntimeError(
+                f"W&B did not resume existing run '{cfg.wandb.continue_run_id}'. "
+                "With resume='allow', this means W&B started a new run with the same "
+                "id instead of attaching to prior history. Refusing to continue."
+            )
 
     if cfg.wandb.watch_model:
         run.watch(actor, log="all", log_freq=1000)
