@@ -1,9 +1,10 @@
 import os
 import random
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import hydra
 import numpy as np
@@ -29,8 +30,6 @@ from src.eval.rollout import do_rollout_evaluation
 from src.gym import get_rl_env
 from src.models.ema import SwitchEMA
 
-# Import the wandb Run type for type hinting
-from wandb.apis.public.runs import Run
 from wandb.errors.util import CommError
 from wandb_osh.hooks import TriggerWandbSyncHook, _comm_default_dir
 
@@ -86,6 +85,127 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def _checkpoint_epoch(path: Path) -> int:
+    match = re.search(r"actor_chkpt_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def find_local_resume_checkpoint(
+    model_save_dir: Union[str, Path], run_name_candidates
+) -> Optional[Path]:
+    model_save_dir = Path(model_save_dir)
+    candidate_dirs = []
+    seen_dirs = set()
+
+    for run_name in run_name_candidates:
+        if not run_name:
+            continue
+        run_dir = model_save_dir / run_name
+        run_dir_key = str(run_dir)
+        if run_dir_key in seen_dirs:
+            continue
+        seen_dirs.add(run_dir_key)
+        candidate_dirs.append(run_dir)
+
+    for run_dir in candidate_dirs:
+        last_checkpoint = run_dir / "actor_chkpt_last.pt"
+        if last_checkpoint.exists():
+            return last_checkpoint
+
+        numbered_checkpoints = sorted(
+            run_dir.glob("actor_chkpt_*.pt"),
+            key=_checkpoint_epoch,
+        )
+        if numbered_checkpoints:
+            return numbered_checkpoints[-1]
+
+    return None
+
+
+def resolve_resume_state(
+    cfg: DictConfig,
+) -> Tuple[Optional[DictConfig], Optional[dict], Optional[str]]:
+    if cfg.wandb.continue_run_id is None:
+        return None, None, None
+
+    run = None
+    run_exists = False
+    run_id = cfg.wandb.continue_run_id
+    run_path = f"{cfg.wandb.project}/{run_id}"
+    wandb_mode = cfg.wandb.mode
+    data_paths_override = cfg.data.data_paths_override
+
+    run_name_candidates = [cfg.wandb.name, run_id]
+    remote_error = None
+
+    try:
+        run = wandb.Api().run(run_path)
+        run_exists = True
+        run_name_candidates.insert(0, run.name)
+    except (ValueError, CommError) as exc:
+        remote_error = exc
+
+    resumed_cfg = None
+    state_dict = None
+    resume_message = None
+
+    if run_exists:
+        try:
+            resumed_cfg, weights_path = get_model_from_api_or_cached(
+                run_path, "last", wandb_mode=wandb_mode
+            )
+        except Exception:
+            try:
+                resumed_cfg, weights_path = get_model_from_api_or_cached(
+                    run_path, "latest", wandb_mode=wandb_mode
+                )
+            except Exception as exc:
+                remote_error = exc
+                weights_path = None
+
+        if weights_path is not None:
+            state_dict = torch.load(weights_path, map_location="cpu")
+            resume_message = (
+                f"Continuing run {run_id}, {run.name} from wandb checkpoint"
+            )
+
+    if state_dict is None:
+        local_checkpoint_path = find_local_resume_checkpoint(
+            cfg.training.model_save_dir, run_name_candidates
+        )
+
+        if local_checkpoint_path is None:
+            remote_error_message = (
+                f" W&B lookup failed: {remote_error}" if remote_error is not None else ""
+            )
+            raise FileNotFoundError(
+                "Could not resume training. No checkpoint was found in W&B or in "
+                f"'{cfg.training.model_save_dir}' for run '{run_id}'."
+                f"{remote_error_message}"
+            )
+
+        state_dict = torch.load(local_checkpoint_path, map_location="cpu")
+        checkpoint_cfg = state_dict.get("config")
+        if checkpoint_cfg is None:
+            raise KeyError(
+                f"Local checkpoint {local_checkpoint_path} does not contain a saved config."
+            )
+
+        resumed_cfg = OmegaConf.create(checkpoint_cfg)
+        resume_message = (
+            f"Continuing run {run_id} from local checkpoint {local_checkpoint_path}"
+        )
+
+    resumed_cfg.wandb.continue_run_id = run_id
+    resumed_cfg.wandb.mode = wandb_mode
+    resumed_cfg.data.data_paths_override = data_paths_override
+
+    epoch_idx = state_dict.get("epoch", 0)
+    resumed_cfg.training.start_epoch = epoch_idx + 1
+
+    return resumed_cfg, state_dict, resume_message
+
+
 # @hydra.main(config_path="../config/bc", config_name="base")
 @hydra.main(config_path="../config", config_name="base")
 def main(cfg: DictConfig):
@@ -108,59 +228,17 @@ def main(cfg: DictConfig):
         f"cuda:{cfg.training.gpu_id}" if torch.cuda.is_available() else "cpu"
     )
 
-    state_dict = None
+    resumed_cfg, state_dict, resume_message = resolve_resume_state(cfg)
+    is_resuming = resumed_cfg is not None
 
-    # Check if we are continuing a run
-    run_exists = False
-    if cfg.wandb.continue_run_id is not None:
-        try:
-            run: Run = wandb.Api().run(
-                f"{cfg.wandb.project}/{cfg.wandb.continue_run_id}"
-            )
-            run_exists = True
-        except (ValueError, CommError):
-            pass
+    if is_resuming:
+        cfg = resumed_cfg
+        print(resume_message)
 
-    if run_exists:
-        print(f"Continuing run {cfg.wandb.continue_run_id}, {run.name}")
-
-        run_id = cfg.wandb.continue_run_id
-        run_path = f"{cfg.wandb.project}/{run_id}"
-        wandb_mode = cfg.wandb.mode
-
-        data_paths_override = cfg.data.data_paths_override
-
-        # Load the weights from the run and override the config with the one from the run
-        try:
-            cfg, wts = get_model_from_api_or_cached(
-                run_path, "last", wandb_mode=wandb_mode
-            )
-        except:
-            cfg, wts = get_model_from_api_or_cached(
-                run_path, "latest", wandb_mode=wandb_mode
-            )
-
-        # Ensure we set the `continue_run_id` to the run_id
-        cfg.wandb.continue_run_id = run_id
-        cfg.wandb.mode = wandb_mode
-        cfg.data.data_paths_override = data_paths_override
-
-        state_dict = torch.load(wts)
-
-        epoch_idx = state_dict.get("epoch", run.summary.get("epoch", 0))
-        cfg.training.start_epoch = epoch_idx
-
-        # Set the best test loss and success rate to the one from the run
-        best_test_loss = state_dict.get(
-            "best_test_loss", run.summary.get("test_epoch_loss", float("inf"))
-        )
+        best_test_loss = state_dict.get("best_test_loss", float("inf"))
         test_loss_mean = best_test_loss
-        best_success_rate = state_dict.get(
-            "best_success_rate", run.summary.get("best_success_rate", 0)
-        )
-        epoch_idx = state_dict.get("epoch", run.summary.get("epoch", 0))
-        global_step = state_dict.get("global_step", run.lastHistoryStep)
-
+        best_success_rate = state_dict.get("best_success_rate", 0)
+        global_step = state_dict.get("global_step", 0)
         prev_best_success_rate = best_success_rate
     else:
         # Train loop
@@ -360,7 +438,7 @@ def main(cfg: DictConfig):
         else:
             actor.load_state_dict(state_dict)
 
-        print(f"Loaded weights from run {run_id}")
+        print(f"Loaded weights from run {cfg.wandb.continue_run_id}")
 
     if cfg.training.ema.use:
         ema = SwitchEMA(actor, cfg.training.ema.decay)
@@ -376,7 +454,7 @@ def main(cfg: DictConfig):
     run = wandb.init(
         id=cfg.wandb.continue_run_id,
         name=cfg.wandb.name,
-        resume=None if cfg.wandb.continue_run_id is None else "allow",
+        resume=None if cfg.wandb.continue_run_id is None else "must",
         project=cfg.wandb.project,
         entity=cfg.wandb.get("entity"),
         config=config_dict,
@@ -416,7 +494,11 @@ def main(cfg: DictConfig):
     wandb.summary["start_time"] = starttime
 
     # Create model save dir
-    model_save_dir = Path(cfg.training.model_save_dir) / wandb.run.name
+    model_dir_name = wandb.run.name
+    if is_resuming:
+        model_dir_name = f"{wandb.run.name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+
+    model_save_dir = Path(cfg.training.model_save_dir) / model_dir_name
     model_save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Job started at: {starttime}")
