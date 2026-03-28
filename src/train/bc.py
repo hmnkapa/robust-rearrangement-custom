@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,49 @@ from src.models.ema import SwitchEMA
 
 from wandb.errors.util import CommError
 from wandb_osh.hooks import TriggerWandbSyncHook, _comm_default_dir
+
+
+def configure_runtime_tmpdir() -> Path:
+    # W&B launches a local service that writes port files into a temp directory.
+    # On shared machines, TMPDIR can sometimes point at a deleted path after a move
+    # or a stale shell session; fall back to a stable writable location.
+    candidate_dirs = []
+    for env_name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(env_name)
+        if value:
+            candidate_dirs.append(Path(value).expanduser())
+
+    candidate_dirs.extend(
+        [
+            Path("/tmp") / os.environ.get("USER", "user") / "robust-rearrangement",
+            Path.cwd() / ".tmp",
+        ]
+    )
+
+    for candidate_dir in candidate_dirs:
+        try:
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            probe_file = candidate_dir / ".wandb_tmp_probe"
+            with open(probe_file, "w"):
+                pass
+            probe_file.unlink()
+
+            tmp_dir = str(candidate_dir)
+            tempfile.tempdir = tmp_dir
+            for env_name in ("TMPDIR", "TEMP", "TMP"):
+                os.environ[env_name] = tmp_dir
+
+            wandb_osh_dir = candidate_dir / "wandb_osh"
+            wandb_osh_dir.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("WANDB_OSH_COMM_DIR", str(wandb_osh_dir))
+            return candidate_dir
+        except OSError:
+            continue
+
+    raise RuntimeError("Unable to configure a writable temporary directory for W&B.")
+
+
+RUNTIME_TMP_DIR = configure_runtime_tmpdir()
 
 trigger_sync = TriggerWandbSyncHook(
     communication_dir=os.environ.get("WANDB_OSH_COMM_DIR", _comm_default_dir),
@@ -90,6 +134,41 @@ def _checkpoint_epoch(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
+def parse_wandb_run_reference(
+    run_reference: str,
+    default_project: Optional[str] = None,
+    default_entity: Optional[str] = None,
+):
+    parts = [part for part in run_reference.split("/") if part]
+
+    if len(parts) == 3:
+        entity, project, run_id = parts
+    elif len(parts) == 2:
+        entity = default_entity
+        project, run_id = parts
+    elif len(parts) == 1:
+        entity = default_entity
+        project = default_project
+        run_id = parts[0]
+    else:
+        raise ValueError(f"Invalid W&B run reference: '{run_reference}'")
+
+    if project is None:
+        raise ValueError(
+            "W&B project is required when continue_run_id is not a full run path."
+        )
+
+    return entity, project, run_id
+
+
+def get_wandb_run_paths(project: str, run_id: str, entity: Optional[str] = None):
+    paths = []
+    if entity:
+        paths.append(f"{entity}/{project}/{run_id}")
+    paths.append(f"{project}/{run_id}")
+    return paths
+
+
 def find_local_resume_checkpoint(
     model_save_dir: Union[str, Path], run_name_candidates, search_roots
 ) -> Optional[Path]:
@@ -146,21 +225,28 @@ def resolve_resume_state(
 
     run = None
     run_exists = False
-    run_id = cfg.wandb.continue_run_id
-    run_path = f"{cfg.wandb.project}/{run_id}"
+    continue_run_reference = cfg.wandb.continue_run_id
+    run_entity, run_project, run_id = parse_wandb_run_reference(
+        continue_run_reference, cfg.wandb.project, cfg.wandb.get("entity")
+    )
     wandb_mode = cfg.wandb.mode
     data_paths_override = cfg.data.data_paths_override
     original_cwd = Path(hydra.utils.get_original_cwd())
+    run_paths = get_wandb_run_paths(run_project, run_id, run_entity)
+    run_path = run_paths[0]
 
     run_name_candidates = [cfg.wandb.name, run_id]
     remote_error = None
 
-    try:
-        run = wandb.Api().run(run_path)
-        run_exists = True
-        run_name_candidates.insert(0, run.name)
-    except (ValueError, CommError) as exc:
-        remote_error = exc
+    for candidate_run_path in run_paths:
+        try:
+            run = wandb.Api().run(candidate_run_path)
+            run_exists = True
+            run_path = candidate_run_path
+            run_name_candidates.insert(0, run.name)
+            break
+        except (ValueError, CommError) as exc:
+            remote_error = exc
 
     resumed_cfg = None
     state_dict = None
@@ -216,6 +302,9 @@ def resolve_resume_state(
             f"Continuing run {run_id} from local checkpoint {local_checkpoint_path}"
         )
 
+    if run is not None:
+        resumed_cfg.wandb.project = run.project
+        resumed_cfg.wandb.entity = run.entity
     resumed_cfg.wandb.continue_run_id = run_id
     resumed_cfg.wandb.mode = wandb_mode
     resumed_cfg.data.data_paths_override = data_paths_override
