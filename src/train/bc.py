@@ -134,6 +134,98 @@ def _checkpoint_epoch(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
+def _extract_path_datetime(path: Path) -> Optional[datetime]:
+    path_str = str(path)
+    parsed_times = []
+
+    for pattern, time_format in (
+        (r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d+", "%Y-%m-%d_%H-%M-%S.%f"),
+        (r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", "%Y-%m-%d_%H-%M-%S"),
+    ):
+        for match in re.findall(pattern, path_str):
+            try:
+                parsed_times.append(datetime.strptime(match, time_format))
+            except ValueError:
+                continue
+
+    split_datetime_matches = re.findall(
+        r"(\d{4}-\d{2}-\d{2})[\\/](\d{2}-\d{2}-\d{2}(?:\.\d+)?)",
+        path_str,
+    )
+    for date_part, time_part in split_datetime_matches:
+        if "." in time_part:
+            time_format = "%Y-%m-%d_%H-%M-%S.%f"
+        else:
+            time_format = "%Y-%m-%d_%H-%M-%S"
+        try:
+            parsed_times.append(
+                datetime.strptime(f"{date_part}_{time_part}", time_format)
+            )
+        except ValueError:
+            continue
+
+    if not parsed_times:
+        return None
+
+    return max(parsed_times)
+
+
+def _checkpoint_priority(path: Path) -> int:
+    if path.name == "actor_chkpt_last.pt":
+        return 3
+    if re.match(r"actor_chkpt_\d+\.pt$", path.name):
+        return 2
+    if path.name == "actor_chkpt_best_test_loss.pt":
+        return 1
+    if path.name == "actor_chkpt_best_success_rate.pt":
+        return 0
+    return -1
+
+
+def _path_sort_key(path: Path) -> Tuple[float, float]:
+    path_datetime = _extract_path_datetime(path)
+    mtime = path.stat().st_mtime
+    return (
+        path_datetime.timestamp() if path_datetime is not None else float("-inf"),
+        mtime,
+    )
+
+
+def _resolve_checkpoint_in_run_dir(run_dir: Path) -> Optional[Path]:
+    possible_files = [
+        run_dir / "actor_chkpt_last.pt",
+        run_dir / "actor_chkpt_best_test_loss.pt",
+        run_dir / "actor_chkpt_best_success_rate.pt",
+    ]
+    possible_files.extend(run_dir.glob("actor_chkpt_*.pt"))
+
+    checkpoint_candidates = []
+    seen_paths = set()
+    for checkpoint_path in possible_files:
+        if not checkpoint_path.exists():
+            continue
+
+        checkpoint_key = str(checkpoint_path.resolve())
+        if checkpoint_key in seen_paths:
+            continue
+        seen_paths.add(checkpoint_key)
+
+        checkpoint_candidates.append(
+            (
+                _checkpoint_priority(checkpoint_path),
+                _checkpoint_epoch(checkpoint_path),
+                checkpoint_path.stat().st_mtime,
+                checkpoint_path,
+            )
+        )
+
+    if not checkpoint_candidates:
+        return None
+
+    checkpoint_candidates.sort()
+    return checkpoint_candidates[-1][3]
+
+
 def parse_wandb_run_reference(
     run_reference: str,
     default_project: Optional[str] = None,
@@ -173,22 +265,25 @@ def find_local_resume_checkpoint(
     model_save_dir: Union[str, Path], run_name_candidates, search_roots
 ) -> Optional[Path]:
     model_save_dir = Path(model_save_dir)
-    candidate_dirs = []
-    seen_dirs = set()
+    for run_name in run_name_candidates:
+        if not run_name:
+            continue
 
-    for root in search_roots:
-        root = Path(root)
-        base_model_dir = model_save_dir if model_save_dir.is_absolute() else root / model_save_dir
+        candidate_dirs = []
+        seen_dirs = set()
 
-        for run_name in run_name_candidates:
-            if not run_name:
-                continue
+        for root in search_roots:
+            root = Path(root)
+            base_model_dir = (
+                model_save_dir if model_save_dir.is_absolute() else root / model_save_dir
+            )
 
             direct_run_dir = base_model_dir / run_name
-            direct_run_dir_key = str(direct_run_dir)
-            if direct_run_dir_key not in seen_dirs:
-                seen_dirs.add(direct_run_dir_key)
-                candidate_dirs.append(direct_run_dir)
+            if direct_run_dir.exists():
+                direct_run_dir_key = str(direct_run_dir.resolve())
+                if direct_run_dir_key not in seen_dirs:
+                    seen_dirs.add(direct_run_dir_key)
+                    candidate_dirs.append(direct_run_dir)
 
             outputs_root = root / "outputs"
             if not outputs_root.exists():
@@ -196,23 +291,23 @@ def find_local_resume_checkpoint(
 
             search_pattern = str(model_save_dir / run_name)
             for output_run_dir in outputs_root.glob(f"**/{search_pattern}"):
-                output_run_dir_key = str(output_run_dir)
+                if not output_run_dir.exists():
+                    continue
+
+                output_run_dir_key = str(output_run_dir.resolve())
                 if output_run_dir_key in seen_dirs:
                     continue
                 seen_dirs.add(output_run_dir_key)
                 candidate_dirs.append(output_run_dir)
 
-    for run_dir in candidate_dirs:
-        last_checkpoint = run_dir / "actor_chkpt_last.pt"
-        if last_checkpoint.exists():
-            return last_checkpoint
+        if not candidate_dirs:
+            continue
 
-        numbered_checkpoints = sorted(
-            run_dir.glob("actor_chkpt_*.pt"),
-            key=_checkpoint_epoch,
-        )
-        if numbered_checkpoints:
-            return numbered_checkpoints[-1]
+        candidate_dirs.sort(key=_path_sort_key, reverse=True)
+        for run_dir in candidate_dirs:
+            checkpoint_path = _resolve_checkpoint_in_run_dir(run_dir)
+            if checkpoint_path is not None:
+                return checkpoint_path
 
     return None
 
