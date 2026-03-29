@@ -591,7 +591,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             )
 
             # In 20% of observations, we now the noised position and rotation to the robot state
-            mask = torch.rand(B) < 0.2
+            mask = torch.rand(B, device=nrobot_state.device) < 0.2
             nrobot_state[mask, :, :3] = pos[mask]
             nrobot_state[mask, :, 3:9] = rot[mask]
 

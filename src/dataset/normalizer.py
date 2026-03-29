@@ -33,14 +33,18 @@ class LinearNormalizer(nn.Module):
 
     def _normalize(self, x, key):
         stats = self.stats[key]
-        x = (x - stats["min"]) / (stats["max"] - stats["min"])
+        stats_min = stats["min"].to(device=x.device, dtype=x.dtype)
+        stats_max = stats["max"].to(device=x.device, dtype=x.dtype)
+        x = (x - stats_min) / (stats_max - stats_min)
         x = 2 * x - 1
         return x
 
     def _denormalize(self, x, key):
         stats = self.stats[key]
         x = (x + 1) / 2
-        x = x * (stats["max"] - stats["min"]) + stats["min"]
+        stats_min = stats["min"].to(device=x.device, dtype=x.dtype)
+        stats_max = stats["max"].to(device=x.device, dtype=x.dtype)
+        x = x * (stats_max - stats_min) + stats_min
         return x
 
     def forward(self, x, key, forward=True):
