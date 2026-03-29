@@ -438,7 +438,7 @@ def main():
     # Setup data saving
     demo_save_dir = Path(args.save_dir)
     demo_save_dir.mkdir(exist_ok=True, parents=True)
-    pkl_path = demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}.pkl"
+    pkl_path = demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.pkl"
 
     episode_data = {}
     episode_data["observations"] = []

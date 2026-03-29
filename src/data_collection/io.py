@@ -152,7 +152,7 @@ def save_raw_rollout(
         "action_type": action_type,
     }
 
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")
     output_path = rollout_save_dir / ("success" if success else "failure")
     output_path.mkdir(parents=True, exist_ok=True)
     output_path = output_path / f"{timestamp}.pkl"

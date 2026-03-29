@@ -332,7 +332,7 @@ class DataCollector:
         demo_path = self.data_path / ("success" if data["success"] else "failure")
         demo_path.mkdir(parents=True, exist_ok=True)
 
-        path = demo_path / f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}.pkl"
+        path = demo_path / f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.pkl"
 
         if self.compress_pickles:
             # Add the suffix .gz if we are compressing the pickle files
