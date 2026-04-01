@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 from collections import deque
 from omegaconf import DictConfig, OmegaConf
 from torchvision import transforms
@@ -69,7 +69,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
     encoder2_proj: nn.Module
 
     camera_2_vib: VIB
-    skill_dim: int = 5
+    skill_dim: Optional[int] = None
 
     def __init__(
         self,
@@ -93,6 +93,9 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         self.observation_type = cfg.observation_type
         self.requires_skill_input = model_requires_skill_input(cfg)
+        self.skill_dim = (
+            int(getattr(cfg, "skill_dim", 0)) if self.requires_skill_input else None
+        )
 
         # Define what parts of the robot state to use
         self.include_proprioceptive_pos = actor_cfg.get(
@@ -266,16 +269,17 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             self.encoder1_proj = nn.Identity()
             self.encoder2_proj = nn.Identity()
 
-        self.skill_dim = int(getattr(cfg, "skill_dim", 0)) if self.requires_skill_input else 0
+        skill_dim = self.skill_dim or 0
         self.timestep_obs_dim = (
-            cfg.robot_state_dim + self.skill_dim + 2 * self.encoding_dim
+            cfg.robot_state_dim + skill_dim + 2 * self.encoding_dim
         )
 
     def _zero_skill_tensor(self, batch_shape, device, dtype):
-        return torch.zeros((*batch_shape, self.skill_dim), device=device, dtype=dtype)
+        skill_dim = self.skill_dim or 0
+        return torch.zeros((*batch_shape, skill_dim), device=device, dtype=dtype)
 
     def _training_skill(self, batch, nrobot_state):
-        if self.skill_dim == 0:
+        if not self.skill_dim:
             return self._zero_skill_tensor(
                 nrobot_state.shape[:2],
                 device=nrobot_state.device,
@@ -295,7 +299,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         return skill
 
     def _inference_skill(self, obs: deque, nrobot_state):
-        if self.skill_dim == 0:
+        if not self.skill_dim:
             return self._zero_skill_tensor(
                 nrobot_state.shape[:2],
                 device=nrobot_state.device,
@@ -353,11 +357,11 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         # Normalize the robot_state
         nrobot_state = self.normalizer(robot_state, "robot_state", forward=True)
-        skill = self._inference_skill(obs, nrobot_state)
 
         B = nrobot_state.shape[0]
 
         if self.observation_type == "image":
+            skill = self._inference_skill(obs, nrobot_state)
 
             # Get size of the image
             img_size = obs[0]["color_image1"].shape[-3:]
@@ -400,6 +404,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
             # Reshape concatenate the features
             nobs = torch.cat([nrobot_state, skill, feature1, feature2], dim=-1)
         elif self.observation_type == "rgbd":
+            skill = self._inference_skill(obs, nrobot_state)
             img_size = obs[0]["color_image1"].shape[-3:]
             depth_size = obs[0]["depth_image1"].shape[-2:]
 

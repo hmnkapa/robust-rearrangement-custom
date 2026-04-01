@@ -219,6 +219,7 @@ def rollout(
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
+    rollout_after_success: int = 0,
     full_length_rollout: bool = False,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
@@ -307,6 +308,9 @@ def rollout(
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
     done = torch.zeros((env.num_envs, 1), dtype=torch.bool, device="cuda")
+    success_stop_step = torch.full(
+        (env.num_envs, 1), -1, dtype=torch.int64, device="cuda"
+    )
     
     # Collect point clouds if pc_generator is provided
     point_clouds = []  # List of lists: [[env0_step0, env1_step0, ...], [env0_step1, ...]]
@@ -457,7 +461,17 @@ def rollout(
         if step_idx >= rollout_max_steps:
             done = torch.ones((env.num_envs, 1), dtype=torch.bool, device="cuda")
 
-        if done.all() and not full_length_rollout:
+        done_for_break = done
+        if rollout_after_success > 0 and not full_length_rollout:
+            current_success = (
+                rewards[:, :step_idx].sum(dim=1, keepdim=True) >= n_parts_assemble
+            ).to(done.device)
+            new_success = current_success & (success_stop_step < 0)
+            success_stop_step[new_success] = step_idx + rollout_after_success
+            delayed_success_done = current_success & (step_idx >= success_stop_step)
+            done_for_break = torch.where(current_success, delayed_success_done, done)
+
+        if done_for_break.all() and not full_length_rollout:
             break
 
         if step_idx >= rollout_max_steps:
@@ -522,6 +536,7 @@ def calculate_success_rate(
     n_steps_padding: int = 30,
     break_on_n_success: bool = False,
     stop_after_n_success: int = 0,
+    rollout_after_success: int = 0,
     record_first_state_only: bool = False,
     pc_generator = None,
     annotate_skill: bool = False,
@@ -580,6 +595,7 @@ def calculate_success_rate(
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
+            rollout_after_success=rollout_after_success,
             full_length_rollout=full_length_rollout,
         )
 

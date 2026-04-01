@@ -738,6 +738,21 @@ def draw_guidance_point_on_image(image: np.ndarray, guidance_point_2d) -> np.nda
 
     uv = _to_numpy(guidance_point_2d).astype(np.int32)
     annotated = image.copy()
+    point_radius = 2
+    point_alpha = 0.5
+    point_color = (255, 0, 0)
+
+    def _draw_point(frame: np.ndarray, center: tuple[int, int]) -> np.ndarray:
+        overlay = frame.copy()
+        cv2.circle(
+            overlay,
+            center,
+            point_radius,
+            point_color,
+            thickness=-1,
+            lineType=cv2.LINE_AA,
+        )
+        return cv2.addWeighted(overlay, point_alpha, frame, 1.0 - point_alpha, 0.0)
 
     if annotated.ndim == 4:
         if annotated.shape[0] != 1:
@@ -747,13 +762,11 @@ def draw_guidance_point_on_image(image: np.ndarray, guidance_point_2d) -> np.nda
         center = (int(uv[0]), int(uv[1]))
         if center[0] < 0 or center[0] >= width or center[1] < 0 or center[1] >= height:
             return annotated
-        cv2.circle(frame, center, 6, (255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
-        annotated[0] = frame
+        annotated[0] = _draw_point(frame, center)
         return annotated
 
     height, width = annotated.shape[:2]
     center = (int(uv[0]), int(uv[1]))
     if center[0] < 0 or center[0] >= width or center[1] < 0 or center[1] >= height:
         return annotated
-    cv2.circle(annotated, center, 6, (255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
-    return annotated
+    return _draw_point(annotated, center)

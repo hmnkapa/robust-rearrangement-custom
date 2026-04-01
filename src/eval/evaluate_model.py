@@ -99,6 +99,13 @@ class LocalCheckpointWrapper:
 
 
 def validate_args(args: argparse.Namespace):
+    tasks = args.task if isinstance(args.task, list) else [args.task]
+    rollout_after_success_values = (
+        args.rollout_after_success
+        if isinstance(args.rollout_after_success, list)
+        else [args.rollout_after_success]
+    )
+
     assert (
         sum(
             [
@@ -126,6 +133,29 @@ def validate_args(args: argparse.Namespace):
     assert not args.skill_on_image or args.annotate_skill, (
         "--skill-on-image requires --annotate-skill"
     )
+    assert all(
+        value >= 0 for value in rollout_after_success_values
+    ), "--rollout-after-success must be non-negative"
+    assert len(rollout_after_success_values) in (
+        1,
+        len(tasks),
+    ), (
+        "--rollout-after-success must provide either one value for all tasks "
+        "or one value per task in the same order as --task"
+    )
+
+
+def resolve_rollout_after_success_by_task(
+    tasks: List[str], rollout_after_success_values: List[int]
+) -> dict[str, int]:
+    if len(rollout_after_success_values) == 1:
+        value = int(rollout_after_success_values[0])
+        return {task: value for task in tasks}
+
+    return {
+        task: int(value)
+        for task, value in zip(tasks, rollout_after_success_values)
+    }
 
 
 def get_runs(args: argparse.Namespace, map_location: Optional[torch.device] = None) -> List[Run]:
@@ -291,6 +321,13 @@ if __name__ == "__main__":
     parser.add_argument("--stop-after-n-success", type=int, default=0)
     parser.add_argument("--break-on-n-success", action="store_true")
     parser.add_argument(
+        "--rollout-after-success",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="After the success step, continue rollout for this many additional frames before stopping. Max rollout steps still apply.",
+    )
+    parser.add_argument(
         "--full-length-rollout",
         action="store_true",
         help="Continue each rollout until max rollout steps even after success, and save the full trajectory.",
@@ -344,6 +381,9 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
     tasks: List[str] = args.task if isinstance(args.task, list) else [args.task]
+    rollout_after_success_by_task = resolve_rollout_after_success_by_task(
+        tasks, args.rollout_after_success
+    )
     if len(tasks) > 1:
         args.multitask = True
     task_group = (
@@ -366,6 +406,11 @@ if __name__ == "__main__":
                 i += 1
                 continue
             if arg in ["-f", "--task"]:
+                i += 1
+                while i < len(raw_argv) and not raw_argv[i].startswith("-"):
+                    i += 1
+                continue
+            if arg == "--rollout-after-success":
                 i += 1
                 while i < len(raw_argv) and not raw_argv[i].startswith("-"):
                     i += 1
@@ -393,6 +438,8 @@ if __name__ == "__main__":
                 *base_argv,
                 "-f",
                 task,
+                "--rollout-after-success",
+                str(rollout_after_success_by_task[task]),
             ]
             if task_group is not None:
                 cmd.extend(["--task-group", task_group])
@@ -561,6 +608,7 @@ if __name__ == "__main__":
                 total_rollouts = 0
 
                 for task in tasks:
+                    task_rollout_after_success = rollout_after_success_by_task[task]
                     spf = f"{task}/" if args.multitask else ""
                     rollout_max_steps = (
                         task_timeout(task, n_parts=args.n_parts_assemble)
@@ -690,7 +738,10 @@ if __name__ == "__main__":
                             bbox_crop_mode=args.pc_bbox_crop_mode,
                         )
 
-                    print(f"Starting rollout of run: {run.name} task: {task}")
+                    print(
+                        f"Starting rollout of run: {run.name} task: {task} "
+                        f"(rollout_after_success={task_rollout_after_success})"
+                    )
                     actor.set_task(task2idx[task])
                     rollout_stats = calculate_success_rate(
                         actor=actor,
@@ -706,6 +757,7 @@ if __name__ == "__main__":
                         resize_video=not args.store_full_resolution_video,
                         break_on_n_success=args.break_on_n_success,
                         stop_after_n_success=args.stop_after_n_success,
+                        rollout_after_success=task_rollout_after_success,
                         full_length_rollout=args.full_length_rollout,
                         record_first_state_only=args.record_for_coverage,
                         pc_generator=pc_generator,
