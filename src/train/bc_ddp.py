@@ -1,9 +1,10 @@
 import os
 import random
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import hydra
 import numpy as np
@@ -85,6 +86,189 @@ def load_state_dict_from_path(path: str):
     return torch.load(path, map_location="cpu")
 
 
+def _checkpoint_epoch(path: Path) -> int:
+    match = re.search(r"actor_chkpt_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _extract_path_datetime(path: Path) -> Optional[datetime]:
+    path_str = str(path)
+    parsed_times = []
+
+    for pattern, time_format in (
+        (r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d+", "%Y-%m-%d_%H-%M-%S.%f"),
+        (r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", "%Y-%m-%d_%H-%M-%S"),
+    ):
+        for match in re.findall(pattern, path_str):
+            try:
+                parsed_times.append(datetime.strptime(match, time_format))
+            except ValueError:
+                continue
+
+    split_datetime_matches = re.findall(
+        r"(\d{4}-\d{2}-\d{2})[\\/](\d{2}-\d{2}-\d{2}(?:\.\d+)?)",
+        path_str,
+    )
+    for date_part, time_part in split_datetime_matches:
+        if "." in time_part:
+            time_format = "%Y-%m-%d_%H-%M-%S.%f"
+        else:
+            time_format = "%Y-%m-%d_%H-%M-%S"
+        try:
+            parsed_times.append(
+                datetime.strptime(f"{date_part}_{time_part}", time_format)
+            )
+        except ValueError:
+            continue
+
+    if not parsed_times:
+        return None
+
+    return max(parsed_times)
+
+
+def _checkpoint_priority(path: Path) -> int:
+    if path.name == "actor_chkpt_last.pt":
+        return 3
+    if re.match(r"actor_chkpt_\d+\.pt$", path.name):
+        return 2
+    if path.name == "actor_chkpt_best_test_loss.pt":
+        return 1
+    if path.name == "actor_chkpt_best_success_rate.pt":
+        return 0
+    return -1
+
+
+def _path_sort_key(path: Path) -> Tuple[float, float]:
+    path_datetime = _extract_path_datetime(path)
+    mtime = path.stat().st_mtime
+    return (
+        path_datetime.timestamp() if path_datetime is not None else float("-inf"),
+        mtime,
+    )
+
+
+def _resolve_checkpoint_in_run_dir(run_dir: Path) -> Optional[Path]:
+    possible_files = [
+        run_dir / "actor_chkpt_last.pt",
+        run_dir / "actor_chkpt_best_test_loss.pt",
+        run_dir / "actor_chkpt_best_success_rate.pt",
+    ]
+    possible_files.extend(run_dir.glob("actor_chkpt_*.pt"))
+
+    checkpoint_candidates = []
+    seen_paths = set()
+    for checkpoint_path in possible_files:
+        if not checkpoint_path.exists():
+            continue
+
+        checkpoint_key = str(checkpoint_path.resolve())
+        if checkpoint_key in seen_paths:
+            continue
+        seen_paths.add(checkpoint_key)
+
+        checkpoint_candidates.append(
+            (
+                _checkpoint_priority(checkpoint_path),
+                _checkpoint_epoch(checkpoint_path),
+                checkpoint_path.stat().st_mtime,
+                checkpoint_path,
+            )
+        )
+
+    if not checkpoint_candidates:
+        return None
+
+    checkpoint_candidates.sort()
+    return checkpoint_candidates[-1][3]
+
+
+def parse_wandb_run_reference(
+    run_reference: str,
+    default_project: Optional[str] = None,
+    default_entity: Optional[str] = None,
+) -> Tuple[Optional[str], str, str]:
+    parts = [part for part in run_reference.split("/") if part]
+
+    if len(parts) == 3:
+        entity, project, run_id = parts
+    elif len(parts) == 2:
+        entity = default_entity
+        project, run_id = parts
+    elif len(parts) == 1:
+        entity = default_entity
+        project = default_project
+        run_id = parts[0]
+    else:
+        raise ValueError(f"Invalid W&B run reference: '{run_reference}'")
+
+    if project is None:
+        raise ValueError(
+            "W&B project is required when continue_run_id is not a full run path."
+        )
+
+    return entity, project, run_id
+
+
+def get_wandb_run_paths(project: str, run_id: str, entity: Optional[str] = None):
+    paths = []
+    if entity:
+        paths.append(f"{entity}/{project}/{run_id}")
+    paths.append(f"{project}/{run_id}")
+    return paths
+
+
+def find_local_resume_checkpoint(
+    model_save_dir: Union[str, Path], run_name_candidates, search_roots
+) -> Optional[Path]:
+    model_save_dir = Path(model_save_dir)
+    for run_name in run_name_candidates:
+        if not run_name:
+            continue
+
+        candidate_dirs = []
+        seen_dirs = set()
+
+        for root in search_roots:
+            root = Path(root)
+            base_model_dir = (
+                model_save_dir if model_save_dir.is_absolute() else root / model_save_dir
+            )
+
+            direct_run_dir = base_model_dir / run_name
+            if direct_run_dir.exists():
+                direct_run_dir_key = str(direct_run_dir.resolve())
+                if direct_run_dir_key not in seen_dirs:
+                    seen_dirs.add(direct_run_dir_key)
+                    candidate_dirs.append(direct_run_dir)
+
+            outputs_root = root / "outputs"
+            if not outputs_root.exists():
+                continue
+
+            search_pattern = str(model_save_dir / run_name)
+            for output_run_dir in outputs_root.glob(f"**/{search_pattern}"):
+                if not output_run_dir.exists():
+                    continue
+
+                output_run_dir_key = str(output_run_dir.resolve())
+                if output_run_dir_key in seen_dirs:
+                    continue
+                seen_dirs.add(output_run_dir_key)
+                candidate_dirs.append(output_run_dir)
+
+        if not candidate_dirs:
+            continue
+
+        candidate_dirs.sort(key=_path_sort_key, reverse=True)
+        for run_dir in candidate_dirs:
+            checkpoint_path = _resolve_checkpoint_in_run_dir(run_dir)
+            if checkpoint_path is not None:
+                return checkpoint_path
+
+    return None
+
+
 def resolve_resume_payload(cfg: DictConfig, is_main: bool):
     payload = {
         "cfg_container": OmegaConf.to_container(cfg, resolve=True),
@@ -93,43 +277,101 @@ def resolve_resume_payload(cfg: DictConfig, is_main: bool):
     }
 
     if is_main and cfg.wandb.continue_run_id is not None:
-        run_exists = False
         run = None
+        run_exists = False
+        remote_error = None
 
-        try:
-            run = wandb.Api().run(f"{cfg.wandb.project}/{cfg.wandb.continue_run_id}")
-            run_exists = True
-        except (ValueError, CommError):
-            run_exists = False
+        continue_run_reference = cfg.wandb.continue_run_id
+        run_entity, run_project, run_id = parse_wandb_run_reference(
+            continue_run_reference, cfg.wandb.project, cfg.wandb.get("entity")
+        )
+        wandb_mode = cfg.wandb.mode
+        data_paths_override = cfg.data.data_paths_override
+        original_cwd = Path(hydra.utils.get_original_cwd())
+        run_paths = get_wandb_run_paths(run_project, run_id, run_entity)
+        run_path = run_paths[0]
+        run_name_candidates = [cfg.wandb.name, run_id]
+
+        for candidate_run_path in run_paths:
+            try:
+                run = wandb.Api().run(candidate_run_path)
+                run_exists = True
+                run_path = candidate_run_path
+                run_name_candidates.insert(0, run.name)
+                break
+            except (ValueError, CommError) as exc:
+                remote_error = exc
+
+        resumed_cfg = None
+        state_dict_path = None
+        resume_message = None
 
         if run_exists:
-            run_id = cfg.wandb.continue_run_id
-            run_path = f"{cfg.wandb.project}/{run_id}"
-            wandb_mode = cfg.wandb.mode
-            data_paths_override = cfg.data.data_paths_override
-
+            weights_path = None
             try:
                 resumed_cfg, weights_path = get_model_from_api_or_cached(
                     run_path, "last", wandb_mode=wandb_mode
                 )
             except Exception:
-                resumed_cfg, weights_path = get_model_from_api_or_cached(
-                    run_path, "latest", wandb_mode=wandb_mode
+                try:
+                    resumed_cfg, weights_path = get_model_from_api_or_cached(
+                        run_path, "latest", wandb_mode=wandb_mode
+                    )
+                except Exception as exc:
+                    remote_error = exc
+
+            if weights_path is not None:
+                state_dict = load_state_dict_from_path(weights_path)
+                epoch_idx = state_dict.get("epoch", run.summary.get("epoch", 0))
+                resumed_cfg.training.start_epoch = epoch_idx
+                state_dict_path = str(Path(weights_path).resolve())
+                resume_message = f"Continuing run {run_id}, {run.name} from wandb checkpoint"
+
+        if state_dict_path is None:
+            local_checkpoint_path = find_local_resume_checkpoint(
+                cfg.training.model_save_dir,
+                run_name_candidates,
+                search_roots=[Path.cwd(), original_cwd],
+            )
+
+            if local_checkpoint_path is None:
+                remote_error_message = (
+                    f" W&B lookup failed: {remote_error}" if remote_error is not None else ""
+                )
+                raise FileNotFoundError(
+                    "Could not resume training. No checkpoint was found in W&B or in "
+                    f"'{cfg.training.model_save_dir}' or under '{original_cwd / 'outputs'}' "
+                    f"for run '{run_id}'."
+                    f"{remote_error_message}"
                 )
 
-            resumed_cfg.wandb.continue_run_id = run_id
-            resumed_cfg.wandb.mode = wandb_mode
-            resumed_cfg.data.data_paths_override = data_paths_override
+            state_dict = load_state_dict_from_path(str(local_checkpoint_path))
+            checkpoint_cfg = state_dict.get("config")
+            if checkpoint_cfg is None:
+                raise KeyError(
+                    f"Local checkpoint {local_checkpoint_path} does not contain a saved config."
+                )
 
-            state_dict = load_state_dict_from_path(weights_path)
-            epoch_idx = state_dict.get("epoch", run.summary.get("epoch", 0))
-            resumed_cfg.training.start_epoch = epoch_idx
+            resumed_cfg = OmegaConf.create(checkpoint_cfg)
+            epoch_idx = state_dict.get("epoch", 0)
+            resumed_cfg.training.start_epoch = epoch_idx + 1
+            state_dict_path = str(local_checkpoint_path.resolve())
+            resume_message = (
+                f"Continuing run {run_id} from local checkpoint {local_checkpoint_path}"
+            )
 
-            payload = {
-                "cfg_container": OmegaConf.to_container(resumed_cfg, resolve=True),
-                "state_dict_path": str(Path(weights_path).resolve()),
-                "resume_message": f"Continuing run {run_id}, {run.name}",
-            }
+        if run is not None:
+            resumed_cfg.wandb.project = run.project
+            resumed_cfg.wandb.entity = run.entity
+        resumed_cfg.wandb.continue_run_id = run_id
+        resumed_cfg.wandb.mode = wandb_mode
+        resumed_cfg.data.data_paths_override = data_paths_override
+
+        payload = {
+            "cfg_container": OmegaConf.to_container(resumed_cfg, resolve=True),
+            "state_dict_path": state_dict_path,
+            "resume_message": resume_message,
+        }
 
     return broadcast_object(payload if is_main else None, src=0)
 

@@ -204,7 +204,7 @@ class CollectInferHelper:
 
         # save the data
         pkl_path = (
-            self.demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}.pkl"
+            self.demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.pkl"
         )
         print(
             f"Saving trajectory with {len(self.episode_data['actions'])} transitions to folder: {pkl_path}"

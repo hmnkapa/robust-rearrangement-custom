@@ -713,7 +713,7 @@ def main():
         "output",
         "camera",
         # f"{demo_date}_substeps_{args_cli.sub_steps}",
-        f"{demo_date}_substeps_{args_cli.sub_steps}_{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}",
+        f"{demo_date}_substeps_{args_cli.sub_steps}_{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}",
     )
     if args_cli.domain_rand:
         output_dir += "_domain_rand"
@@ -725,7 +725,7 @@ def main():
         "output",
         "wrist_camera",
         # f"{demo_date}_substeps_{args_cli.sub_steps}",
-        f"{demo_date}_substeps_{args_cli.sub_steps}_{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}",
+        f"{demo_date}_substeps_{args_cli.sub_steps}_{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}",
     )
     if args_cli.domain_rand:
         wrist_output_dir += "_domain_rand"
@@ -837,7 +837,7 @@ def main():
         assert args_cli.save_dir is not None, f"Must set --save-dir if --save is True!"
         demo_save_dir = Path(args_cli.save_dir)
         demo_save_dir.mkdir(exist_ok=True, parents=True)
-        pkl_path = demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}.pkl"
+        pkl_path = demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.pkl"
 
     episode_data = {}
     episode_data["observations"] = []
