@@ -1,5 +1,8 @@
 import argparse
 import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 import time
 
@@ -195,6 +198,12 @@ def convert_state_dict(state_dict):
             state_dict[new_k] = state_dict.pop(k)
 
 
+def format_success_rate(n_success: int, n_rollouts: int) -> str:
+    if n_rollouts <= 0:
+        return "n/a (0/0)"
+    return f"{n_success / n_rollouts:.2%} ({n_success}/{n_rollouts})"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", type=str, required=False, nargs="*")
@@ -208,6 +217,7 @@ if __name__ == "__main__":
         "--task",
         "-f",
         type=str,
+        nargs="+",
         choices=[
             "one_leg",
             "lamp",
@@ -290,6 +300,18 @@ if __name__ == "__main__":
     parser.add_argument("--skill-on-image", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
+    parser.add_argument(
+        "--task-group",
+        type=str,
+        default=None,
+        help="Optional task group name used for rollout path suffix when running multitask via subprocesses.",
+    )
+    parser.add_argument(
+        "--task-summary-out",
+        type=str,
+        default=None,
+        help="Optional path to write JSON summary for this task run.",
+    )
 
     # params for RGBD
     parser.add_argument("--save-depth-image", action="store_true", help="Enable depth images collection")
@@ -321,59 +343,152 @@ if __name__ == "__main__":
     # Make the device
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    # Set the timeout
-    rollout_max_steps = (
-        task_timeout(args.task, n_parts=args.n_parts_assemble)
-        if args.max_rollout_steps is None
-        else args.max_rollout_steps
+    tasks: List[str] = args.task if isinstance(args.task, list) else [args.task]
+    if len(tasks) > 1:
+        args.multitask = True
+    task_group = (
+        args.task_group
+        if args.task_group is not None
+        else ("+".join(tasks) if len(tasks) > 1 else None)
     )
 
-    # Get the environment
+    # If multiple tasks are provided, run each task in a fresh process to avoid IsaacGym core dumps.
+    is_child = os.environ.get("RR_EVAL_MT_CHILD", "0") == "1"
+    if len(tasks) > 1 and not is_child:
+        base_argv = []
+        skip_next = False
+        raw_argv = sys.argv[1:]
+        i = 0
+        while i < len(raw_argv):
+            arg = raw_argv[i]
+            if skip_next:
+                skip_next = False
+                i += 1
+                continue
+            if arg in ["-f", "--task"]:
+                i += 1
+                while i < len(raw_argv) and not raw_argv[i].startswith("-"):
+                    i += 1
+                continue
+            if arg in ["--task-group", "--task-summary-out"]:
+                skip_next = True
+                i += 1
+                continue
+            base_argv.append(arg)
+            i += 1
+
+        total_success_all_tasks = 0
+        total_rollouts_all_tasks = 0
+        per_task_summaries = {}
+
+        for task in tasks:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+                tmp.write(b"{}")
+                summary_path = tmp.name
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.eval.evaluate_model",
+                *base_argv,
+                "-f",
+                task,
+            ]
+            if task_group is not None:
+                cmd.extend(["--task-group", task_group])
+            cmd.extend(["--task-summary-out", summary_path])
+
+            child_env = os.environ.copy()
+            child_env["RR_EVAL_MT_CHILD"] = "1"
+            result = subprocess.run(cmd, env=child_env)
+            if result.returncode != 0:
+                print(f"[ERROR] Task {task} failed with return code {result.returncode}")
+                sys.exit(result.returncode)
+
+            try:
+                import json
+
+                with open(summary_path, "r") as f:
+                    summary = json.load(f)
+                task_n_success = summary.get("n_success", 0)
+                task_n_rollouts = summary.get("n_rollouts", 0)
+                per_task_summaries[task] = {
+                    "n_success": task_n_success,
+                    "n_rollouts": task_n_rollouts,
+                }
+                total_success_all_tasks += task_n_success
+                total_rollouts_all_tasks += task_n_rollouts
+            finally:
+                try:
+                    os.remove(summary_path)
+                except OSError:
+                    pass
+
+        print("Final success rate summary:")
+        for task in tasks:
+            task_summary = per_task_summaries.get(
+                task, {"n_success": 0, "n_rollouts": 0}
+            )
+            print(
+                f"Success rate ({task}): "
+                f"{format_success_rate(task_summary['n_success'], task_summary['n_rollouts'])}"
+            )
+        print(
+            "Success rate (all tasks): "
+            f"{format_success_rate(total_success_all_tasks, total_rollouts_all_tasks)}"
+        )
+        sys.exit(0)
+
+    primary_task = tasks[0]
+    primary_spf = f"{primary_task}/" if args.multitask else ""
+
+    # Get the environment(s)
     # TODO: This needs to be changed to enable recreation the env for each run
     print(
-        f"Creating the environment with action_type {args.action_type} (this needs to be changed to enable recreation the env for each run)"
+        f"Creating the environment(s) with action_type {args.action_type} (this needs to be changed to enable recreation the env for each run)"
     )
     env: Optional[Env] = None
+    env_task: Optional[str] = None
+    run: Optional[Run] = None
 
-    f: str = args.task
-
-    # Summary prefix, shoprtened to spf for brevity downstream
-    spf = f"{f}/" + "" if args.multitask else ""
+    summary_total_success = 0
+    summary_total_rollouts = 0
 
     # Start the evaluation loop
     print(f"Starting evaluation loop in continuous mode: {args.continuous_mode}")
     try:
         while True:
-            # Get the run(s) to test, using main's device for map_location
             runs = get_runs(args, map_location=device)
 
-            # For now, filter out only the runs with strictly positive success rates to add more runs to them to get a better estimate
             if args.eval_top_k is not None:
-                # Get the top k runs
                 runs = sorted(
                     runs,
-                    key=lambda run: run.summary.get(spf + "success_rate", 0),
+                    key=lambda current_run: current_run.summary.get(
+                        primary_spf + "success_rate", 0
+                    ),
                     reverse=True,
                 )[: args.eval_top_k]
 
-            # Also, evaluate the ones with the fewest rollouts first (if they have any)
             runs = sorted(
                 runs,
-                key=lambda run: run.summary.get(spf + "n_rollouts", 0),
+                key=lambda current_run: current_run.summary.get(
+                    primary_spf + "n_rollouts", 0
+                ),
             )
 
             print(f"Found {len(runs)} runs to evaluate:")
-            for run in runs:
+            for current_run in runs:
                 print(
-                    f"    Run: {run.name}: {run.summary.get(spf + 'n_rollouts', 0)}, {run.summary.get(spf + 'success_rate', None)}"
+                    f"    Run: {current_run.name}: "
+                    f"{current_run.summary.get(primary_spf + 'n_rollouts', 0)}, "
+                    f"{current_run.summary.get(primary_spf + 'success_rate', None)}"
                 )
+
             for run in runs:
-                # First, we must flush the api and request the run again in case the information is stale
                 if not args.wt_path:
                     api.flush()
                     run = api.run("/".join([run.project, run.id]))
 
-                # Check if the run is currently being evaluated
                 if (
                     run.config.get("currently_evaluating", False)
                     and not args.ignore_currently_evaluating_flag
@@ -381,32 +496,6 @@ if __name__ == "__main__":
                     print(f"Run: {run.name} is currently being evaluated, skipping")
                     continue
 
-                # Check if the number of rollouts this run has is greater than the max_rollouts
-                if args.max_rollouts is not None:
-                    if run.summary.get(spf + "n_rollouts", 0) >= args.max_rollouts:
-                        print(
-                            f"Run: {run.name} has already been evaluated {run.summary.get(spf + 'n_rollouts', 0)} times, skipping"
-                        )
-                        continue
-
-                # Check if the run has already been evaluated
-                how_update = "overwrite"
-                if run.summary.get(spf + "success_rate", None) is not None:
-                    if args.if_exists == "skip":
-                        print(f"Run: {run.name} has already been evaluated, skipping")
-                        continue
-                    elif args.if_exists == "error":
-                        raise ValueError(f"Run: {run.name} has already been evaluated")
-                    elif args.if_exists == "overwrite":
-                        print(
-                            f"Run: {run.name} has already been evaluated, overwriting"
-                        )
-                        how_update = "overwrite"
-                    elif args.if_exists == "append":
-                        print(f"Run: {run.name} has already been evaluated, appending")
-                        how_update = "append"
-
-                # If in overwrite set the currently_evaluating flag to true runs can cooperate better in skip mode
                 if args.wandb:
                     print(
                         f"Setting currently_evaluating flag to true for run: {run.name}"
@@ -414,37 +503,30 @@ if __name__ == "__main__":
                     run.config["currently_evaluating"] = True
                     run.update()
 
-                # Get the current `test_epoch_loss` from the run
                 test_epoch_loss = run.summary.get("test_epoch_loss", None)
                 print(
                     f"Evaluating run: {run.name} at test_epoch_loss: {test_epoch_loss}"
                 )
 
                 cfg = OmegaConf.create(run.config)
-
-                # Check that we didn't set the wrong action type and pose representation
                 assert cfg.control.control_mode == args.action_type
 
                 print(OmegaConf.to_yaml(cfg))
 
-                # Temporary fix for residual missing field
                 if "base_policy" in cfg:
                     print("Applying residual field hotfix")
                     cfg.action_dim = cfg.base_policy.action_dim
 
-                # Temporary fix for dagger missing field
                 if "student_policy" in cfg:
                     print("Applying dagger field hotfix")
                     cfg.action_dim = cfg.student_policy.action_dim
 
-                # Temporary fix for critic missing field in actor config
                 if "critic" in cfg:
                     print("Applying critic field hotfix")
                     cfg.actor.critic = cfg.critic
                     cfg.actor.init_logstd = cfg.init_logstd
                     cfg.discount = cfg.base_policy.discount
 
-                # Make the actor
                 requires_skill_input = model_requires_skill_input(cfg)
                 actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
                 print(
@@ -455,7 +537,6 @@ if __name__ == "__main__":
                 )
                 actor: Actor = get_actor(cfg=cfg, device=device)
 
-                # Set the inference steps of the actor
                 if isinstance(actor, DiffusionPolicy):
                     actor.inference_steps = 4
 
@@ -464,209 +545,270 @@ if __name__ == "__main__":
                         actor.load_state_dict(run.checkpoint["model_state_dict"])
                     actor.eval()
                     actor.to(device)
-
                 else:
-                    actor: Optional[Actor] = load_model_weights(
-                        run=run, actor=actor, wt_type=args.wt_type
-                    )
+                    actor = load_model_weights(run=run, actor=actor, wt_type=args.wt_type)
 
                 if actor is None:
                     print(
                         f"Skipping run: {run.name} as no weights for wt_type: {args.wt_type} was not found"
                     )
+                    if args.wandb:
+                        run.config["currently_evaluating"] = False
+                        run.update()
                     continue
 
-                suffix = args.save_rollouts_suffix
+                total_success = 0
+                total_rollouts = 0
 
-                if actor_name == "dp3":
-                    suffix = "dp3"
+                for task in tasks:
+                    spf = f"{task}/" if args.multitask else ""
+                    rollout_max_steps = (
+                        task_timeout(task, n_parts=args.n_parts_assemble)
+                        if args.max_rollout_steps is None
+                        else args.max_rollout_steps
+                    )
 
-                if args.save_pc_for_dp3:
-                    suffix = f"pc/{args.pc_points}/{args.pc_downsample_mode}"
+                    if args.max_rollouts is not None:
+                        if run.summary.get(spf + "n_rollouts", 0) >= args.max_rollouts:
+                            print(
+                                f"Run: {run.name} task {task} has already been evaluated "
+                                f"{run.summary.get(spf + 'n_rollouts', 0)} times, skipping"
+                            )
+                            continue
 
-                if args.save_depth_image:
-                    suffix = f"rgbd"
-                
-                if args.annotate_skill:
+                    how_update = "overwrite"
+                    if run.summary.get(spf + "success_rate", None) is not None:
+                        if args.if_exists == "skip":
+                            print(
+                                f"Run: {run.name} task {task} has already been evaluated, skipping"
+                            )
+                            continue
+                        if args.if_exists == "error":
+                            raise ValueError(
+                                f"Run: {run.name} task {task} has already been evaluated"
+                            )
+                        if args.if_exists == "overwrite":
+                            print(
+                                f"Run: {run.name} task {task} has already been evaluated, overwriting"
+                            )
+                            how_update = "overwrite"
+                        elif args.if_exists == "append":
+                            print(
+                                f"Run: {run.name} task {task} has already been evaluated, appending"
+                            )
+                            how_update = "append"
+
+                    suffix = args.save_rollouts_suffix
+                    if actor_name == "dp3":
+                        suffix = "dp3"
+                    if args.save_pc_for_dp3:
+                        suffix = f"pc/{args.pc_points}/{args.pc_downsample_mode}"
                     if args.save_depth_image:
-                        suffix = "rgbd-skill"
+                        suffix = "rgbd"
+                    if args.annotate_skill:
+                        suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
+                    if task_group:
+                        suffix = f"{suffix}/{task_group}" if suffix else task_group
+
+                    save_dir = (
+                        trajectory_save_dir(
+                            controller="diffik",
+                            domain="sim",
+                            task=task,
+                            demo_source="rollout",
+                            randomness=args.randomness,
+                            suffix=suffix,
+                            create=True,
+                        )
+                        if args.save_rollouts
+                        else None
+                    )
+
+                    if args.store_video_wandb:
+                        wandb.init(
+                            project=run.project,
+                            entity=run.entity,
+                            id=run.id,
+                            resume="allow",
+                        )
+
+                    if env is None or env_task != task:
+                        if env is not None and env_task != task:
+                            close_fn = getattr(env, "close", None)
+                            if callable(close_fn):
+                                close_fn()
+                            env = None
+                            env_task = None
+
+                        env_obs_keys = None
+                        if (
+                            args.save_pc_for_dp3
+                            or args.save_depth_image
+                            or actor_name == "dp3"
+                        ):
+                            from src.gym import FULL_OBS
+
+                            env_obs_keys = list(FULL_OBS)
+                            if args.observation_space == "state":
+                                env_obs_keys = [
+                                    key
+                                    for key in env_obs_keys
+                                    if "color_image" not in key
+                                ]
+                            if "depth_image1" not in env_obs_keys:
+                                env_obs_keys.append("depth_image1")
+                            if "depth_image2" not in env_obs_keys:
+                                env_obs_keys.append("depth_image2")
+
+                        env = get_rl_env(
+                            gpu_id=args.gpu,
+                            task=task,
+                            num_envs=args.n_envs,
+                            randomness=args.randomness,
+                            observation_space=args.observation_space,
+                            max_env_steps=5_000,
+                            resize_img=False,
+                            act_rot_repr=cfg.control.act_rot_repr,
+                            action_type=args.action_type,
+                            april_tags=args.april_tags,
+                            verbose=args.verbose,
+                            headless=not args.visualize,
+                            obs_keys=env_obs_keys,
+                        )
+                        env_task = task
+
+                    pc_generator = None
+                    if args.save_pc_for_dp3 or actor_name == "dp3":
+                        bbox_ext = args.pc_bbox_half_extent
+                        if isinstance(bbox_ext, list) and len(bbox_ext) == 1:
+                            bbox_ext = bbox_ext[0]
+                        pc_generator = PointCloudGenerator(
+                            env=env,
+                            camera_name="front",
+                            max_points=args.pc_points,
+                            bbox_half_extent=bbox_ext,
+                            bbox_crop_mode=args.pc_bbox_crop_mode,
+                        )
+
+                    print(f"Starting rollout of run: {run.name} task: {task}")
+                    actor.set_task(task2idx[task])
+                    rollout_stats = calculate_success_rate(
+                        actor=actor,
+                        env=env,
+                        n_rollouts=args.n_rollouts,
+                        rollout_max_steps=rollout_max_steps,
+                        epoch_idx=0,
+                        discount=cfg.discount,
+                        rollout_save_dir=save_dir,
+                        save_failures=args.save_failures,
+                        n_parts_assemble=args.n_parts_assemble,
+                        compress_pickles=args.compress_pickles,
+                        resize_video=not args.store_full_resolution_video,
+                        break_on_n_success=args.break_on_n_success,
+                        stop_after_n_success=args.stop_after_n_success,
+                        full_length_rollout=args.full_length_rollout,
+                        record_first_state_only=args.record_for_coverage,
+                        pc_generator=pc_generator,
+                        annotate_skill=args.annotate_skill,
+                        skill_on_image=args.skill_on_image,
+                        provide_skill_input=requires_skill_input,
+                    )
+
+                    if args.store_video_wandb:
+                        wandb.finish()
+
+                    success_rate = rollout_stats.success_rate
+                    print(
+                        f"Success rate ({task}): "
+                        f"{format_success_rate(rollout_stats.n_success, rollout_stats.n_rollouts)}"
+                    )
+
+                    if args.wandb:
+                        print("Writing to wandb...")
+                        s: dict = run.summary
+
+                        if how_update == "overwrite":
+                            s[spf + "success_rate"] = success_rate
+                            s[spf + "n_success"] = rollout_stats.n_success
+                            s[spf + "n_rollouts"] = rollout_stats.n_rollouts
+                            s[spf + "total_return"] = rollout_stats.total_return
+                            s[spf + "average_return"] = (
+                                rollout_stats.total_return / rollout_stats.n_rollouts
+                            )
+                            s[spf + "total_reward"] = rollout_stats.total_reward
+                            s[spf + "average_reward"] = (
+                                rollout_stats.total_reward / rollout_stats.n_rollouts
+                            )
+                        elif how_update == "append":
+                            s[spf + "n_success"] = s.get(spf + "n_success", 0) + rollout_stats.n_success
+                            s[spf + "n_rollouts"] = s.get(spf + "n_rollouts", 0) + rollout_stats.n_rollouts
+                            s[spf + "success_rate"] = (
+                                s[spf + "n_success"] / s[spf + "n_rollouts"]
+                            )
+                            s[spf + "total_return"] = (
+                                s.get(spf + "total_return", 0) + rollout_stats.total_return
+                            )
+                            s[spf + "average_return"] = (
+                                s[spf + "total_return"] / s[spf + "n_rollouts"]
+                            )
+                            s[spf + "total_reward"] = (
+                                s.get(spf + "total_reward", 0) + rollout_stats.total_reward
+                            )
+                            s[spf + "average_reward"] = (
+                                s[spf + "total_reward"] / s[spf + "n_rollouts"]
+                            )
+                        else:
+                            raise ValueError(f"Invalid how_update: {how_update}")
+
+                        run.update()
                     else:
-                        suffix = "rgb-skill"
-                
-                save_dir = (
-                    trajectory_save_dir(
-                        controller="diffik",
-                        domain="sim",
-                        task=args.task,
-                        demo_source="rollout",
-                        randomness=args.randomness,
-                        suffix=suffix,
-                        create=True,
+                        print("Not writing to wandb")
+
+                    total_success += rollout_stats.n_success
+                    total_rollouts += rollout_stats.n_rollouts
+                    summary_total_success += rollout_stats.n_success
+                    summary_total_rollouts += rollout_stats.n_rollouts
+
+                if total_rollouts > 0:
+                    print(
+                        "Success rate (all tasks): "
+                        f"{format_success_rate(total_success, total_rollouts)}"
                     )
-                    if args.save_rollouts
-                    else None
-                )
-
-                if args.store_video_wandb:
-                    # For the run table with videos to be saved to wandb,
-                    # a run needs to be active, so we initialie run here
-                    wandb.init(
-                        project=run.project,
-                        entity=run.entity,
-                        id=run.id,
-                        resume="allow",
-                    )
-
-                # Only actually load the environment after we know we've got at least one run to evaluate
-                if env is None:
-                    # Prepare obs_keys with depth_image2 if needed for point cloud generation
-                    env_obs_keys = None
-                    if args.save_pc_for_dp3 or args.save_depth_image or actor_name == "dp3":
-                        # Need to include depth_image2 for point cloud generation
-                        from src.gym import FULL_OBS
-                        env_obs_keys = list(FULL_OBS)
-                        if args.observation_space == "state":
-                            # Filter out color images but keep depth
-                            env_obs_keys = [key for key in env_obs_keys if "color_image" not in key]
-                        # Ensure depth_image is included
-                        if "depth_image1" not in env_obs_keys:
-                            env_obs_keys.append("depth_image1")
-                        if "depth_image2" not in env_obs_keys:
-                            env_obs_keys.append("depth_image2")
-                    
-                    env = get_rl_env(
-                        gpu_id=args.gpu,
-                        task=args.task,
-                        num_envs=args.n_envs,
-                        randomness=args.randomness,
-                        observation_space=args.observation_space,
-                        max_env_steps=5_000,
-                        resize_img=False,
-                        act_rot_repr=cfg.control.act_rot_repr,
-                        action_type=args.action_type,
-                        april_tags=args.april_tags,
-                        verbose=args.verbose,
-                        headless=not args.visualize,
-                        obs_keys=env_obs_keys,  # Pass prepared obs_keys
-                    )
-                
-                # 点云 obs 相关
-                pc_generator = None
-                if args.save_pc_for_dp3 or actor_name == "dp3":
-                    # depth_image2 should already be in obs_keys from env creation
-                    # Handle list vs scalar for bbox
-                    bbox_ext = args.pc_bbox_half_extent
-                    if isinstance(bbox_ext, list) and len(bbox_ext) == 1:
-                        bbox_ext = bbox_ext[0]
-                    pc_generator = PointCloudGenerator(
-                        env=env, 
-                        camera_name="front", 
-                        max_points=args.pc_points, 
-                        bbox_half_extent=bbox_ext,
-                        bbox_crop_mode=args.pc_bbox_crop_mode
-                    )
-
-                # Perform the rollouts
-                print(f"Starting rollout of run: {run.name}")
-                actor.set_task(task2idx[args.task])
-                rollout_stats = calculate_success_rate(
-                    actor=actor,
-                    env=env,
-                    n_rollouts=args.n_rollouts,
-                    rollout_max_steps=rollout_max_steps,
-                    epoch_idx=0,
-                    discount=cfg.discount,
-                    rollout_save_dir=save_dir,
-                    save_failures=args.save_failures,
-                    n_parts_assemble=args.n_parts_assemble,
-                    compress_pickles=args.compress_pickles,
-                    resize_video=not args.store_full_resolution_video,
-                    break_on_n_success=args.break_on_n_success,
-                    stop_after_n_success=args.stop_after_n_success,
-                    full_length_rollout=args.full_length_rollout,
-                    record_first_state_only=args.record_for_coverage,
-                    pc_generator=pc_generator,
-                    annotate_skill=args.annotate_skill,
-                    skill_on_image=args.skill_on_image,
-                    provide_skill_input=requires_skill_input,
-                )
-
-                if args.store_video_wandb:
-                    # Close the run to save the videos
-                    wandb.finish()
-
-                success_rate = rollout_stats.success_rate
-
-                print(
-                    f"Success rate: {success_rate:.2%} ({rollout_stats.n_success}/{rollout_stats.n_rollouts})"
-                )
 
                 if args.wandb:
-                    print("Writing to wandb...")
-
-                    s: dict = run.summary
-
-                    # Set the summary fields
-                    if how_update == "overwrite":
-                        s[spf + "success_rate"] = success_rate
-                        s[spf + "n_success"] = rollout_stats.n_success
-                        s[spf + "n_rollouts"] = rollout_stats.n_rollouts
-                        s[spf + "total_return"] = rollout_stats.total_return
-                        s[spf + "average_return"] = (
-                            rollout_stats.total_return / rollout_stats.n_rollouts
-                        )
-                        s[spf + "total_reward"] = rollout_stats.total_reward
-                        s[spf + "average_reward"] = (
-                            rollout_stats.total_reward / rollout_stats.n_rollouts
-                        )
-                    elif how_update == "append":
-                        s[spf + "n_success"] += rollout_stats.n_success
-                        s[spf + "n_rollouts"] += rollout_stats.n_rollouts
-                        s[spf + "success_rate"] = (
-                            s[spf + "n_success"] / s[spf + "n_rollouts"]
-                        )
-
-                        s[spf + "total_return"] = (
-                            s.get(spf + "total_return", 0) + rollout_stats.total_return
-                        )
-                        s[spf + "average_return"] = (
-                            s[spf + "total_return"] / s[spf + "n_rollouts"]
-                        )
-                        s[spf + "total_reward"] = (
-                            s.get(spf + "total_reward", 0) + rollout_stats.total_reward
-                        )
-                        s[spf + "average_reward"] = (
-                            s[spf + "total_reward"] / s[spf + "n_rollouts"]
-                        )
-                    else:
-                        raise ValueError(f"Invalid how_update: {how_update}")
-
-                    # Set the currently_evaluating flag to false
                     run.config["currently_evaluating"] = False
-
-                    # Update the run to save the summary fields
                     run.update()
 
-                else:
-                    print("Not writing to wandb")
-
-                # If we prioritize the runs with the fewest rollouts, break after the first run
-                # so that we can sort the runs according to the number of rollouts and evaluate them again
                 if args.prioritize_fewest_rollouts:
                     break
 
-            # If not in continuous mode, break
             if not args.continuous_mode:
                 break
 
-            # Sleep for the interval
             print(
                 f"Sleeping for {args.continuous_interval} seconds before checking for new runs..."
             )
             time.sleep(args.continuous_interval)
+
+        if args.task_summary_out:
+            import json
+
+            with open(args.task_summary_out, "w") as f:
+                json.dump(
+                    {
+                        "task": primary_task if len(tasks) == 1 else task_group,
+                        "n_success": summary_total_success,
+                        "n_rollouts": summary_total_rollouts,
+                        "success_rate": (
+                            summary_total_success / summary_total_rollouts
+                            if summary_total_rollouts > 0
+                            else None
+                        ),
+                    },
+                    f,
+                )
     finally:
-        # Unset the "currently_evaluating" flag
-        if args.wandb:
+        if args.wandb and run is not None:
             print("Exiting the evaluation loop")
             print("Unsetting the currently_evaluating flag")
             run.config["currently_evaluating"] = False
