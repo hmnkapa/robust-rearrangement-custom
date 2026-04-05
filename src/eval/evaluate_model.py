@@ -30,7 +30,7 @@ from src.common.files import trajectory_save_dir
 from src.gym import get_rl_env
 from src.eval.eval_utils import load_model_weights
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from ipdb import set_trace as bp  # noqa
 import wandb
 from wandb import Api
@@ -147,7 +147,7 @@ def validate_args(args: argparse.Namespace):
 
 def resolve_rollout_after_success_by_task(
     tasks: List[str], rollout_after_success_values: List[int]
-) -> dict[str, int]:
+) -> Dict[str, int]:
     if len(rollout_after_success_values) == 1:
         value = int(rollout_after_success_values[0])
         return {task: value for task in tasks}
@@ -337,6 +337,15 @@ if __name__ == "__main__":
     parser.add_argument("--skill-on-image", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
+    parser.add_argument(
+        "--rollout-suffix-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Optional extra subdirectory inserted into the raw rollout save path "
+            "(placed after task-group suffix and before success/failure)."
+        ),
+    )
     parser.add_argument(
         "--task-group",
         type=str,
@@ -657,6 +666,10 @@ if __name__ == "__main__":
                         suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
                     if task_group:
                         suffix = f"{suffix}/{task_group}" if suffix else task_group
+                    if args.rollout_suffix_model_name is not None:
+                        model_name = args.rollout_suffix_model_name.strip()
+                        if model_name:
+                            suffix = f"{suffix}/{model_name}" if suffix else model_name
 
                     save_dir = (
                         trajectory_save_dir(

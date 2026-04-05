@@ -738,8 +738,12 @@ def draw_guidance_point_on_image(image: np.ndarray, guidance_point_2d) -> np.nda
 
     uv = _to_numpy(guidance_point_2d).astype(np.int32)
     annotated = image.copy()
+    # small dot setting
     point_radius = 2
     point_alpha = 0.5
+    # big dot setting
+    # point_radius = 6
+    # point_alpha = 1.0
     point_color = (255, 0, 0)
 
     def _draw_point(frame: np.ndarray, center: tuple[int, int]) -> np.ndarray:
