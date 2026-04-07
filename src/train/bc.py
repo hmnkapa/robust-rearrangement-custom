@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import shutil
 import tempfile
 from collections import defaultdict
 from datetime import datetime
@@ -130,7 +131,10 @@ def now():
 
 
 def _checkpoint_epoch(path: Path) -> int:
-    match = re.search(r"actor_chkpt_(\d+)\.pt$", path.name)
+    match = re.search(
+        r"actor_chkpt_(?:latest_|best_test_loss_)?(\d+)\.pt$",
+        path.name,
+    )
     return int(match.group(1)) if match else -1
 
 
@@ -172,10 +176,14 @@ def _extract_path_datetime(path: Path) -> Optional[datetime]:
 
 def _checkpoint_priority(path: Path) -> int:
     if path.name == "actor_chkpt_last.pt":
-        return 3
+        return 5
+    if re.match(r"actor_chkpt_latest_\d+\.pt$", path.name):
+        return 4
     if re.match(r"actor_chkpt_\d+\.pt$", path.name):
-        return 2
+        return 3
     if path.name == "actor_chkpt_best_test_loss.pt":
+        return 2
+    if re.match(r"actor_chkpt_best_test_loss_\d+\.pt$", path.name):
         return 1
     if path.name == "actor_chkpt_best_success_rate.pt":
         return 0
@@ -732,6 +740,27 @@ def main(cfg: DictConfig):
         desc=pbar_desc,
     )
 
+    checkpoint_archive_interval = cfg.training.save_per_epoch
+
+    def build_save_dict():
+        save_dict = {
+            "model_state_dict": actor.state_dict(),
+            "best_test_loss": best_test_loss,
+            "best_success_rate": best_success_rate,
+            "epoch": epoch_idx,
+            "global_step": global_step,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+
+        for (name, opt), scheduler in zip(optimizers, lr_schedulers):
+            save_dict[f"{name}_optimizer_state_dict"] = opt.state_dict()
+            save_dict[f"{name}_scheduler_state_dict"] = scheduler.state_dict()
+
+        return save_dict
+
+    def save_checkpoint(path: Path):
+        torch.save(build_save_dict(), str(path))
+
     for epoch_idx in tglobal:
         epoch_loss = list()
         test_loss = list()
@@ -794,21 +823,6 @@ def main(cfg: DictConfig):
         # Add the learning rates to the log
         for name, opt in optimizers:
             epoch_log[f"{name}_lr"] = opt.param_groups[0]["lr"]
-
-        # Prepare the save dict once and we can reuse below
-        save_dict = {
-            "model_state_dict": actor.state_dict(),
-            "best_test_loss": best_test_loss,
-            "best_success_rate": best_success_rate,
-            "epoch": epoch_idx,
-            "global_step": global_step,
-            "config": OmegaConf.to_container(cfg, resolve=True),
-        }
-
-        # Add the optimizer and scheduler states to the save dict
-        for (name, opt), scheduler in zip(optimizers, lr_schedulers):
-            save_dict[f"{name}_optimizer_state_dict"] = opt.state_dict()
-            save_dict[f"{name}_scheduler_state_dict"] = scheduler.state_dict()
 
         if (
             cfg.training.eval_every > 0
@@ -886,7 +900,7 @@ def main(cfg: DictConfig):
             ):
                 best_test_loss = test_loss_mean
                 save_path = str(model_save_dir / f"actor_chkpt_best_test_loss.pt")
-                torch.save(save_dict, save_path)
+                save_checkpoint(Path(save_path))
                 # wandb.save(save_path)
 
             # Save the model if the success rate is the best so far
@@ -896,7 +910,7 @@ def main(cfg: DictConfig):
             ):
                 prev_best_success_rate = best_success_rate
                 save_path = str(model_save_dir / f"actor_chkpt_best_success_rate.pt")
-                torch.save(save_dict, save_path)
+                save_checkpoint(Path(save_path))
                 # wandb.save(save_path)
 
             if (
@@ -904,7 +918,7 @@ def main(cfg: DictConfig):
                 and (epoch_idx + 1) % cfg.training.checkpoint_interval == 0
             ):
                 save_path = str(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
-                torch.save(save_dict, save_path)
+                save_checkpoint(Path(save_path))
                 # wandb.save(save_path)
 
             # Run diffusion sampling on a training batch
@@ -944,8 +958,19 @@ def main(cfg: DictConfig):
         # We store the last model at the end of each epoch for better checkpointing
         if cfg.training.store_last_model:
             save_path = str(model_save_dir / f"actor_chkpt_last.pt")
-            torch.save(save_dict, save_path)
+            save_checkpoint(Path(save_path))
             # wandb.save(save_path)
+
+        if checkpoint_archive_interval > 0 and (epoch_idx + 1) % checkpoint_archive_interval == 0:
+            save_checkpoint(model_save_dir / f"actor_chkpt_latest_{epoch_idx + 1}.pt")
+
+            best_test_loss_checkpoint = model_save_dir / "actor_chkpt_best_test_loss.pt"
+            if best_test_loss_checkpoint.exists():
+                shutil.copy2(
+                    best_test_loss_checkpoint,
+                    model_save_dir
+                    / f"actor_chkpt_best_test_loss_{epoch_idx + 1}.pt",
+                )
 
         # If switch is enabled, copy the the shadow to the model at the end of each epoch
         if cfg.training.ema.use and cfg.training.ema.switch:

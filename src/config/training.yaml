@@ -19,6 +19,7 @@ training:
   
   model_save_dir: models
   checkpoint_interval: -1
+  save_per_epoch: 1000
 
   store_best_test_loss_model: true
   store_last_model: true
