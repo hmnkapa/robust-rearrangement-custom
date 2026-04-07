@@ -36,7 +36,7 @@ import wandb
 from wandb import Api
 from wandb.sdk.wandb_run import Run
 
-api = Api()
+_wandb_api: Optional[Api] = None
 
 
 class LocalCheckpointWrapper:
@@ -96,6 +96,13 @@ class LocalCheckpointWrapper:
     def __getitem__(self, key: str) -> Any:
         # This method allows accessing config items using square bracket notation
         return self.config[key]
+
+
+def get_wandb_api() -> Api:
+    global _wandb_api
+    if _wandb_api is None:
+        _wandb_api = Api()
+    return _wandb_api
 
 
 def validate_args(args: argparse.Namespace):
@@ -172,7 +179,7 @@ def get_runs(args: argparse.Namespace, map_location: Optional[torch.device] = No
         runs = [run]
 
     else:
-
+        api = get_wandb_api()
         api.flush()
         if args.sweep_id:
             runs: List[Run] = list(api.sweep(args.sweep_id).runs)
@@ -542,6 +549,7 @@ if __name__ == "__main__":
 
             for run in runs:
                 if not args.wt_path:
+                    api = get_wandb_api()
                     api.flush()
                     run = api.run("/".join([run.project, run.id]))
 
