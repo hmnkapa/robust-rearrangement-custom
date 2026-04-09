@@ -6,6 +6,7 @@ import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Optional, Tuple, Union
 
 import hydra
@@ -18,7 +19,7 @@ from gymnasium import Env
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
@@ -28,7 +29,7 @@ from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
-from src.dataset.dataloader import FixedStepsDataloader
+from src.dataset.dataloader import AsyncDevicePrefetchLoader, build_dataloader
 from src.dataset.dataset import ImageDataset, RGBDDataset, StateDataset
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
@@ -479,6 +480,16 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def emit_timing_metrics(timing_metrics):
+    if not timing_metrics:
+        return
+
+    for key, value in timing_metrics.items():
+        print(f"TIMING {key}={value:.6f}")
+
+    wandb.summary.update(timing_metrics)
+
+
 def log_action_mse(log_dict, category, pred_action, gt_action):
     B, T, _ = pred_action.shape
     pred_action = pred_action.view(B, T, -1, 10)
@@ -525,6 +536,7 @@ def build_save_dict(
 
 @hydra.main(config_path="../config", config_name="base")
 def main(cfg: DictConfig):
+    job_start_perf = perf_counter()
     rank, local_rank, world_size = ddp_setup()
     main_process = is_main_process(rank)
     run = None
@@ -572,6 +584,7 @@ def main(cfg: DictConfig):
             )
 
         per_rank_batch_size = cfg.training.batch_size // world_size
+        data_init_start_perf = perf_counter()
 
         OmegaConf.set_struct(cfg, False)
         if (job_id := os.environ.get("SLURM_JOB_ID")) is not None:
@@ -690,43 +703,56 @@ def main(cfg: DictConfig):
             shuffle=True,
             drop_last=False,
         )
-        trainload_kwargs = dict(
+        trainloader = build_dataloader(
             dataset=train_dataset,
             batch_size=per_rank_batch_size,
             num_workers=cfg.data.dataloader_workers,
             shuffle=False,
             pin_memory=True,
             drop_last=False,
-            persistent_workers=False,
+            persistent_workers=cfg.data.get("persistent_workers", False),
+            prefetch_factor=cfg.data.get("prefetch_factor", None),
             sampler=train_sampler,
-        )
-        trainloader = (
-            FixedStepsDataloader(**trainload_kwargs, n_batches=cfg.training.steps_per_epoch)
-            if cfg.training.steps_per_epoch != -1
-            else DataLoader(**trainload_kwargs)
+            steps_per_epoch=cfg.training.steps_per_epoch,
         )
 
         testloader = None
         if main_process:
-            testload_kwargs = dict(
+            test_steps_per_epoch = (
+                max(int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1)
+                if cfg.training.steps_per_epoch != -1
+                else -1
+            )
+            testloader = build_dataloader(
                 dataset=test_dataset,
                 batch_size=per_rank_batch_size,
                 num_workers=cfg.data.dataloader_workers,
                 shuffle=True,
                 pin_memory=True,
                 drop_last=False,
-                persistent_workers=False,
+                persistent_workers=cfg.data.get("persistent_workers", False),
+                prefetch_factor=cfg.data.get("prefetch_factor", None),
+                steps_per_epoch=test_steps_per_epoch,
             )
-            testloader = (
-                FixedStepsDataloader(
-                    **testload_kwargs,
-                    n_batches=max(
-                        int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1
-                    ),
-                )
-                if cfg.training.steps_per_epoch != -1
-                else DataLoader(**testload_kwargs)
-            )
+
+        async_device_prefetch_enabled = bool(
+            cfg.data.get("async_device_prefetch", False) and device.type == "cuda"
+        )
+        if async_device_prefetch_enabled:
+            trainloader = AsyncDevicePrefetchLoader(trainloader, device)
+            if testloader is not None:
+                testloader = AsyncDevicePrefetchLoader(testloader, device)
+            if main_process:
+                print(f"Async device prefetch enabled across {world_size} DDP ranks.")
+
+        timing_metrics = {
+            "timing/data_init_seconds": perf_counter() - data_init_start_perf,
+        }
+
+        def prepare_batch(batch):
+            if async_device_prefetch_enabled:
+                return batch
+            return dict_to_device(batch, device)
 
         actor = DDP(
             actor,
@@ -870,12 +896,20 @@ def main(cfg: DictConfig):
 
             print(f"Job started at: {starttime}")
             print(f"This process has access to {os.cpu_count()} CPUs.")
+            train_loop_start_perf = perf_counter()
+            timing_metrics["timing/time_to_train_loop_seconds"] = (
+                train_loop_start_perf - job_start_perf
+            )
+            wandb.summary.update(timing_metrics)
         else:
             model_save_dir = None
+            train_loop_start_perf = None
 
         dist.barrier()
 
         early_stop = False
+        epoch_durations = []
+        timing_epoch_10_logged = False
         checkpoint_archive_interval = cfg.training.save_per_epoch
         pbar_desc = (
             f"Epoch ({cfg.task}, {cfg.observation_type}"
@@ -894,6 +928,7 @@ def main(cfg: DictConfig):
             epoch_iter = range(cfg.training.start_epoch, cfg.training.num_epochs)
 
         for epoch_idx in epoch_iter:
+            epoch_start_perf = perf_counter() if main_process else None
             epoch_log = {"epoch": epoch_idx}
             train_metric_sums = defaultdict(float)
             train_metric_counts = defaultdict(int)
@@ -913,7 +948,7 @@ def main(cfg: DictConfig):
                 for _, opt in optimizers:
                     opt.zero_grad()
 
-                batch = dict_to_device(batch, device)
+                batch = prepare_batch(batch)
                 loss, losses_log = actor(batch)
                 loss.backward()
 
@@ -982,7 +1017,7 @@ def main(cfg: DictConfig):
                 test_tepoch = tqdm(testloader, desc="Validation", leave=False)
                 for test_batch in test_tepoch:
                     with torch.no_grad():
-                        test_batch = dict_to_device(test_batch, device)
+                        test_batch = prepare_batch(test_batch)
                         test_loss_val, losses_log = actor.module.compute_loss(test_batch)
 
                         test_loss_cpu = test_loss_val.item()
@@ -1033,16 +1068,14 @@ def main(cfg: DictConfig):
                     and (epoch_idx + 1) % cfg.training.sample_every == 0
                 ):
                     with torch.no_grad():
-                        train_sampling_batch = dict_to_device(
-                            next(iter(trainloader)), device
-                        )
+                        train_sampling_batch = prepare_batch(next(iter(trainloader)))
                         pred_action = actor.module.action_pred(train_sampling_batch)
                         gt_action = actor.module.normalizer(
                             train_sampling_batch["action"], "action", forward=False
                         )
                         log_action_mse(epoch_log, "train", pred_action, gt_action)
 
-                        val_sampling_batch = dict_to_device(next(iter(testloader)), device)
+                        val_sampling_batch = prepare_batch(next(iter(testloader)))
                         gt_action = actor.module.normalizer(
                             val_sampling_batch["action"], "action", forward=False
                         )
@@ -1120,6 +1153,21 @@ def main(cfg: DictConfig):
             dist.broadcast(early_stop_tensor, src=0)
             early_stop = bool(early_stop_tensor.item())
 
+            if main_process:
+                epoch_durations.append(perf_counter() - epoch_start_perf)
+                if not timing_epoch_10_logged and len(epoch_durations) >= 10:
+                    timing_metrics["timing/time_to_epoch_10_total_seconds"] = (
+                        perf_counter() - job_start_perf
+                    )
+                    timing_metrics["timing/time_to_epoch_10_train_loop_seconds"] = (
+                        perf_counter() - train_loop_start_perf
+                    )
+                    timing_metrics["timing/avg_epoch_seconds_first_10"] = float(
+                        np.mean(epoch_durations[:10])
+                    )
+                    emit_timing_metrics(timing_metrics)
+                    timing_epoch_10_logged = True
+
             if early_stop:
                 if main_process:
                     print(
@@ -1130,6 +1178,9 @@ def main(cfg: DictConfig):
 
         if main_process and hasattr(epoch_iter, "close"):
             epoch_iter.close()
+
+        if main_process and not timing_epoch_10_logged:
+            emit_timing_metrics(timing_metrics)
 
         if run is not None:
             wandb.finish()

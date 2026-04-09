@@ -6,6 +6,7 @@ import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Optional, Tuple, Union
 
 import hydra
@@ -16,7 +17,7 @@ from diffusers.optimization import get_scheduler
 from gymnasium import Env
 from ipdb import set_trace as bp
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import random_split
 from tqdm import tqdm, trange
 
 from src.behavior import get_actor
@@ -25,7 +26,7 @@ from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
-from src.dataset.dataloader import FixedStepsDataloader
+from src.dataset.dataloader import AsyncDevicePrefetchLoader, build_dataloader
 from src.dataset.dataset import ImageDataset, StateDataset, RGBDDataset
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
@@ -128,6 +129,16 @@ def set_dryrun_params(cfg: DictConfig):
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def emit_timing_metrics(timing_metrics):
+    if not timing_metrics:
+        return
+
+    for key, value in timing_metrics.items():
+        print(f"TIMING {key}={value:.6f}")
+
+    wandb.summary.update(timing_metrics)
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -423,6 +434,7 @@ def resolve_resume_state(
 def main(cfg: DictConfig):
     set_dryrun_params(cfg)
     OmegaConf.resolve(cfg)
+    job_start_perf = perf_counter()
 
     # Set the random seed
     if cfg.get("seed") is None:
@@ -460,6 +472,7 @@ def main(cfg: DictConfig):
         prev_best_success_rate = 0
         global_step = 0
 
+    data_init_start_perf = perf_counter()
     if cfg.data.data_paths_override is None:
         data_path = get_processed_paths(
             controller=to_native(cfg.control.controller),
@@ -570,41 +583,51 @@ def main(cfg: DictConfig):
         actor.load_state_dict(torch.load(model_path))
 
     # Create dataloaders
-    trainload_kwargs = dict(
+    trainloader = build_dataloader(
         dataset=train_dataset,
         batch_size=cfg.training.batch_size,
         num_workers=cfg.data.dataloader_workers,
         shuffle=True,
         pin_memory=True,
         drop_last=False,
-        persistent_workers=False,
-    )
-    trainloader = (
-        FixedStepsDataloader(**trainload_kwargs, n_batches=cfg.training.steps_per_epoch)
-        if cfg.training.steps_per_epoch != -1
-        else DataLoader(**trainload_kwargs)
+        persistent_workers=cfg.data.get("persistent_workers", False),
+        prefetch_factor=cfg.data.get("prefetch_factor", None),
+        steps_per_epoch=cfg.training.steps_per_epoch,
     )
 
-    testload_kwargs = dict(
+    test_steps_per_epoch = (
+        max(int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1)
+        if cfg.training.steps_per_epoch != -1
+        else -1
+    )
+    testloader = build_dataloader(
         dataset=test_dataset,
         batch_size=cfg.training.batch_size,
         num_workers=cfg.data.dataloader_workers,
         shuffle=True,
         pin_memory=True,
         drop_last=False,
-        persistent_workers=False,
+        persistent_workers=cfg.data.get("persistent_workers", False),
+        prefetch_factor=cfg.data.get("prefetch_factor", None),
+        steps_per_epoch=test_steps_per_epoch,
     )
 
-    testloader = (
-        FixedStepsDataloader(
-            **testload_kwargs,
-            n_batches=max(
-                int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1
-            ),
-        )
-        if cfg.training.steps_per_epoch != -1
-        else DataLoader(**testload_kwargs)
+    async_device_prefetch_enabled = bool(
+        cfg.data.get("async_device_prefetch", False) and device.type == "cuda"
     )
+    if async_device_prefetch_enabled:
+        trainloader = AsyncDevicePrefetchLoader(trainloader, device)
+        testloader = AsyncDevicePrefetchLoader(testloader, device)
+        print(f"Async device prefetch enabled on {device}.")
+
+    timing_metrics = {
+        "timing/data_init_seconds": perf_counter() - data_init_start_perf,
+    }
+
+    def prepare_batch(batch):
+        if async_device_prefetch_enabled:
+            return batch
+        return dict_to_device(batch, device)
 
     # Create lists for optimizers and lr schedulers
 
@@ -727,8 +750,15 @@ def main(cfg: DictConfig):
     model_save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Job started at: {starttime}")
+    train_loop_start_perf = perf_counter()
+    timing_metrics["timing/time_to_train_loop_seconds"] = (
+        train_loop_start_perf - job_start_perf
+    )
+    wandb.summary.update(timing_metrics)
 
     early_stop = False
+    epoch_durations = []
+    timing_epoch_10_logged = False
 
     pbar_desc = f"Epoch ({cfg.task}, {cfg.observation_type}{f', {cfg.vision_encoder.model}' if cfg.observation_type == 'image' else ''})"
 
@@ -762,6 +792,7 @@ def main(cfg: DictConfig):
         torch.save(build_save_dict(), str(path))
 
     for epoch_idx in tglobal:
+        epoch_start_perf = perf_counter()
         epoch_loss = list()
         test_loss = list()
 
@@ -780,7 +811,7 @@ def main(cfg: DictConfig):
                 opt.zero_grad()
 
             # Get a batch on device and compute loss and gradients
-            batch = dict_to_device(batch, device)
+            batch = prepare_batch(batch)
             loss, losses_log = actor.compute_loss(batch)
             loss.backward()
 
@@ -840,7 +871,7 @@ def main(cfg: DictConfig):
             for test_batch in test_tepoch:
                 with torch.no_grad():
                     # device transfer for test_batch
-                    test_batch = dict_to_device(test_batch, device)
+                    test_batch = prepare_batch(test_batch)
 
                     # Get test loss
                     test_loss_val, losses_log = actor.compute_loss(test_batch)
@@ -929,16 +960,14 @@ def main(cfg: DictConfig):
 
                 with torch.no_grad():
                     # sample trajectory from training set, and evaluate difference
-                    train_sampling_batch = dict_to_device(
-                        next(iter(trainloader)), device
-                    )
+                    train_sampling_batch = prepare_batch(next(iter(trainloader)))
                     pred_action = actor.action_pred(train_sampling_batch)
                     gt_action = actor.normalizer(
                         train_sampling_batch["action"], "action", forward=False
                     )
                     log_action_mse(epoch_log, "train", pred_action, gt_action)
 
-                    val_sampling_batch = dict_to_device(next(iter(testloader)), device)
+                    val_sampling_batch = prepare_batch(next(iter(testloader)))
                     gt_action = actor.normalizer(
                         val_sampling_batch["action"], "action", forward=False
                     )
@@ -993,6 +1022,20 @@ def main(cfg: DictConfig):
         ):
             trigger_sync()
 
+        epoch_durations.append(perf_counter() - epoch_start_perf)
+        if not timing_epoch_10_logged and len(epoch_durations) >= 10:
+            timing_metrics["timing/time_to_epoch_10_total_seconds"] = (
+                perf_counter() - job_start_perf
+            )
+            timing_metrics["timing/time_to_epoch_10_train_loop_seconds"] = (
+                perf_counter() - train_loop_start_perf
+            )
+            timing_metrics["timing/avg_epoch_seconds_first_10"] = float(
+                np.mean(epoch_durations[:10])
+            )
+            emit_timing_metrics(timing_metrics)
+            timing_epoch_10_logged = True
+
         # Now that everything is logged and restored, we can check if we need to stop
         if early_stop:
             print(
@@ -1001,6 +1044,8 @@ def main(cfg: DictConfig):
             break
 
     tglobal.close()
+    if not timing_epoch_10_logged:
+        emit_timing_metrics(timing_metrics)
     wandb.finish()
 
 

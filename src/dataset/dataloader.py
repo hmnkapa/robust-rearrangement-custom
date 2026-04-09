@@ -1,6 +1,9 @@
-import torch
-import itertools
+from typing import Optional
+
 import numpy as np
+import torch
+
+from src.common.pytorch_util import dict_apply, dict_to_device
 
 
 class FixedStepsDataloader(torch.utils.data.DataLoader):
@@ -14,8 +17,13 @@ class FixedStepsDataloader(torch.utils.data.DataLoader):
         super().__init__(*args, **kwargs)
         self.n_batches = n_batches
 
+    def _endless_iterator(self):
+        while True:
+            for batch in super().__iter__():
+                yield batch
+
     def __iter__(self):
-        endless_dataloader = itertools.cycle(super().__iter__())
+        endless_dataloader = self._endless_iterator()
         for _ in range(self.n_batches):
             yield next(endless_dataloader)
 
@@ -32,9 +40,9 @@ class EndlessDataloader(torch.utils.data.DataLoader):
         super().__init__(*args, **kwargs)
 
     def __iter__(self):
-        endless_dataloader = itertools.cycle(super().__iter__())
-        for batch in endless_dataloader:
-            yield batch
+        while True:
+            for batch in super().__iter__():
+                yield batch
 
     def __len__(self):
         return float("inf")
@@ -77,3 +85,99 @@ class WeightedDataLoader:
 
     def __len__(self):
         return sum([len(dataloader) for dataloader in self.dataloaders])
+
+
+def build_dataloader(
+    *,
+    dataset,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    pin_memory: bool,
+    drop_last: bool,
+    persistent_workers: bool = False,
+    prefetch_factor: Optional[int] = None,
+    sampler=None,
+    steps_per_epoch: int = -1,
+):
+    persistent_workers = persistent_workers and num_workers > 0
+
+    dataloader_kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle if sampler is None else False,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        persistent_workers=persistent_workers,
+    )
+
+    if sampler is not None:
+        dataloader_kwargs["sampler"] = sampler
+
+    if num_workers > 0 and prefetch_factor is not None:
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+
+    if steps_per_epoch != -1:
+        return FixedStepsDataloader(**dataloader_kwargs, n_batches=steps_per_epoch)
+
+    return torch.utils.data.DataLoader(**dataloader_kwargs)
+
+
+class _AsyncDevicePrefetchIterator:
+    def __init__(self, dataloader, device: torch.device):
+        self.loader_iter = iter(dataloader)
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.next_batch = None
+        self._preload()
+
+    def __iter__(self):
+        return self
+
+    def _record_stream(self, batch):
+        current_stream = torch.cuda.current_stream(self.device)
+
+        def record_tensor(tensor):
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                tensor.record_stream(current_stream)
+            return tensor
+
+        return dict_apply(batch, record_tensor)
+
+    def _preload(self):
+        try:
+            batch = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = dict_to_device(batch, self.device)
+
+    def __next__(self):
+        if self.next_batch is None:
+            raise StopIteration
+
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        self._record_stream(batch)
+        self._preload()
+        return batch
+
+
+class AsyncDevicePrefetchLoader:
+    def __init__(self, dataloader, device: torch.device):
+        self.dataloader = dataloader
+        self.device = torch.device(device)
+
+    def __iter__(self):
+        if self.device.type != "cuda":
+            return iter(self.dataloader)
+        return _AsyncDevicePrefetchIterator(self.dataloader, self.device)
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __getattr__(self, name):
+        return getattr(self.dataloader, name)

@@ -2,6 +2,9 @@ data:
   test_split: 0.05
   data_subset: null
   dataloader_workers: 16
+  persistent_workers: false
+  prefetch_factor: 2
+  async_device_prefetch: false
   pred_horizon: ${pred_horizon}
   obs_horizon: ${obs_horizon}
   action_horizon: ${action_horizon}
