@@ -1,3 +1,4 @@
+import itertools
 from typing import Optional
 
 import numpy as np
@@ -17,13 +18,10 @@ class FixedStepsDataloader(torch.utils.data.DataLoader):
         super().__init__(*args, **kwargs)
         self.n_batches = n_batches
 
-    def _endless_iterator(self):
-        while True:
-            for batch in super().__iter__():
-                yield batch
-
     def __iter__(self):
-        endless_dataloader = self._endless_iterator()
+        # Keep cycling over the first underlying iterator instead of recreating it
+        # mid-epoch, which can be extremely expensive for lazy zarr-backed datasets.
+        endless_dataloader = itertools.cycle(super().__iter__())
         for _ in range(self.n_batches):
             yield next(endless_dataloader)
 
@@ -40,9 +38,9 @@ class EndlessDataloader(torch.utils.data.DataLoader):
         super().__init__(*args, **kwargs)
 
     def __iter__(self):
-        while True:
-            for batch in super().__iter__():
-                yield batch
+        endless_dataloader = itertools.cycle(super().__iter__())
+        for batch in endless_dataloader:
+            yield batch
 
     def __len__(self):
         return float("inf")
