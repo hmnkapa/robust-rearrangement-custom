@@ -678,7 +678,7 @@ def main():
 
     # Setup camera streams (via either LCM or pyrealsense)
     # Setup data saving
-    eval_save_dir = Path(args.save_dir) / str(datetime.now())
+    eval_save_dir = Path(args.save_dir) / datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
     eval_save_dir.mkdir(exist_ok=True, parents=True)
 
     episode_dict = {}

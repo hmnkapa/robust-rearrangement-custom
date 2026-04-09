@@ -344,6 +344,6 @@ def render_mp4(ims1, ims2, filename=None):
     )
 
     if not filename:
-        filename = f"render-{datetime.now()}.mp4"
+        filename = f"render-{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.mp4"
 
     ani.save(filename)
