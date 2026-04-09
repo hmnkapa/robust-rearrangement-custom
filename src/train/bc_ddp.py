@@ -1,6 +1,8 @@
 import os
 import random
 import re
+import shutil
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,49 @@ from src.gym import get_rl_env
 from src.models.ema import SwitchEMA
 from wandb.errors.util import CommError
 from wandb_osh.hooks import TriggerWandbSyncHook, _comm_default_dir
+
+
+def configure_runtime_tmpdir() -> Path:
+    # W&B launches a local service that writes port files into a temp directory.
+    # On shared machines, TMPDIR can sometimes point at a deleted path after a move
+    # or a stale shell session; fall back to a stable writable location.
+    candidate_dirs = []
+    for env_name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(env_name)
+        if value:
+            candidate_dirs.append(Path(value).expanduser())
+
+    candidate_dirs.extend(
+        [
+            Path("/tmp") / os.environ.get("USER", "user") / "robust-rearrangement",
+            Path.cwd() / ".tmp",
+        ]
+    )
+
+    for candidate_dir in candidate_dirs:
+        try:
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            probe_file = candidate_dir / ".wandb_tmp_probe"
+            with open(probe_file, "w"):
+                pass
+            probe_file.unlink()
+
+            tmp_dir = str(candidate_dir)
+            tempfile.tempdir = tmp_dir
+            for env_name in ("TMPDIR", "TEMP", "TMP"):
+                os.environ[env_name] = tmp_dir
+
+            wandb_osh_dir = candidate_dir / "wandb_osh"
+            wandb_osh_dir.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("WANDB_OSH_COMM_DIR", str(wandb_osh_dir))
+            return candidate_dir
+        except OSError:
+            continue
+
+    raise RuntimeError("Unable to configure a writable temporary directory for W&B.")
+
+
+RUNTIME_TMP_DIR = configure_runtime_tmpdir()
 
 trigger_sync = TriggerWandbSyncHook(
     communication_dir=os.environ.get("WANDB_OSH_COMM_DIR", _comm_default_dir),
@@ -129,10 +174,14 @@ def _extract_path_datetime(path: Path) -> Optional[datetime]:
 
 def _checkpoint_priority(path: Path) -> int:
     if path.name == "actor_chkpt_last.pt":
-        return 3
+        return 5
+    if re.match(r"actor_chkpt_latest_\d+\.pt$", path.name):
+        return 4
     if re.match(r"actor_chkpt_\d+\.pt$", path.name):
-        return 2
+        return 3
     if path.name == "actor_chkpt_best_test_loss.pt":
+        return 2
+    if re.match(r"actor_chkpt_best_test_loss_\d+\.pt$", path.name):
         return 1
     if path.name == "actor_chkpt_best_success_rate.pt":
         return 0
@@ -506,6 +555,7 @@ def main(cfg: DictConfig):
         best_success_rate = 0.0
         prev_best_success_rate = 0.0
         global_step = 0
+        is_resuming = resume_payload["state_dict_path"] is not None
 
         if resume_payload["state_dict_path"] is not None:
             state_dict = load_state_dict_from_path(resume_payload["state_dict_path"])
@@ -742,6 +792,21 @@ def main(cfg: DictConfig):
         )
         config_dict = OmegaConf.to_container(cfg, resolve=True)
 
+        def save_checkpoint(path: Path):
+            torch.save(
+                build_save_dict(
+                    cfg,
+                    actor,
+                    best_test_loss,
+                    best_success_rate,
+                    epoch_idx,
+                    global_step,
+                    optimizers,
+                    lr_schedulers,
+                ),
+                str(path),
+            )
+
         if main_process:
             run = wandb.init(
                 id=cfg.wandb.continue_run_id,
@@ -753,6 +818,19 @@ def main(cfg: DictConfig):
                 mode=cfg.wandb.mode,
                 notes=cfg.wandb.notes,
             )
+
+            if cfg.wandb.continue_run_id is not None:
+                if run.id != cfg.wandb.continue_run_id:
+                    raise RuntimeError(
+                        "W&B initialized an unexpected run id: "
+                        f"expected '{cfg.wandb.continue_run_id}', got '{run.id}'."
+                    )
+                if not run.resumed:
+                    raise RuntimeError(
+                        f"W&B did not resume existing run '{cfg.wandb.continue_run_id}'. "
+                        "With resume='allow', this means W&B started a new run with the same "
+                        "id instead of attaching to prior history. Refusing to continue."
+                    )
 
             if cfg.wandb.watch_model:
                 run.watch(actor.module, log="all", log_freq=1000)
@@ -781,7 +859,13 @@ def main(cfg: DictConfig):
             starttime = now()
             wandb.summary["start_time"] = starttime
 
-            model_save_dir = Path(cfg.training.model_save_dir) / wandb.run.name
+            model_dir_name = wandb.run.name
+            if is_resuming:
+                model_dir_name = (
+                    f"{wandb.run.name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+                )
+
+            model_save_dir = Path(cfg.training.model_save_dir) / model_dir_name
             model_save_dir.mkdir(parents=True, exist_ok=True)
 
             print(f"Job started at: {starttime}")
@@ -792,6 +876,7 @@ def main(cfg: DictConfig):
         dist.barrier()
 
         early_stop = False
+        checkpoint_archive_interval = cfg.training.save_per_epoch
         pbar_desc = (
             f"Epoch ({cfg.task}, {cfg.observation_type}"
             f"{f', {cfg.vision_encoder.model}' if cfg.observation_type in {'image', 'rgbd'} else ''})"
@@ -969,59 +1054,20 @@ def main(cfg: DictConfig):
                     and test_loss_mean < best_test_loss
                 ):
                     best_test_loss = test_loss_mean
-                    save_path = str(model_save_dir / "actor_chkpt_best_test_loss.pt")
-                    torch.save(
-                        build_save_dict(
-                            cfg,
-                            actor,
-                            best_test_loss,
-                            best_success_rate,
-                            epoch_idx,
-                            global_step,
-                            optimizers,
-                            lr_schedulers,
-                        ),
-                        save_path,
-                    )
+                    save_checkpoint(model_save_dir / "actor_chkpt_best_test_loss.pt")
 
                 if (
                     cfg.training.store_best_success_rate_model
                     and best_success_rate > prev_best_success_rate
                 ):
                     prev_best_success_rate = best_success_rate
-                    save_path = str(model_save_dir / "actor_chkpt_best_success_rate.pt")
-                    torch.save(
-                        build_save_dict(
-                            cfg,
-                            actor,
-                            best_test_loss,
-                            best_success_rate,
-                            epoch_idx,
-                            global_step,
-                            optimizers,
-                            lr_schedulers,
-                        ),
-                        save_path,
-                    )
+                    save_checkpoint(model_save_dir / "actor_chkpt_best_success_rate.pt")
 
                 if (
                     cfg.training.checkpoint_interval > 0
                     and (epoch_idx + 1) % cfg.training.checkpoint_interval == 0
                 ):
-                    save_path = str(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
-                    torch.save(
-                        build_save_dict(
-                            cfg,
-                            actor,
-                            best_test_loss,
-                            best_success_rate,
-                            epoch_idx,
-                            global_step,
-                            optimizers,
-                            lr_schedulers,
-                        ),
-                        save_path,
-                    )
+                    save_checkpoint(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
 
                 if ema is not None:
                     ema.restore()
@@ -1032,28 +1078,21 @@ def main(cfg: DictConfig):
                 epoch_log["early_stopper/ema_loss"] = early_stopper.ema_loss
 
             if main_process and cfg.training.store_last_model:
-                ema_applied_for_last = False
-                if ema is not None:
-                    ema.apply_shadow()
-                    ema_applied_for_last = True
+                save_checkpoint(model_save_dir / "actor_chkpt_last.pt")
 
-                save_path = str(model_save_dir / "actor_chkpt_last.pt")
-                torch.save(
-                    build_save_dict(
-                        cfg,
-                        actor,
-                        best_test_loss,
-                        best_success_rate,
-                        epoch_idx,
-                        global_step,
-                        optimizers,
-                        lr_schedulers,
-                    ),
-                    save_path,
-                )
+            if (
+                main_process
+                and checkpoint_archive_interval > 0
+                and (epoch_idx + 1) % checkpoint_archive_interval == 0
+            ):
+                save_checkpoint(model_save_dir / f"actor_chkpt_latest_{epoch_idx + 1}.pt")
 
-                if ema_applied_for_last:
-                    ema.restore()
+                best_test_loss_checkpoint = model_save_dir / "actor_chkpt_best_test_loss.pt"
+                if best_test_loss_checkpoint.exists():
+                    shutil.copy2(
+                        best_test_loss_checkpoint,
+                        model_save_dir / f"actor_chkpt_best_test_loss_{epoch_idx + 1}.pt",
+                    )
 
             if ema is not None and cfg.training.ema.switch:
                 ema.copy_to_model()
