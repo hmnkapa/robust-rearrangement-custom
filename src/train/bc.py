@@ -697,6 +697,9 @@ def main(cfg: DictConfig):
         print(f"Async device prefetch enabled on {device}.")
 
     timing_metrics = {
+        "timing/load_into_memory_seconds": float(
+            getattr(dataset, "load_into_memory_seconds", 0.0)
+        ),
         "timing/data_init_seconds": perf_counter() - data_init_start_perf,
     }
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 import numpy as np
 import torch
 from typing import Dict, Optional, Union, List
@@ -105,6 +106,7 @@ class ImageDataset(torch.utils.data.Dataset):
             "color_image1",
             "color_image2",
         ]
+        self.load_into_memory_seconds = 0.0
         self.load_into_memory = load_into_memory
         if not self.load_into_memory and self.obs_horizon > 1:
             raise ValueError(
@@ -113,11 +115,15 @@ class ImageDataset(torch.utils.data.Dataset):
             )
         if self.load_into_memory:
             # Read from zarr dataset (images and non-image data)
+            load_into_memory_start_perf = perf_counter()
             combined_data, metadata = combine_zarr_datasets(
                 dataset_paths,
                 self.non_image_keys + self.image_keys,
                 max_episodes=data_subset,
                 max_ep_cnt=max_episode_count,
+            )
+            self.load_into_memory_seconds = (
+                perf_counter() - load_into_memory_start_perf
             )
         else:
             # Read non-image data into memory
@@ -422,6 +428,7 @@ class RGBDDataset(torch.utils.data.Dataset):
             "depth_image2",
         ]
 
+        self.load_into_memory_seconds = 0.0
         self.load_into_memory = load_into_memory
         if not self.load_into_memory and self.obs_horizon > 1:
             raise ValueError(
@@ -430,11 +437,15 @@ class RGBDDataset(torch.utils.data.Dataset):
             )
         if self.load_into_memory:
             # Read from zarr dataset (images and non-image data)
+            load_into_memory_start_perf = perf_counter()
             combined_data, metadata = combine_zarr_datasets(
                 dataset_paths,
                 self.non_image_keys + self.image_keys + self.depth_keys,
                 max_episodes=data_subset,
                 max_ep_cnt=max_episode_count,
+            )
+            self.load_into_memory_seconds = (
+                perf_counter() - load_into_memory_start_perf
             )
         else:
             # Read non-image data into memory
@@ -739,8 +750,10 @@ class StateDataset(torch.utils.data.Dataset):
         self.predict_past_actions = predict_past_actions
         self.control_mode = control_mode
         self.include_future_obs = include_future_obs
+        self.load_into_memory_seconds = 0.0
 
         # Read from zarr dataset
+        load_into_memory_start_perf = perf_counter()
         combined_data, metadata = combine_zarr_datasets(
             dataset_paths,
             [
@@ -753,6 +766,7 @@ class StateDataset(torch.utils.data.Dataset):
             max_episodes=data_subset,
             max_ep_cnt=max_episode_count,
         )
+        self.load_into_memory_seconds = perf_counter() - load_into_memory_start_perf
 
         # (N, D)
         # Get only the first data_subset episodes
