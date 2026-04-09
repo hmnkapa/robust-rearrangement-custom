@@ -4,6 +4,7 @@ import re
 import shutil
 import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -158,6 +159,62 @@ def get_wandb_run_dir_name(run, configured_name: Optional[str]) -> str:
     if getattr(run, "id", None):
         return run.id
     return f"wandb-run-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+
+
+def can_write_to_dir(path: Union[str, Path]) -> bool:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    probe_file = path / ".wandb_access_probe"
+    try:
+        with open(probe_file, "w"):
+            pass
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            probe_file.unlink()
+        except OSError:
+            pass
+
+
+@contextmanager
+def patch_wandb_access_checks(paths):
+    normalized_paths = set()
+    for path in paths:
+        if not path:
+            continue
+        path_obj = Path(path)
+        if can_write_to_dir(path_obj):
+            normalized_paths.add(str(path_obj.resolve()))
+
+    if not normalized_paths:
+        yield
+        return
+
+    original_access = os.access
+
+    def patched_access(path, mode, *args, **kwargs):
+        try:
+            resolved_path = str(Path(path).resolve())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            resolved_path = None
+
+        if resolved_path in normalized_paths:
+            if mode & os.W_OK:
+                return True
+            if mode & os.R_OK:
+                return True
+            if mode & os.X_OK:
+                return True
+
+        return original_access(path, mode, *args, **kwargs)
+
+    os.access = patched_access
+    try:
+        yield
+    finally:
+        os.access = original_access
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -706,17 +763,18 @@ def main(cfg: DictConfig):
     wandb_init_dir = get_wandb_init_dir()
 
     # Init wandb
-    run = wandb.init(
-        id=cfg.wandb.continue_run_id,
-        name=cfg.wandb.name,
-        resume=None if cfg.wandb.continue_run_id is None else "allow",
-        project=cfg.wandb.project,
-        entity=cfg.wandb.get("entity"),
-        config=config_dict,
-        mode=cfg.wandb.mode,
-        notes=cfg.wandb.notes,
-        dir=wandb_init_dir,
-    )
+    with patch_wandb_access_checks([wandb_init_dir, tempfile.gettempdir()]):
+        run = wandb.init(
+            id=cfg.wandb.continue_run_id,
+            name=cfg.wandb.name,
+            resume=None if cfg.wandb.continue_run_id is None else "allow",
+            project=cfg.wandb.project,
+            entity=cfg.wandb.get("entity"),
+            config=config_dict,
+            mode=cfg.wandb.mode,
+            notes=cfg.wandb.notes,
+            dir=wandb_init_dir,
+        )
 
     if cfg.wandb.continue_run_id is not None:
         if run.id != cfg.wandb.continue_run_id:
