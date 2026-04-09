@@ -141,6 +141,25 @@ def emit_timing_metrics(timing_metrics):
     wandb.summary.update(timing_metrics)
 
 
+def get_wandb_init_dir() -> Optional[str]:
+    wandb_dir = os.environ.get("WANDB_DIR")
+    if not wandb_dir:
+        return None
+
+    Path(wandb_dir).mkdir(parents=True, exist_ok=True)
+    return wandb_dir
+
+
+def get_wandb_run_dir_name(run, configured_name: Optional[str]) -> str:
+    if run.name:
+        return run.name
+    if configured_name:
+        return configured_name
+    if getattr(run, "id", None):
+        return run.id
+    return f"wandb-run-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+
+
 def _checkpoint_epoch(path: Path) -> int:
     match = re.search(
         r"actor_chkpt_(?:latest_|best_test_loss_)?(\d+)\.pt$",
@@ -684,6 +703,7 @@ def main(cfg: DictConfig):
         smooth_factor=cfg.early_stopper.smooth_factor,
     )
     config_dict = OmegaConf.to_container(cfg, resolve=True)
+    wandb_init_dir = get_wandb_init_dir()
 
     # Init wandb
     run = wandb.init(
@@ -695,6 +715,7 @@ def main(cfg: DictConfig):
         config=config_dict,
         mode=cfg.wandb.mode,
         notes=cfg.wandb.notes,
+        dir=wandb_init_dir,
     )
 
     if cfg.wandb.continue_run_id is not None:
@@ -713,8 +734,10 @@ def main(cfg: DictConfig):
     if cfg.wandb.watch_model:
         run.watch(actor, log="all", log_freq=1000)
 
+    run_dir_name = get_wandb_run_dir_name(run, cfg.wandb.name)
+
     # Print the run name and storage location
-    print(f"Run name: {run.name}")
+    print(f"Run name: {run_dir_name}")
     print(f"Run storage location: {run.dir}")
 
     # In sweeps, the init is ignored, so to make sure that the cfg is saved correctly
@@ -742,9 +765,11 @@ def main(cfg: DictConfig):
     wandb.summary["start_time"] = starttime
 
     # Create model save dir
-    model_dir_name = wandb.run.name
+    model_dir_name = run_dir_name
     if is_resuming:
-        model_dir_name = f"{wandb.run.name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+        model_dir_name = (
+            f"{run_dir_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')}"
+        )
 
     model_save_dir = Path(cfg.training.model_save_dir) / model_dir_name
     model_save_dir.mkdir(parents=True, exist_ok=True)
