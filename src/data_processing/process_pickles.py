@@ -1,5 +1,4 @@
 import argparse
-import array
 import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,9 +25,33 @@ from src.data_processing.utils import resize, resize_crop
 from src.data_processing.utils import clip_quat_xyzw_magnitude
 
 from ipdb import set_trace as bp  # noqa
-import sys
 
-# === Modified Function to Initialize Zarr Store with Full Dimensions ===
+TIMESERIES_KEYS = (
+    "robot_state",
+    "color_image1",
+    "color_image2",
+    "depth_image1",
+    "depth_image2",
+    "action/delta",
+    "action/pos",
+    "reward",
+    "skill",
+    "augment_states",
+    "parts_poses",
+)
+
+
+def get_zarr_chunks(shape, chunksize):
+    """
+    Use bounded chunks along the leading dimension so datasets can be resized.
+    """
+    if len(shape) == 0:
+        return None
+
+    leading_chunk = chunksize if shape[0] == 0 else min(chunksize, shape[0])
+    return (max(1, leading_chunk),) + tuple(shape[1:])
+
+
 def initialize_zarr_store(out_path, full_data_shapes, chunksize=32):
     """
     Initialize the Zarr store with full dimensions for each dataset.
@@ -42,28 +65,72 @@ def initialize_zarr_store(out_path, full_data_shapes, chunksize=32):
 
     # Initialize datasets with full shapes
     for name, shape, dtype in full_data_shapes:
+        chunks = get_zarr_chunks(shape, chunksize)
+
         if "image" in name:  # Apply compression to image data
             z.create_dataset(
                 name,
                 shape=shape,
                 dtype=dtype,
-                chunks=(chunksize,) + shape[1:],
+                chunks=chunks,
                 compressor=compressor,
             )
-        elif dtype == object:
+        elif dtype in (object, str):
             z.create_dataset(
-            name,
-            shape=shape,
-            dtype=dtype,
-            chunks=shape,
-            object_codec=JSON(),
+                name,
+                shape=shape,
+                dtype=object,
+                chunks=chunks,
+                object_codec=JSON(),
             )
         else:
             z.create_dataset(
-            name, shape=shape, dtype=dtype, chunks=shape
+                name, shape=shape, dtype=dtype, chunks=chunks
             )
 
     return z
+
+
+def concatenate_batch_timeseries(batch_timeseries):
+    """
+    Concatenate a batch of per-episode arrays into per-timestep arrays.
+    """
+    return {
+        key: np.concatenate(values)
+        for key, values in batch_timeseries.items()
+    }
+
+
+def build_streaming_data_shapes(batch_timeseries):
+    """
+    Create growable dataset specs from the first processed batch.
+    """
+    data_shapes = [
+        (key, (0,) + value.shape[1:], value.dtype)
+        for key, value in batch_timeseries.items()
+    ]
+    data_shapes.extend(
+        [
+            ("episode_ends", (0,), np.uint32),
+            ("task", (0,), object),
+            ("success", (0,), np.uint8),
+            ("pickle_file", (0,), object),
+        ]
+    )
+    return data_shapes
+
+
+def resize_and_write_dataset(dataset, start_idx, values):
+    """
+    Resize a dataset on axis 0 and write a contiguous block.
+    """
+    if values.shape[0] == 0:
+        return start_idx
+
+    end_idx = start_idx + values.shape[0]
+    dataset.resize((end_idx,) + dataset.shape[1:])
+    dataset[start_idx:end_idx] = values
+    return end_idx
 
 
 def process_pickle_file(
@@ -128,8 +195,6 @@ def process_pickle_file(
         # Ensure the shape is consistent with the expected Zarr dataset shape
         assert color_image1.shape[1:] == (240, 320, 3), f"Unexpected shape for color_image1: {color_image1.shape[1:]}"
         # assert color_image2.shape[1:] == (240, 320, 3), f"Unexpected shape for color_image2: {color_image2.shape[1:]}"
-    else:
-        print("[INFO] Skipping image resizing as --resize-image is not set.")
 
     if isinstance(obs[0]["robot_state"], dict):
         # Convert the robot state to a numpy array
@@ -507,116 +572,22 @@ if __name__ == "__main__":
     n_cpus = min(os.cpu_count(), args.n_cpus)
     batch_size = args.batch_size
 
-    # If batch processing requested, do a lightweight scan first to determine total shapes
+    # If batch processing requested, stream batches directly into a growable zarr
     if batch_size > 0 and batch_size < len(pickle_paths):
         print(f"[INFO] Using batch processing with batch_size={batch_size}")
-        total_timesteps = 0
-        episode_lengths = []
-        tasks_meta = []
-        successes_meta = []
-        pickle_files_meta = []
-        # For determining per-step dims
-        img_shape = None
-        parts_pose_dim = None
-        robot_state_dim = None
-
-        for p in tqdm(pickle_paths, desc="Scanning pickle files for shapes"):
-            data = unpickle_data(p)
-
-            obs = data["observations"]
-            actions = data["actions"]
-            # Adjust for possible extra last obs
-            if len(obs) == len(actions) + 1:
-                obs = obs[:-1]
-            ep_len = len(actions)
-            episode_lengths.append(ep_len)
-            total_timesteps += ep_len
-            tasks_meta.append(data.get("task", data.get("furniture")))
-            successes_meta.append(1 if data.get("success") == "partial_success" else int(data.get("success", 0)))
-            pickle_file_rel = "/".join(p.parts[p.parts.index("raw") + 1 :]) if "raw" in p.parts else p.name
-            pickle_files_meta.append(pickle_file_rel)
-            if robot_state_dim is None:
-                rs = obs[0]["robot_state"]
-                if isinstance(rs, dict):
-                    rs_vec = filter_and_concat_robot_state(rs)
-                else:
-                    rs_vec = rs
-                robot_state_dim = rs_vec.shape[-1] + 2  # will become 6D rotation later but safe placeholder
-            if parts_pose_dim is None and "parts_poses" in obs[0]:
-                parts_pose_dim = len(obs[0]["parts_poses"])
-            if img_shape is None and "color_image1" in obs[0]:
-                img_shape = obs[0]["color_image1"].shape
-        if parts_pose_dim is None:
-            parts_pose_dim = 0
-        if img_shape is None:
-            # No images in this dataset (state-only); set dummy shape (total_timesteps,0,0,0)
-            img_shape = (0, 0, 0)
-
-        # Build full_data_shapes for zarr initialization
-        # Process the first pickle file to determine data shapes
-        sample_data = process_pickle_file(
-            pickle_paths[0],
-            noop_threshold=0.0,
-            calculate_pos_action_from_delta=True,
-            resize_image=args.resize_image,
-        )
-
-        # Define full_data_shapes based on the sample data and total_timesteps
-        full_data_shapes = [
-            ("robot_state", (total_timesteps,) + sample_data["robot_state"].shape[1:], np.float32),
-            ("color_image1", (total_timesteps,) + sample_data["color_image1"].shape[1:], np.uint8),
-            ("color_image2", (total_timesteps,) + sample_data["color_image2"].shape[1:], np.uint8),
-            ("depth_image1", (total_timesteps,) + sample_data["depth_image1"].shape[1:], np.float32),
-            ("depth_image2", (total_timesteps,) + sample_data["depth_image2"].shape[1:], np.float32),
-            ("action/delta", (total_timesteps,) + sample_data["action/delta"].shape[1:], np.float32),
-            ("action/pos", (total_timesteps,) + sample_data["action/pos"].shape[1:], np.float32),
-            ("parts_poses", (total_timesteps,) + sample_data["parts_poses"].shape[1:], np.float32),
-            ("reward", (total_timesteps,), np.float32),
-            ("skill", (total_timesteps,) + sample_data["skill"].shape[1:], np.float32),
-            ("augment_states", (total_timesteps,), np.float32),
-            ("episode_ends", (len(episode_lengths),), np.uint32),
-            ("task", (len(episode_lengths),), str),
-            ("success", (len(episode_lengths),), np.uint8),
-            ("pickle_file", (len(episode_lengths),), str),
-        ]
-
-        # Output the full_data_shapes for debugging or inspection
-        print("Full data shapes:")
-        for name, shape, dtype in full_data_shapes:
-            print(f"{name}: shape={shape}, dtype={dtype}")
-        sys.stdout.flush()  # Ensure the output is flushed immediately after printing
-
-        # Initialize zarr store early
-        z = initialize_zarr_store(output_path, full_data_shapes, chunksize=chunksize)
-
-        # Fill episode-level metadata arrays
-        cum_end = 0
-        episode_ends_arr = []
-        for L in episode_lengths:
-            cum_end += L
-            episode_ends_arr.append(cum_end)
-        z["episode_ends"][:] = np.array(episode_ends_arr, dtype=np.uint32)
-        z["task"][:] = np.array(tasks_meta, dtype=object)
-        z["success"][:] = np.array(successes_meta, dtype=np.uint8)
-        z["pickle_file"][:] = np.array(pickle_files_meta, dtype=object)
-
-        # Process in batches and write slices
+        total_batches = (len(pickle_paths) + batch_size - 1) // batch_size
+        z = None
         write_ptr = 0
+        episode_ptr = 0
+
         for start_i in range(0, len(pickle_paths), batch_size):
             batch_paths = pickle_paths[start_i : start_i + batch_size]
-            batch_timeseries = {
-                "robot_state": [],
-                "color_image1": [],
-                "color_image2": [],
-                "depth_image1": [],
-                "depth_image2": [],
-                "action/delta": [],
-                "action/pos": [],
-                "reward": [],
-                "skill": [],
-                "augment_states": [],
-                "parts_poses": [],
-            }
+            batch_timeseries = {key: [] for key in TIMESERIES_KEYS}
+            batch_episode_lengths = []
+            batch_tasks = []
+            batch_successes = []
+            batch_pickle_files = []
+
             for p in batch_paths:
                 data = process_pickle_file(
                     p,
@@ -624,25 +595,57 @@ if __name__ == "__main__":
                     calculate_pos_action_from_delta=True,
                     resize_image=args.resize_image,
                 )
-                for k in batch_timeseries.keys():
+                for k in TIMESERIES_KEYS:
                     batch_timeseries[k].append(data[k])
-            # Concatenate this batch
-            for k in batch_timeseries.keys():
-                if batch_timeseries[k]:
-                    batch_timeseries[k] = np.concatenate(batch_timeseries[k])
-                else:
-                    # Create empty array with correct trailing dims
-                    if k in ["robot_state", "action/delta", "action/pos", "parts_poses", "skill"]:
-                        batch_timeseries[k] = np.empty((0, batch_timeseries[k][0].shape[1] if batch_timeseries[k] else 0), dtype=np.float32)
-                    else:
-                        batch_timeseries[k] = np.empty((0,), dtype=np.float32)
+
+                batch_episode_lengths.append(data["episode_length"])
+                batch_tasks.append(data["task"])
+                batch_successes.append(data["success"])
+                batch_pickle_files.append(data["pickle_file"])
+
+            batch_timeseries = concatenate_batch_timeseries(batch_timeseries)
+
+            if z is None:
+                full_data_shapes = build_streaming_data_shapes(batch_timeseries)
+                print("Full data shapes:")
+                for name, shape, dtype in full_data_shapes:
+                    print(f"{name}: shape={shape}, dtype={dtype}")
+                z = initialize_zarr_store(output_path, full_data_shapes, chunksize=chunksize)
+
             batch_len = batch_timeseries["action/delta"].shape[0]
-            end_ptr = write_ptr + batch_len
-            # Write slice to zarr
+
             for k, arr in batch_timeseries.items():
-                z[k][write_ptr:end_ptr] = arr
-            write_ptr = end_ptr
-            print(f"[INFO] Written batch {start_i//batch_size + 1}, timesteps so far: {write_ptr}/{total_timesteps}")
+                if arr.shape[0] not in (0, batch_len):
+                    raise ValueError(
+                        f"Batch key {k} has unexpected leading dimension {arr.shape[0]} "
+                        f"(expected 0 or {batch_len})"
+                    )
+                if arr.shape[0] == batch_len:
+                    resize_and_write_dataset(z[k], write_ptr, arr)
+
+            batch_episode_ends = (
+                np.cumsum(np.array(batch_episode_lengths, dtype=np.uint32), dtype=np.uint32)
+                + np.uint32(write_ptr)
+            )
+            next_episode_ptr = resize_and_write_dataset(
+                z["episode_ends"], episode_ptr, batch_episode_ends
+            )
+            resize_and_write_dataset(
+                z["task"], episode_ptr, np.array(batch_tasks, dtype=object)
+            )
+            resize_and_write_dataset(
+                z["success"], episode_ptr, np.array(batch_successes, dtype=np.uint8)
+            )
+            resize_and_write_dataset(
+                z["pickle_file"], episode_ptr, np.array(batch_pickle_files, dtype=object)
+            )
+
+            write_ptr += batch_len
+            episode_ptr = next_episode_ptr
+            print(
+                f"[INFO] Written batch {start_i // batch_size + 1}/{total_batches}, "
+                f"timesteps so far: {write_ptr}, episodes so far: {episode_ptr}"
+            )
 
         # Update metadata attrs and exit early (skip original full aggregation path)
         z.attrs["time_finished"] = datetime.now().astimezone().isoformat()
@@ -650,8 +653,8 @@ if __name__ == "__main__":
         z.attrs["chunksize"] = chunksize
         z.attrs["rotation_mode"] = "rot_6d"
         z.attrs["n_episodes"] = len(z["episode_ends"])
-        z.attrs["n_timesteps"] = total_timesteps
-        z.attrs["mean_episode_length"] = round(total_timesteps / len(z["episode_ends"]))
+        z.attrs["n_timesteps"] = write_ptr
+        z.attrs["mean_episode_length"] = round(write_ptr / len(z["episode_ends"]))
         z.attrs["calculated_pos_action_from_delta"] = True
         z.attrs["randomize_order"] = args.randomize_order
         z.attrs["random_seed"] = args.random_seed
