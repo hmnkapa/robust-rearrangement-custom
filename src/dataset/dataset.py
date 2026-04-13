@@ -74,6 +74,14 @@ def sample_sequence(
     return result
 
 
+def float_tensor_from_numpy(array: np.ndarray) -> torch.Tensor:
+    """
+    Continuous training signals should stay float32 even if an upstream zarr
+    shard was created with float64.
+    """
+    return torch.from_numpy(array).to(dtype=torch.float32)
+
+
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -151,9 +159,11 @@ class ImageDataset(torch.utils.data.Dataset):
             )
 
         self.train_data = {
-            "robot_state": torch.from_numpy(combined_data["robot_state"]),
-            "action": torch.from_numpy(combined_data[f"action/{control_mode}"]),
-            "skill": torch.from_numpy(combined_data["skill"]),
+            "robot_state": float_tensor_from_numpy(combined_data["robot_state"]),
+            "action": float_tensor_from_numpy(
+                combined_data[f"action/{control_mode}"]
+            ),
+            "skill": float_tensor_from_numpy(combined_data["skill"]),
         }
 
         # Fit the normalizer to the data
@@ -475,9 +485,11 @@ class RGBDDataset(torch.utils.data.Dataset):
             )
 
         self.train_data = {
-            "robot_state": torch.from_numpy(combined_data["robot_state"]),
-            "action": torch.from_numpy(combined_data[f"action/{control_mode}"]),
-            "skill": torch.from_numpy(combined_data["skill"]),
+            "robot_state": float_tensor_from_numpy(combined_data["robot_state"]),
+            "action": float_tensor_from_numpy(
+                combined_data[f"action/{control_mode}"]
+            ),
+            "skill": float_tensor_from_numpy(combined_data["skill"]),
         }
 
         # Fit the normalizer to the data
@@ -516,10 +528,10 @@ class RGBDDataset(torch.utils.data.Dataset):
             ).permute(0, 3, 1, 2)
             self.train_data["depth_image1"] = torch.from_numpy(
                 combined_data["depth_image1"]
-            ).unsqueeze(1)
+            ).to(dtype=torch.float32).unsqueeze(1)
             self.train_data["depth_image2"] = torch.from_numpy(
                 combined_data["depth_image2"]
-            ).unsqueeze(1)
+            ).to(dtype=torch.float32).unsqueeze(1)
 
         self.train_data["zarr_idx"] = torch.from_numpy(combined_data["zarr_idx"])
         self.train_data["within_zarr_idx"] = torch.from_numpy(
@@ -655,10 +667,10 @@ class RGBDDataset(torch.utils.data.Dataset):
             ).permute(0, 3, 1, 2)
             nsample["depth_image1"] = torch.from_numpy(
                 self.zarr_di1[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).unsqueeze(1)
+            ).to(dtype=torch.float32).unsqueeze(1)
             nsample["depth_image2"] = torch.from_numpy(
                 self.zarr_di2[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).unsqueeze(1)
+            ).to(dtype=torch.float32).unsqueeze(1)
 
         # Discard unused observations
         # TODO: This is where a performance improvement can be made, i.e., don't load
@@ -779,9 +791,9 @@ class StateDataset(torch.utils.data.Dataset):
             )
 
         # Get the data and convert to torch tensors
-        robot_state = torch.from_numpy(combined_data["robot_state"])
-        action = torch.from_numpy(combined_data[f"action/{control_mode}"])
-        parts_poses = torch.from_numpy(combined_data["parts_poses"])
+        robot_state = float_tensor_from_numpy(combined_data["robot_state"])
+        action = float_tensor_from_numpy(combined_data[f"action/{control_mode}"])
+        parts_poses = float_tensor_from_numpy(combined_data["parts_poses"])
 
         self.train_data = {
             "parts_poses": parts_poses,

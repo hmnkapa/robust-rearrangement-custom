@@ -101,12 +101,26 @@ def concatenate_batch_timeseries(batch_timeseries):
     }
 
 
+def ensure_float32(array: np.ndarray) -> np.ndarray:
+    """
+    Keep floating-point arrays in float32 so streamed zarr writes do not
+    accidentally lock large datasets into float64.
+    """
+    if np.issubdtype(array.dtype, np.floating):
+        return array.astype(np.float32, copy=False)
+    return array
+
+
 def build_streaming_data_shapes(batch_timeseries):
     """
     Create growable dataset specs from the first processed batch.
     """
     data_shapes = [
-        (key, (0,) + value.shape[1:], value.dtype)
+        (
+            key,
+            (0,) + value.shape[1:],
+            np.float32 if np.issubdtype(value.dtype, np.floating) else value.dtype,
+        )
         for key, value in batch_timeseries.items()
     ]
     data_shapes.extend(
@@ -205,7 +219,9 @@ def process_pickle_file(
     else:
         robot_state_quat = np.array([o["robot_state"] for o in obs], dtype=np.float32)
 
-    robot_state_6d = np_proprioceptive_quat_to_6d_rotation(robot_state_quat)
+    robot_state_6d = ensure_float32(
+        np_proprioceptive_quat_to_6d_rotation(robot_state_quat)
+    )
     parts_poses = (
         np.array([o["parts_poses"] for o in obs], dtype=np.float32)
         if "parts_poses" in obs[0]
@@ -236,7 +252,7 @@ def process_pickle_file(
             ],
             axis=1,
         )
-        action_pos_6d = np_action_quat_to_6d_rotation(action_pos)
+        action_pos_6d = ensure_float32(np_action_quat_to_6d_rotation(action_pos))
 
     else:
         raise NotImplementedError(
@@ -244,10 +260,10 @@ def process_pickle_file(
         )
 
     # Convert delta action to use 6D rotation
-    action_delta_6d = np_action_quat_to_6d_rotation(action_delta_quat)
+    action_delta_6d = ensure_float32(np_action_quat_to_6d_rotation(action_delta_quat))
 
     # Extract the rewards from the pickle file
-    reward = (
+    reward = ensure_float32(
         np.array(data["rewards"], dtype=np.float32)
         if "rewards" in data
         else np.zeros(len(action_delta_6d))
@@ -269,8 +285,10 @@ def process_pickle_file(
             )
         skill[idx] = SKILL_TO_ONEHOT[skill_label]
 
-    augment_states = (
-        data["augment_states"] if "augment_states" in data else np.zeros_like(reward)
+    augment_states = ensure_float32(
+        data["augment_states"]
+        if "augment_states" in data
+        else np.zeros_like(reward)
     )
 
     # Sanity check that all arrays are the same length

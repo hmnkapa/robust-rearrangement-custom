@@ -103,8 +103,9 @@ def combine_zarr_datasets(
         "success": np.zeros(total_episodes, dtype=np.uint8),
         # Domain is 0 for sim, 1 for real
         "domain": np.zeros(total_episodes, dtype=np.uint8),
-        "zarr_idx": np.zeros(total_frames, dtype=np.uint8),
-        "within_zarr_idx": np.zeros(total_frames, dtype=np.uint8),
+        # Large sharded datasets and long trajectories can easily exceed uint8.
+        "zarr_idx": np.zeros(total_frames, dtype=np.int64),
+        "within_zarr_idx": np.zeros(total_frames, dtype=np.int64),
     }
     for key in keys:
         combined_data[key] = np.zeros(
