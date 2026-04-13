@@ -61,6 +61,7 @@ def save_raw_rollout(
     have_depth_obs: bool = False,
     pcs: List[np.ndarray] = None,
     skill_on_image: bool = False,
+    output_only_pickle: bool = False,
 ):
     observations: List[Observation] = list()
 
@@ -162,6 +163,8 @@ def save_raw_rollout(
 
     pickle_data(data, output_path)
 
+    if output_only_pickle:
+        return
 
     # Additionally save MP4 videos for video1 and video2
     if have_img_obs:

@@ -314,6 +314,11 @@ if __name__ == "__main__":
     parser.add_argument("--prioritize-fewest-rollouts", action="store_true")
     parser.add_argument("--multitask", action="store_true")
     parser.add_argument("--compress-pickles", action="store_true")
+    parser.add_argument(
+        "--output-only-pickle",
+        action="store_true",
+        help="When saving rollouts locally, only write pickle files and skip txt/mp4 side outputs.",
+    )
     parser.add_argument("--max-rollouts", type=int, default=None)
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--max-rollout-steps", type=int, default=None)
@@ -785,6 +790,7 @@ if __name__ == "__main__":
                         annotate_skill=args.annotate_skill,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
+                        output_only_pickle=args.output_only_pickle,
                     )
 
                     if args.store_video_wandb:

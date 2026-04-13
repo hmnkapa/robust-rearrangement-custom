@@ -544,6 +544,7 @@ def calculate_success_rate(
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
     full_length_rollout: bool = False,
+    output_only_pickle: bool = False,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -735,6 +736,7 @@ def calculate_success_rate(
                         have_depth_obs=have_depth_obs,
                         pcs=pcs_trimmed,
                         skill_on_image=skill_on_image,
+                        output_only_pickle=output_only_pickle,
                     )
 
         if break_on_n_success and n_success >= stop_after_n_success:
