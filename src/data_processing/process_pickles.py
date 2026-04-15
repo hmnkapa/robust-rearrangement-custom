@@ -40,6 +40,14 @@ TIMESERIES_KEYS = (
     "parts_poses",
 )
 
+NORMALIZER_STATS_KEYS = (
+    "robot_state",
+    "action/delta",
+    "action/pos",
+    "skill",
+    "parts_poses",
+)
+
 
 def get_zarr_chunks(shape, chunksize):
     """
@@ -109,6 +117,51 @@ def ensure_float32(array: np.ndarray) -> np.ndarray:
     if np.issubdtype(array.dtype, np.floating):
         return array.astype(np.float32, copy=False)
     return array
+
+
+def update_normalizer_stats(stats, key: str, values: np.ndarray):
+    if key not in NORMALIZER_STATS_KEYS or values.size == 0 or values.shape[0] == 0:
+        return
+
+    local_min = np.min(values, axis=0).astype(np.float32, copy=False)
+    local_max = np.max(values, axis=0).astype(np.float32, copy=False)
+
+    if key not in stats:
+        stats[key] = {"min": local_min.copy(), "max": local_max.copy()}
+        return
+
+    stats[key]["min"] = np.minimum(stats[key]["min"], local_min)
+    stats[key]["max"] = np.maximum(stats[key]["max"], local_max)
+
+
+def compute_normalizer_stats_from_dict(data_dict):
+    stats = {}
+    for key in NORMALIZER_STATS_KEYS:
+        update_normalizer_stats(stats, key, data_dict[key])
+    return stats
+
+
+def merge_normalizer_stats(dst_stats, src_stats):
+    for key, value in src_stats.items():
+        if key not in dst_stats:
+            dst_stats[key] = {
+                "min": value["min"].copy(),
+                "max": value["max"].copy(),
+            }
+            continue
+
+        dst_stats[key]["min"] = np.minimum(dst_stats[key]["min"], value["min"])
+        dst_stats[key]["max"] = np.maximum(dst_stats[key]["max"], value["max"])
+
+
+def serialize_normalizer_stats(stats):
+    return {
+        key: {
+            "min": value["min"].astype(np.float32, copy=False).tolist(),
+            "max": value["max"].astype(np.float32, copy=False).tolist(),
+        }
+        for key, value in stats.items()
+    }
 
 
 def build_streaming_data_shapes(batch_timeseries):
@@ -597,6 +650,7 @@ if __name__ == "__main__":
         z = None
         write_ptr = 0
         episode_ptr = 0
+        normalizer_stats = {}
 
         for start_i in range(0, len(pickle_paths), batch_size):
             batch_paths = pickle_paths[start_i : start_i + batch_size]
@@ -622,6 +676,8 @@ if __name__ == "__main__":
                 batch_pickle_files.append(data["pickle_file"])
 
             batch_timeseries = concatenate_batch_timeseries(batch_timeseries)
+            batch_stats = compute_normalizer_stats_from_dict(batch_timeseries)
+            merge_normalizer_stats(normalizer_stats, batch_stats)
 
             if z is None:
                 full_data_shapes = build_streaming_data_shapes(batch_timeseries)
@@ -683,6 +739,7 @@ if __name__ == "__main__":
         z.attrs["randomness"] = args.randomness
         z.attrs["demo_outcome"] = args.demo_outcome
         z.attrs["suffix"] = args.suffix
+        z.attrs["normalizer_stats"] = serialize_normalizer_stats(normalizer_stats)
         print("[INFO] Batch processing complete.")
         exit(0)
 
@@ -699,6 +756,7 @@ if __name__ == "__main__":
         calculate_pos_action_from_delta=True,
         resize_image=args.resize_image,
     )
+    normalizer_stats = compute_normalizer_stats_from_dict(all_data)
 
     # Define the full shapes for each dataset
     full_data_shapes = [
@@ -758,5 +816,6 @@ if __name__ == "__main__":
     z.attrs["domain"] = args.domain if args.domain == "real" else "sim"
     z.attrs["task"] = args.task
     z.attrs["randomness"] = args.randomness
+    z.attrs["normalizer_stats"] = serialize_normalizer_stats(normalizer_stats)
     z.attrs["demo_outcome"] = args.demo_outcome
     z.attrs["suffix"] = args.suffix

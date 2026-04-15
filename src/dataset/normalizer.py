@@ -15,14 +15,7 @@ class LinearNormalizer(nn.Module):
         for key, tensor in data_dict.items():
             min_value = tensor.min(dim=0)[0]
             max_value = tensor.max(dim=0)[0]
-
-            # Check if any column has only one value throughout
-            diff = max_value - min_value
-            constant_columns = diff == 0
-
-            # Set a small range for constant columns to avoid division by zero
-            min_value[constant_columns] -= 1
-            max_value[constant_columns] += 1
+            min_value, max_value = self._expand_constant_columns(min_value, max_value)
 
             self.stats[key] = nn.ParameterDict(
                 {
@@ -78,19 +71,26 @@ class LinearNormalizer(nn.Module):
 
         return f"<Added keys {self.stats.keys()} to the normalizer.>"
 
+    @staticmethod
+    def _expand_constant_columns(min_value, max_value):
+        diff = max_value - min_value
+        constant_columns = diff == 0
+        min_value = min_value.clone()
+        max_value = max_value.clone()
+        min_value[constant_columns] -= 1
+        max_value[constant_columns] += 1
+        return min_value, max_value
+
     def load_stats(self, stats_dict):
         stats = nn.ParameterDict()
         for key, key_stats in stats_dict.items():
+            min_value = torch.as_tensor(key_stats["min"], dtype=torch.float32)
+            max_value = torch.as_tensor(key_stats["max"], dtype=torch.float32)
+            min_value, max_value = self._expand_constant_columns(min_value, max_value)
             stats[key] = nn.ParameterDict(
                 {
-                    "min": nn.Parameter(
-                        torch.as_tensor(key_stats["min"], dtype=torch.float32),
-                        requires_grad=False,
-                    ),
-                    "max": nn.Parameter(
-                        torch.as_tensor(key_stats["max"], dtype=torch.float32),
-                        requires_grad=False,
-                    ),
+                    "min": nn.Parameter(min_value, requires_grad=False),
+                    "max": nn.Parameter(max_value, requires_grad=False),
                 }
             )
 

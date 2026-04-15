@@ -85,7 +85,23 @@ class BaseSequenceDataset(torch.utils.data.Dataset):
             episode_refs = self.episode_refs
             if data_subset is not None:
                 episode_refs = episode_refs[:data_subset]
-            return subset_loader(self.dataset_paths, episode_refs, keys)
+            progress_desc = None
+            progress_position = 0
+            progress_disable = False
+            if self.shard_spec.enabled:
+                progress_desc = (
+                    f"[Rank {self.shard_spec.rank}] Load {self.shard_spec.split} shard"
+                )
+                progress_position = self.shard_spec.rank
+
+            return subset_loader(
+                self.dataset_paths,
+                episode_refs,
+                keys,
+                progress_desc=progress_desc,
+                progress_position=progress_position,
+                progress_disable=progress_disable,
+            )
 
         return full_loader(
             self.dataset_paths,

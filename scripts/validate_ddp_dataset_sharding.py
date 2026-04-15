@@ -68,6 +68,28 @@ def create_synthetic_dataset(path: Path, episode_lengths, domain: str, offset: i
     root.create_dataset("color_image2", data=color_image2, shape=color_image2.shape)
     root.create_dataset("depth_image1", data=depth_image1, shape=depth_image1.shape)
     root.create_dataset("depth_image2", data=depth_image2, shape=depth_image2.shape)
+    root.attrs["normalizer_stats"] = {
+        "robot_state": {
+            "min": robot_state.min(axis=0).tolist(),
+            "max": robot_state.max(axis=0).tolist(),
+        },
+        "action/delta": {
+            "min": action_delta.min(axis=0).tolist(),
+            "max": action_delta.max(axis=0).tolist(),
+        },
+        "action/pos": {
+            "min": action_pos.min(axis=0).tolist(),
+            "max": action_pos.max(axis=0).tolist(),
+        },
+        "skill": {
+            "min": skill.min(axis=0).tolist(),
+            "max": skill.max(axis=0).tolist(),
+        },
+        "parts_poses": {
+            "min": parts_poses.min(axis=0).tolist(),
+            "max": parts_poses.max(axis=0).tolist(),
+        },
+    }
 
 
 def manual_concat(paths, episode_refs, key):

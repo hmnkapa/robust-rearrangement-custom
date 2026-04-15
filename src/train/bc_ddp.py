@@ -904,6 +904,7 @@ def main(cfg: DictConfig):
                 )
 
             manifest_payload = None
+            manifest_start_perf = perf_counter()
             if main_process:
                 full_episode_refs = build_episode_manifest(
                     data_path,
@@ -933,21 +934,26 @@ def main(cfg: DictConfig):
                 }
 
             manifest_payload = broadcast_object(manifest_payload if main_process else None)
+            manifest_duration = perf_counter() - manifest_start_perf
             full_episode_refs = manifest_payload["full_episode_refs"]
             train_episode_refs = manifest_payload["train_episode_refs"]
             val_episode_refs = manifest_payload["val_episode_refs"]
             train_shard_refs = manifest_payload["train_shards"][rank]
             full_metadata = manifest_payload["metadata"]
 
-            local_stats_refs = full_episode_refs[rank::world_size]
+            stats_start_perf = perf_counter()
             global_stats = compute_global_minmax_stats(
                 data_path,
-                local_stats_refs,
+                full_episode_refs,
                 get_normalizer_stats_key_map(cfg),
                 device=device,
+                progress_desc=f"[Rank {rank}] Min/max",
+                progress_position=rank,
             )
+            stats_duration = perf_counter() - stats_start_perf
             shared_normalizer = build_normalizer_from_global_stats(cfg, global_stats)
 
+            train_dataset_start_perf = perf_counter()
             train_dataset = build_dataset_for_observation_type(
                 cfg,
                 data_path,
@@ -962,9 +968,11 @@ def main(cfg: DictConfig):
                     is_validation=False,
                 ),
             )
+            train_dataset_duration = perf_counter() - train_dataset_start_perf
             dataset = train_dataset
 
             if main_process:
+                val_dataset_start_perf = perf_counter()
                 test_dataset = build_dataset_for_observation_type(
                     cfg,
                     data_path,
@@ -979,6 +987,9 @@ def main(cfg: DictConfig):
                         is_validation=True,
                     ),
                 )
+                val_dataset_duration = perf_counter() - val_dataset_start_perf
+            else:
+                val_dataset_duration = None
 
             episode_count_tensor = torch.tensor(
                 [len(train_shard_refs), len(train_dataset)],
@@ -1018,6 +1029,17 @@ def main(cfg: DictConfig):
                     f"{global_train_episode_count} train episodes, "
                     f"{global_val_episode_count} val episodes."
                 )
+            print(
+                f"[Rank {rank}] DDP shard init timings: "
+                f"manifest={manifest_duration:.1f}s "
+                f"stats={stats_duration:.1f}s "
+                f"train_dataset={train_dataset_duration:.1f}s"
+                + (
+                    f" val_dataset={val_dataset_duration:.1f}s"
+                    if val_dataset_duration is not None
+                    else ""
+                )
+            )
 
             train_sampler = EpochShuffleSampler(
                 train_dataset, shuffle=True, seed=base_seed
