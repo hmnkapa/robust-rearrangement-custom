@@ -188,6 +188,12 @@ def _dataset_chunk_frames(dataset, key: str, fallback_frames: int = 1000) -> int
     return int(chunks[0])
 
 
+def _scan_chunk_count(scan_end: int, chunk_frames: int) -> int:
+    if scan_end <= 0:
+        return 0
+    return (int(scan_end) + int(chunk_frames) - 1) // int(chunk_frames)
+
+
 def _copy_chunk_intersections(
     output_array,
     path_items: List[dict],
@@ -519,29 +525,14 @@ def combine_zarr_episode_subset(
     )
     per_key_position = progress_position + 1
     for key in keys:
-        key_total_scan_frames = sum(
-            path_items[-1]["ref"].frame_end
-            for path_items in items_by_path.values()
-            if path_items
-        )
+        key_scan_plan = []
+        key_total_scan_frames = 0
+        key_total_chunks = 0
         key_total_bytes = sum(
             path_items[-1]["ref"].frame_end * _key_bytes_per_frame(opened[path_idx], key)
             for path_idx, path_items in items_by_path.items()
             if path_items
         )
-        key_desc = f"{load_desc}: {key}"
-        if key_total_bytes > 0:
-            key_desc = f"{key_desc} ({_format_gib(key_total_bytes)})"
-
-        key_iterator = tqdm(
-            desc=key_desc,
-            total=key_total_scan_frames,
-            position=per_key_position,
-            leave=False,
-            disable=progress_disable,
-            unit="frame",
-        )
-
         for path_idx, path_items in items_by_path.items():
             if not path_items:
                 continue
@@ -553,6 +544,34 @@ def combine_zarr_episode_subset(
                 fallback_frames=int(dataset.attrs.asdict().get("chunksize", 1000)),
             )
             scan_end = path_items[-1]["ref"].frame_end
+            scan_chunks = _scan_chunk_count(scan_end, chunk_frames)
+            key_total_scan_frames += scan_end
+            key_total_chunks += scan_chunks
+            key_scan_plan.append((path_idx, scan_end, chunk_frames))
+
+        _debug_log(
+            f"{load_desc}: {key} scans {key_total_chunks} source chunks, "
+            f"scan_frames={key_total_scan_frames}, selected_frames={total_selected_frames}, "
+            f"est_read={_format_gib(key_total_bytes)}",
+            enabled=not progress_disable,
+        )
+
+        key_desc = f"{load_desc}: batches for {key}"
+        if key_total_bytes > 0:
+            key_desc = f"{key_desc} ({_format_gib(key_total_bytes)})"
+
+        key_iterator = tqdm(
+            desc=key_desc,
+            total=key_total_chunks,
+            position=per_key_position,
+            leave=False,
+            disable=progress_disable,
+            unit="chunk",
+        )
+
+        for path_idx, scan_end, chunk_frames in key_scan_plan:
+            path_items = items_by_path[path_idx]
+            dataset = opened[path_idx]
             item_idx = 0
 
             for chunk_start in range(0, scan_end, chunk_frames):
@@ -566,7 +585,7 @@ def combine_zarr_episode_subset(
                     chunk_array,
                     item_idx,
                 )
-                key_iterator.update(chunk_end - chunk_start)
+                key_iterator.update(1)
 
         key_iterator.close()
         dataset_iterator.update(1)
