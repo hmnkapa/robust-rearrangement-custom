@@ -942,19 +942,36 @@ def main(cfg: DictConfig):
         wandb_init_dir = get_wandb_init_dir()
 
         def save_checkpoint(path: Path):
-            torch.save(
-                build_save_dict(
-                    cfg,
-                    actor,
-                    best_test_loss,
-                    best_success_rate,
-                    epoch_idx,
-                    global_step,
-                    optimizers,
-                    lr_schedulers,
-                ),
-                str(path),
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
             )
+            try:
+                with os.fdopen(fd, "wb") as tmp_file:
+                    torch.save(
+                        build_save_dict(
+                            cfg,
+                            actor,
+                            best_test_loss,
+                            best_success_rate,
+                            epoch_idx,
+                            global_step,
+                            optimizers,
+                            lr_schedulers,
+                        ),
+                        tmp_file,
+                    )
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                os.replace(tmp_path, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                raise
 
         if main_process:
             with patch_wandb_access_checks([wandb_init_dir, tempfile.gettempdir()]):
