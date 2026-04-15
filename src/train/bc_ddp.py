@@ -3,18 +3,20 @@ import random
 import re
 import shutil
 import tempfile
+import math
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import hydra
 import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
+import zarr
 from diffusers.optimization import get_scheduler
 from gymnasium import Env
 from omegaconf import DictConfig, OmegaConf
@@ -30,8 +32,21 @@ from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
-from src.dataset.dataloader import AsyncDevicePrefetchLoader, build_dataloader
+from src.dataset.base import DatasetShardSpec
+from src.dataset.dataloader import (
+    AsyncDevicePrefetchLoader,
+    EpochShuffleSampler,
+    build_dataloader,
+)
 from src.dataset.dataset import ImageDataset, RGBDDataset, StateDataset
+from src.dataset.normalizer import LinearNormalizer
+from src.dataset.zarr import (
+    balance_episode_manifest_by_frames,
+    build_episode_manifest,
+    compute_global_minmax_stats,
+    dataset_tuple,
+    split_episode_manifest,
+)
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
 from src.gym import get_rl_env
@@ -170,6 +185,127 @@ def distributed_mean(value_sum: float, count: int, device: torch.device) -> floa
     if tensor[1].item() == 0:
         return float("nan")
     return (tensor[0] / tensor[1]).item()
+
+
+def sort_data_paths(data_paths: List[Path]) -> List[Path]:
+    return sorted(data_paths, key=lambda path: str(path))
+
+
+def summarize_manifest_metadata(data_paths: List[Path], episode_refs) -> Dict[str, dict]:
+    metadata = {}
+    attrs_cache = {}
+    for ref in episode_refs:
+        metadata_key = str(dataset_tuple(data_paths[ref.path_idx]))
+        if ref.path_idx not in attrs_cache:
+            attrs_cache[ref.path_idx] = zarr.open(
+                data_paths[ref.path_idx], mode="r"
+            ).attrs.asdict()
+
+        if metadata_key not in metadata:
+            metadata[metadata_key] = {
+                "n_episodes_used": 0,
+                "n_frames_used": 0,
+                "attrs": attrs_cache[ref.path_idx],
+            }
+
+        metadata[metadata_key]["n_episodes_used"] += 1
+        metadata[metadata_key]["n_frames_used"] += ref.frame_count
+
+    return metadata
+
+
+def is_relative_control_mode(control_mode) -> bool:
+    if control_mode == "relative":
+        return True
+    return getattr(control_mode, "value", None) == "relative"
+
+
+def build_dataset_for_observation_type(
+    cfg: DictConfig,
+    data_path: List[Path],
+    *,
+    episode_refs=None,
+    normalizer: Optional[LinearNormalizer] = None,
+    shard_spec: Optional[DatasetShardSpec] = None,
+):
+    common_kwargs = dict(
+        dataset_paths=data_path,
+        pred_horizon=cfg.data.pred_horizon,
+        obs_horizon=cfg.data.obs_horizon,
+        action_horizon=cfg.data.action_horizon,
+        data_subset=None if episode_refs is not None else cfg.data.data_subset,
+        control_mode=cfg.control.control_mode,
+        predict_past_actions=cfg.data.predict_past_actions,
+        pad_after=cfg.data.get("pad_after", True),
+        max_episode_count=cfg.data.get("max_episode_count", None),
+        episode_refs=episode_refs,
+        normalizer=normalizer,
+        shard_spec=shard_spec,
+    )
+
+    if cfg.observation_type == "image":
+        return ImageDataset(
+            **common_kwargs,
+            minority_class_power=cfg.data.get("minority_class_power", False),
+            load_into_memory=cfg.data.get("load_into_memory", True),
+        )
+    if cfg.observation_type == "rgbd":
+        return RGBDDataset(
+            **common_kwargs,
+            minority_class_power=cfg.data.get("minority_class_power", False),
+            load_into_memory=cfg.data.get("load_into_memory", True),
+        )
+    if cfg.observation_type == "state":
+        return StateDataset(
+            **common_kwargs,
+            include_future_obs=cfg.data.include_future_obs,
+        )
+    raise ValueError(f"Unknown observation type: {cfg.observation_type}")
+
+
+def get_normalizer_stats_key_map(cfg: DictConfig) -> Dict[str, str]:
+    control_mode = cfg.control.control_mode
+    image_action_mode = "pos" if is_relative_control_mode(control_mode) else control_mode
+    if cfg.observation_type in {"image", "rgbd"}:
+        stats_key_map = {
+            "robot_state": "robot_state",
+            "action": f"action/{image_action_mode}",
+            "skill": "skill",
+        }
+        if is_relative_control_mode(control_mode):
+            stats_key_map["__action_delta__"] = "action/delta"
+        return stats_key_map
+
+    return {
+        "parts_poses": "parts_poses",
+        "robot_state": "robot_state",
+        "action": f"action/{control_mode}",
+    }
+
+
+def build_normalizer_from_global_stats(cfg: DictConfig, stats: Dict[str, dict]):
+    stats_for_normalizer = {
+        key: value for key, value in stats.items() if not key.startswith("__")
+    }
+    normalizer = LinearNormalizer.from_stats(stats_for_normalizer)
+
+    if cfg.observation_type in {"image", "rgbd"} and is_relative_control_mode(
+        cfg.control.control_mode
+    ):
+        delta_stats = stats["__action_delta__"]
+        delta_min = torch.as_tensor(delta_stats["min"], dtype=torch.float32)
+        delta_max = torch.as_tensor(delta_stats["max"], dtype=torch.float32)
+        max_delta_action = torch.max(
+            torch.abs(torch.cat([delta_min[:3].reshape(-1), delta_max[:3].reshape(-1)]))
+        ).item()
+        normalizer.stats.action.min[:3] = -max_delta_action * cfg.data.pred_horizon
+        normalizer.stats.action.max[:3] = max_delta_action * cfg.data.pred_horizon
+        normalizer.stats.action.min[3:] = -1.0
+        normalizer.stats.action.max[3:] = 1.0
+        normalizer.stats.robot_state.min[:9] = -1.0
+        normalizer.stats.robot_state.max[:9] = 1.0
+
+    return normalizer
 
 
 def load_state_dict_from_path(path: str):
@@ -730,62 +866,270 @@ def main(cfg: DictConfig):
         else:
             data_path = path_override(cfg.data.data_paths_override)
 
+        data_path = sort_data_paths(list(data_path))
         if main_process:
             print(f"Using data from {data_path}")
 
+        ddp_shard_enabled = bool(world_size > 1 and cfg.data.get("ddp_shard_enabled", False))
         dataset: Union[ImageDataset, StateDataset, RGBDDataset]
+        train_dataset = None
+        test_dataset = None
+        train_sampler = None
+        dataset_stats = None
+        train_steps_per_epoch = cfg.training.steps_per_epoch
 
-        if cfg.observation_type == "image":
-            dataset = ImageDataset(
-                dataset_paths=data_path,
-                pred_horizon=cfg.data.pred_horizon,
-                obs_horizon=cfg.data.obs_horizon,
-                action_horizon=cfg.data.action_horizon,
-                data_subset=cfg.data.data_subset,
-                control_mode=cfg.control.control_mode,
-                predict_past_actions=cfg.data.predict_past_actions,
-                pad_after=cfg.data.get("pad_after", True),
-                max_episode_count=cfg.data.get("max_episode_count", None),
-                minority_class_power=cfg.data.get("minority_class_power", False),
-                load_into_memory=cfg.data.get("load_into_memory", True),
+        if ddp_shard_enabled:
+            if cfg.data.get("ddp_split_unit") != "episode":
+                raise ValueError(
+                    "data.ddp_split_unit currently only supports 'episode' in bc_ddp.py."
+                )
+            if cfg.data.get("ddp_shard_balance") != "frames":
+                raise ValueError(
+                    "data.ddp_shard_balance currently only supports 'frames' in bc_ddp.py."
+                )
+            if cfg.data.get("ddp_validation_mode") != "rank0_full":
+                raise ValueError(
+                    "data.ddp_validation_mode currently only supports 'rank0_full' in bc_ddp.py."
+                )
+            if cfg.data.get("minority_class_power", False):
+                raise ValueError(
+                    "data.minority_class_power is not supported when data.ddp_shard_enabled=true."
+                )
+            if (
+                cfg.observation_type in {"image", "rgbd"}
+                and not cfg.data.get("load_into_memory", True)
+            ):
+                raise ValueError(
+                    "Image/RGBD DDP sharding currently requires data.load_into_memory=true."
+                )
+
+            manifest_payload = None
+            if main_process:
+                full_episode_refs = build_episode_manifest(
+                    data_path,
+                    max_episodes=cfg.data.data_subset,
+                    max_ep_cnt=cfg.data.get("max_episode_count", None),
+                )
+                train_episode_refs, val_episode_refs = split_episode_manifest(
+                    full_episode_refs,
+                    cfg.data.test_split,
+                    base_seed,
+                )
+                train_shards = balance_episode_manifest_by_frames(
+                    train_episode_refs, world_size
+                )
+                if any(len(shard) == 0 for shard in train_shards):
+                    raise ValueError(
+                        "DDP sharding produced an empty training shard. "
+                        "Reduce WORLD_SIZE or provide more training episodes."
+                    )
+
+                manifest_payload = {
+                    "full_episode_refs": full_episode_refs,
+                    "train_episode_refs": train_episode_refs,
+                    "val_episode_refs": val_episode_refs,
+                    "train_shards": train_shards,
+                    "metadata": summarize_manifest_metadata(data_path, full_episode_refs),
+                }
+
+            manifest_payload = broadcast_object(manifest_payload if main_process else None)
+            full_episode_refs = manifest_payload["full_episode_refs"]
+            train_episode_refs = manifest_payload["train_episode_refs"]
+            val_episode_refs = manifest_payload["val_episode_refs"]
+            train_shard_refs = manifest_payload["train_shards"][rank]
+            full_metadata = manifest_payload["metadata"]
+
+            local_stats_refs = full_episode_refs[rank::world_size]
+            global_stats = compute_global_minmax_stats(
+                data_path,
+                local_stats_refs,
+                get_normalizer_stats_key_map(cfg),
+                device=device,
             )
-        elif cfg.observation_type == "rgbd":
-            dataset = RGBDDataset(
-                dataset_paths=data_path,
-                pred_horizon=cfg.data.pred_horizon,
-                obs_horizon=cfg.data.obs_horizon,
-                action_horizon=cfg.data.action_horizon,
-                data_subset=cfg.data.data_subset,
-                control_mode=cfg.control.control_mode,
-                predict_past_actions=cfg.data.predict_past_actions,
-                pad_after=cfg.data.get("pad_after", True),
-                max_episode_count=cfg.data.get("max_episode_count", None),
-                minority_class_power=cfg.data.get("minority_class_power", False),
-                load_into_memory=cfg.data.get("load_into_memory", True),
+            shared_normalizer = build_normalizer_from_global_stats(cfg, global_stats)
+
+            train_dataset = build_dataset_for_observation_type(
+                cfg,
+                data_path,
+                episode_refs=train_shard_refs,
+                normalizer=shared_normalizer,
+                shard_spec=DatasetShardSpec(
+                    enabled=True,
+                    rank=rank,
+                    world_size=world_size,
+                    split="train",
+                    balance=cfg.data.get("ddp_shard_balance"),
+                    is_validation=False,
+                ),
             )
-        elif cfg.observation_type == "state":
-            dataset = StateDataset(
-                dataset_paths=data_path,
-                pred_horizon=cfg.data.pred_horizon,
-                obs_horizon=cfg.data.obs_horizon,
-                action_horizon=cfg.data.action_horizon,
-                data_subset=cfg.data.data_subset,
-                control_mode=cfg.control.control_mode,
-                predict_past_actions=cfg.data.predict_past_actions,
-                pad_after=cfg.data.get("pad_after", True),
-                max_episode_count=cfg.data.get("max_episode_count", None),
-                include_future_obs=cfg.data.include_future_obs,
+            dataset = train_dataset
+
+            if main_process:
+                test_dataset = build_dataset_for_observation_type(
+                    cfg,
+                    data_path,
+                    episode_refs=val_episode_refs,
+                    normalizer=shared_normalizer,
+                    shard_spec=DatasetShardSpec(
+                        enabled=True,
+                        rank=rank,
+                        world_size=world_size,
+                        split="validation",
+                        balance=cfg.data.get("ddp_shard_balance"),
+                        is_validation=True,
+                    ),
+                )
+
+            episode_count_tensor = torch.tensor(
+                [len(train_shard_refs), len(train_dataset)],
+                device=device,
+                dtype=torch.int64,
             )
+            dist.all_reduce(episode_count_tensor, op=dist.ReduceOp.SUM)
+            global_train_episode_count = int(episode_count_tensor[0].item())
+            global_train_sample_count = int(episode_count_tensor[1].item())
+
+            global_val_episode_count = broadcast_object(
+                len(val_episode_refs) if main_process else None
+            )
+            global_val_sample_count = broadcast_object(
+                len(test_dataset) if main_process else None
+            )
+
+            local_train_batches = int(
+                math.ceil(len(train_dataset) / per_rank_batch_size)
+            )
+            local_batch_tensor = torch.tensor(
+                local_train_batches, device=device, dtype=torch.int64
+            )
+            dist.all_reduce(local_batch_tensor, op=dist.ReduceOp.MIN)
+            min_train_batches = int(local_batch_tensor.item())
+            if min_train_batches <= 0:
+                raise ValueError(
+                    "At least one DDP shard has zero train batches. "
+                    "Reduce WORLD_SIZE or increase the dataset size."
+                )
+            if train_steps_per_epoch == -1:
+                train_steps_per_epoch = min_train_batches
+
+            if main_process:
+                print(
+                    f"Sharded training into {world_size} ranks: "
+                    f"{global_train_episode_count} train episodes, "
+                    f"{global_val_episode_count} val episodes."
+                )
+
+            train_sampler = EpochShuffleSampler(
+                train_dataset, shuffle=True, seed=base_seed
+            )
+            trainloader = build_dataloader(
+                dataset=train_dataset,
+                batch_size=per_rank_batch_size,
+                num_workers=cfg.data.dataloader_workers,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=cfg.data.get("persistent_workers", False),
+                prefetch_factor=cfg.data.get("prefetch_factor", None),
+                sampler=train_sampler,
+                steps_per_epoch=train_steps_per_epoch,
+            )
+
+            if main_process:
+                test_steps_per_epoch = (
+                    max(int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1)
+                    if cfg.training.steps_per_epoch != -1
+                    else -1
+                )
+                testloader = build_dataloader(
+                    dataset=test_dataset,
+                    batch_size=per_rank_batch_size,
+                    num_workers=cfg.data.dataloader_workers,
+                    shuffle=True,
+                    pin_memory=True,
+                    drop_last=False,
+                    persistent_workers=cfg.data.get("persistent_workers", False),
+                    prefetch_factor=cfg.data.get("prefetch_factor", None),
+                    steps_per_epoch=test_steps_per_epoch,
+                )
+            else:
+                testloader = None
+
+            dataset_stats = {
+                "num_samples_train": global_train_sample_count,
+                "num_samples_test": global_val_sample_count,
+                "num_episodes_train": global_train_episode_count,
+                "num_episodes_test": global_val_episode_count,
+                "dataset_metadata": full_metadata,
+                "world_size": world_size,
+                "global_batch_size": cfg.training.batch_size,
+                "per_rank_batch_size": per_rank_batch_size,
+            }
         else:
-            raise ValueError(f"Unknown observation type: {cfg.observation_type}")
+            dataset = build_dataset_for_observation_type(cfg, data_path)
 
-        train_size = int(len(dataset) * (1 - cfg.data.test_split))
-        test_size = len(dataset) - train_size
-        if main_process:
-            print(
-                f"Splitting dataset into {train_size} train and {test_size} test samples."
+            train_size = int(len(dataset) * (1 - cfg.data.test_split))
+            test_size = len(dataset) - train_size
+            if main_process:
+                print(
+                    f"Splitting dataset into {train_size} train and {test_size} test samples."
+                )
+            train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=False,
             )
-        train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+            trainloader = build_dataloader(
+                dataset=train_dataset,
+                batch_size=per_rank_batch_size,
+                num_workers=cfg.data.dataloader_workers,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=cfg.data.get("persistent_workers", False),
+                prefetch_factor=cfg.data.get("prefetch_factor", None),
+                sampler=train_sampler,
+                steps_per_epoch=cfg.training.steps_per_epoch,
+            )
+
+            testloader = None
+            if main_process:
+                test_steps_per_epoch = (
+                    max(int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1)
+                    if cfg.training.steps_per_epoch != -1
+                    else -1
+                )
+                testloader = build_dataloader(
+                    dataset=test_dataset,
+                    batch_size=per_rank_batch_size,
+                    num_workers=cfg.data.dataloader_workers,
+                    shuffle=True,
+                    pin_memory=True,
+                    drop_last=False,
+                    persistent_workers=cfg.data.get("persistent_workers", False),
+                    prefetch_factor=cfg.data.get("prefetch_factor", None),
+                    steps_per_epoch=test_steps_per_epoch,
+                )
+
+            dataset_stats = {
+                "num_samples_train": int(dataset.n_samples * (1 - cfg.data.test_split)),
+                "num_samples_test": dataset.n_samples
+                - int(dataset.n_samples * (1 - cfg.data.test_split)),
+                "num_episodes_train": int(
+                    len(dataset.episode_ends) * (1 - cfg.data.test_split)
+                ),
+                "num_episodes_test": int(
+                    len(dataset.episode_ends) * cfg.data.test_split
+                ),
+                "dataset_metadata": dataset.metadata,
+                "world_size": world_size,
+                "global_batch_size": cfg.training.batch_size,
+                "per_rank_batch_size": per_rank_batch_size,
+            }
 
         OmegaConf.set_struct(cfg, False)
         cfg.robot_state_dim = dataset.robot_state_dim
@@ -802,8 +1146,12 @@ def main(cfg: DictConfig):
 
         OmegaConf.set_struct(cfg, False)
         cfg.data_path = [str(f) for f in data_path]
-        cfg.n_episodes = len(dataset.episode_ends)
-        cfg.n_samples = dataset.n_samples
+        if ddp_shard_enabled:
+            cfg.n_episodes = dataset_stats["num_episodes_train"] + dataset_stats["num_episodes_test"]
+            cfg.n_samples = dataset_stats["num_samples_train"] + dataset_stats["num_samples_test"]
+        else:
+            cfg.n_episodes = len(dataset.episode_ends)
+            cfg.n_samples = dataset.n_samples
         cfg.timestep_obs_dim = actor.timestep_obs_dim
         OmegaConf.set_struct(cfg, True)
 
@@ -814,45 +1162,6 @@ def main(cfg: DictConfig):
             if main_process:
                 print(f"Loading checkpoint from {cfg.training.load_checkpoint_run_id}")
             actor.load_state_dict(load_state_dict_from_path(remote_checkpoint_path))
-
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=False,
-        )
-        trainloader = build_dataloader(
-            dataset=train_dataset,
-            batch_size=per_rank_batch_size,
-            num_workers=cfg.data.dataloader_workers,
-            shuffle=False,
-            pin_memory=True,
-            drop_last=False,
-            persistent_workers=cfg.data.get("persistent_workers", False),
-            prefetch_factor=cfg.data.get("prefetch_factor", None),
-            sampler=train_sampler,
-            steps_per_epoch=cfg.training.steps_per_epoch,
-        )
-
-        testloader = None
-        if main_process:
-            test_steps_per_epoch = (
-                max(int(round(cfg.training.steps_per_epoch * cfg.data.test_split)), 1)
-                if cfg.training.steps_per_epoch != -1
-                else -1
-            )
-            testloader = build_dataloader(
-                dataset=test_dataset,
-                batch_size=per_rank_batch_size,
-                num_workers=cfg.data.dataloader_workers,
-                shuffle=True,
-                pin_memory=True,
-                drop_last=False,
-                persistent_workers=cfg.data.get("persistent_workers", False),
-                prefetch_factor=cfg.data.get("prefetch_factor", None),
-                steps_per_epoch=test_steps_per_epoch,
-            )
 
         async_device_prefetch_enabled = bool(
             cfg.data.get("async_device_prefetch", False) and device.type == "cuda"
@@ -1009,21 +1318,6 @@ def main(cfg: DictConfig):
             print(f"Run storage location: {run.dir}")
             wandb.config.update(config_dict)
 
-            dataset_stats = {
-                "num_samples_train": int(dataset.n_samples * (1 - cfg.data.test_split)),
-                "num_samples_test": dataset.n_samples
-                - int(dataset.n_samples * (1 - cfg.data.test_split)),
-                "num_episodes_train": int(
-                    len(dataset.episode_ends) * (1 - cfg.data.test_split)
-                ),
-                "num_episodes_test": int(
-                    len(dataset.episode_ends) * cfg.data.test_split
-                ),
-                "dataset_metadata": dataset.metadata,
-                "world_size": world_size,
-                "global_batch_size": cfg.training.batch_size,
-                "per_rank_batch_size": per_rank_batch_size,
-            }
             wandb.summary.update(dataset_stats)
 
             starttime = now()

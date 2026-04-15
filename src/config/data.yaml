@@ -22,4 +22,8 @@ data:
   minority_class_power: false
   data_paths_override: null
   load_into_memory: true
+  ddp_shard_enabled: false
+  ddp_split_unit: episode
+  ddp_shard_balance: frames
+  ddp_validation_mode: rank0_full
   parts_poses_in_robot_frame: ${parts_poses_in_robot_frame}

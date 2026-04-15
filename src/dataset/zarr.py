@@ -1,12 +1,16 @@
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Dict, List, Tuple, Union
+from collections import defaultdict
 
 import numpy as np
+import torch
+import torch.distributed as dist
 import zarr
 from tqdm import tqdm
 from ipdb import set_trace as bp
 
 from src.common.files import get_processed_paths
+from src.dataset.base import EpisodeRef
 
 
 class ZarrSubsetView:
@@ -40,6 +44,243 @@ def dataset_tuple(path: Path) -> Tuple[str, str, str, str]:
     Extract the task, source, randomness, and outcome from a zarr path.
     """
     return path.with_name(path.stem).parts[-4:]
+
+
+def _resolve_max_episodes(path: Path, max_episodes=None, max_ep_cnt=None):
+    if max_ep_cnt is not None:
+        f, s, r, o = dataset_tuple(path)
+        return max_ep_cnt.get(f, {}).get(s, {}).get(r, {}).get(o, max_episodes)
+    return max_episodes
+
+
+def _coerce_scalar(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        return _coerce_scalar(value.tolist())
+    if isinstance(value, list):
+        if len(value) == 1:
+            return _coerce_scalar(value[0])
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _feature_min_max(array: np.ndarray):
+    if array.ndim == 1:
+        return np.min(array, axis=0), np.max(array, axis=0)
+    return np.min(array, axis=0), np.max(array, axis=0)
+
+
+def build_episode_manifest(
+    zarr_paths: Union[List[Path], Path],
+    max_episodes=None,
+    max_ep_cnt=None,
+) -> List[EpisodeRef]:
+    if not isinstance(zarr_paths, list):
+        zarr_paths = [zarr_paths]
+
+    manifest: List[EpisodeRef] = []
+    for path_idx, path in enumerate(zarr_paths):
+        dataset = zarr.open(path, mode="r")
+        max_ep = _resolve_max_episodes(
+            path, max_episodes=max_episodes, max_ep_cnt=max_ep_cnt
+        )
+        episode_ends = dataset["episode_ends"][:max_ep]
+        task = dataset.get("task", dataset.get("furniture"))
+        success = dataset["success"][:max_ep]
+        domain = str(dataset.attrs["domain"])
+
+        start_idx = 0
+        for episode_idx, end_idx in enumerate(episode_ends):
+            end_idx = int(end_idx)
+            manifest.append(
+                EpisodeRef(
+                    path_idx=path_idx,
+                    episode_idx=episode_idx,
+                    frame_start=start_idx,
+                    frame_end=end_idx,
+                    frame_count=end_idx - start_idx,
+                    task=str(_coerce_scalar(task[episode_idx])),
+                    success=int(_coerce_scalar(success[episode_idx])),
+                    domain=domain,
+                )
+            )
+            start_idx = end_idx
+
+    return manifest
+
+
+def split_episode_manifest(
+    manifest: List[EpisodeRef], test_split: float, seed: int
+) -> Tuple[List[EpisodeRef], List[EpisodeRef]]:
+    if not 0.0 <= test_split <= 1.0:
+        raise ValueError(f"test_split must be in [0, 1], got {test_split}.")
+
+    if len(manifest) == 0:
+        return [], []
+
+    rng = np.random.default_rng(int(seed))
+    indices = rng.permutation(len(manifest))
+    train_episode_count = int(len(manifest) * (1 - test_split))
+
+    train_indices = indices[:train_episode_count]
+    val_indices = indices[train_episode_count:]
+
+    train_manifest = [manifest[idx] for idx in train_indices]
+    val_manifest = [manifest[idx] for idx in val_indices]
+    return train_manifest, val_manifest
+
+
+def balance_episode_manifest_by_frames(
+    manifest: List[EpisodeRef], world_size: int
+) -> List[List[EpisodeRef]]:
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}.")
+
+    shards = [[] for _ in range(world_size)]
+    shard_loads = [0 for _ in range(world_size)]
+
+    ordered_manifest = sorted(
+        manifest,
+        key=lambda ref: (-ref.frame_count, ref.path_idx, ref.episode_idx),
+    )
+    for ref in ordered_manifest:
+        shard_idx = min(range(world_size), key=lambda idx: (shard_loads[idx], idx))
+        shards[shard_idx].append(ref)
+        shard_loads[shard_idx] += ref.frame_count
+
+    return shards
+
+
+def combine_zarr_episode_subset(
+    zarr_paths: Union[List[Path], Path], episode_refs: List[EpisodeRef], keys
+) -> Tuple[dict, dict]:
+    if not isinstance(zarr_paths, list):
+        zarr_paths = [zarr_paths]
+
+    opened = {}
+    metadata = {}
+    domain_idx = dict(sim=0, real=1)
+    total_frames = sum(ref.frame_count for ref in episode_refs)
+    total_episodes = len(episode_refs)
+
+    if zarr_paths:
+        first_dataset = zarr.open(zarr_paths[0], mode="r")
+    else:
+        raise ValueError("combine_zarr_episode_subset requires at least one zarr path.")
+
+    combined_data = {
+        "episode_ends": np.zeros(total_episodes, dtype=np.int64),
+        "task": [],
+        "success": np.zeros(total_episodes, dtype=np.uint8),
+        "domain": np.zeros(total_episodes, dtype=np.uint8),
+        "zarr_idx": np.zeros(total_frames, dtype=np.int64),
+        "within_zarr_idx": np.zeros(total_frames, dtype=np.int64),
+        "failure_idx": np.full(total_episodes, -1, dtype=np.int64),
+    }
+    for key in keys:
+        combined_data[key] = np.zeros(
+            (total_frames,) + first_dataset[key].shape[1:], dtype=first_dataset[key].dtype
+        )
+
+    per_path_episode_counts = defaultdict(int)
+    per_path_frame_counts = defaultdict(int)
+
+    frame_cursor = 0
+    for episode_cursor, ref in enumerate(episode_refs):
+        path = zarr_paths[ref.path_idx]
+        dataset = opened.get(ref.path_idx)
+        if dataset is None:
+            dataset = zarr.open(path, mode="r")
+            opened[ref.path_idx] = dataset
+
+        frame_start = ref.frame_start
+        frame_end = ref.frame_end
+        frame_count = ref.frame_count
+
+        for key in keys:
+            combined_data[key][frame_cursor : frame_cursor + frame_count] = dataset[key][
+                frame_start:frame_end
+            ]
+
+        combined_data["episode_ends"][episode_cursor] = frame_cursor + frame_count
+        combined_data["task"].append(ref.task)
+        combined_data["success"][episode_cursor] = ref.success
+        combined_data["domain"][episode_cursor] = domain_idx[ref.domain]
+        combined_data["zarr_idx"][frame_cursor : frame_cursor + frame_count] = ref.path_idx
+        combined_data["within_zarr_idx"][
+            frame_cursor : frame_cursor + frame_count
+        ] = np.arange(frame_start, frame_end)
+
+        failure_idx = dataset.get("failure_idx")
+        if failure_idx is not None and len(failure_idx) > ref.episode_idx:
+            combined_data["failure_idx"][episode_cursor] = failure_idx[ref.episode_idx]
+
+        metadata_key = str(dataset_tuple(path))
+        per_path_episode_counts[metadata_key] += 1
+        per_path_frame_counts[metadata_key] += frame_count
+        metadata[metadata_key] = {
+            "n_episodes_used": per_path_episode_counts[metadata_key],
+            "n_frames_used": per_path_frame_counts[metadata_key],
+            "attrs": dataset.attrs.asdict(),
+        }
+
+        frame_cursor += frame_count
+
+    return combined_data, metadata
+
+
+def compute_global_minmax_stats(
+    zarr_paths: Union[List[Path], Path],
+    episode_refs: List[EpisodeRef],
+    stats_key_map: Dict[str, str],
+    device: Union[torch.device, None] = None,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    if not isinstance(zarr_paths, list):
+        zarr_paths = [zarr_paths]
+
+    if len(zarr_paths) == 0:
+        raise ValueError("compute_global_minmax_stats requires at least one zarr path.")
+
+    opened = {}
+    first_dataset = zarr.open(zarr_paths[0], mode="r")
+    local_stats = {}
+    for stat_key, zarr_key in stats_key_map.items():
+        feature_shape = first_dataset[zarr_key].shape[1:]
+        local_stats[stat_key] = {
+            "min": np.full(feature_shape, np.inf, dtype=np.float64),
+            "max": np.full(feature_shape, -np.inf, dtype=np.float64),
+        }
+
+    for ref in episode_refs:
+        dataset = opened.get(ref.path_idx)
+        if dataset is None:
+            dataset = zarr.open(zarr_paths[ref.path_idx], mode="r")
+            opened[ref.path_idx] = dataset
+
+        for stat_key, zarr_key in stats_key_map.items():
+            array = dataset[zarr_key][ref.frame_start : ref.frame_end]
+            local_min, local_max = _feature_min_max(array)
+            local_stats[stat_key]["min"] = np.minimum(local_stats[stat_key]["min"], local_min)
+            local_stats[stat_key]["max"] = np.maximum(local_stats[stat_key]["max"], local_max)
+
+    reduced_stats: Dict[str, Dict[str, torch.Tensor]] = {}
+    for stat_key, key_stats in local_stats.items():
+        min_tensor = torch.as_tensor(key_stats["min"], dtype=torch.float64, device=device)
+        max_tensor = torch.as_tensor(key_stats["max"], dtype=torch.float64, device=device)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+
+        reduced_stats[stat_key] = {
+            "min": min_tensor.cpu().to(dtype=torch.float32),
+            "max": max_tensor.cpu().to(dtype=torch.float32),
+        }
+
+    return reduced_stats
 
 
 def combine_zarr_datasets(

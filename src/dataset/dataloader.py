@@ -3,6 +3,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from torch.utils.data import Sampler
 
 from src.common.pytorch_util import dict_apply, dict_to_device
 
@@ -83,6 +84,29 @@ class WeightedDataLoader:
 
     def __len__(self):
         return sum([len(dataloader) for dataloader in self.dataloaders])
+
+
+class EpochShuffleSampler(Sampler[int]):
+    def __init__(self, data_source, shuffle: bool = True, seed: int = 0):
+        self.data_source = data_source
+        self.shuffle = shuffle
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        if not self.shuffle:
+            return iter(range(len(self.data_source)))
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(len(self.data_source), generator=generator).tolist()
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.data_source)
 
 
 def build_dataloader(

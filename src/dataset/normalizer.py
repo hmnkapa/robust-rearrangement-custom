@@ -1,4 +1,5 @@
 from typing import Dict, Union
+import torch
 import torch.nn as nn
 import numpy as np
 
@@ -76,6 +77,32 @@ class LinearNormalizer(nn.Module):
         self._turn_off_gradients()
 
         return f"<Added keys {self.stats.keys()} to the normalizer.>"
+
+    def load_stats(self, stats_dict):
+        stats = nn.ParameterDict()
+        for key, key_stats in stats_dict.items():
+            stats[key] = nn.ParameterDict(
+                {
+                    "min": nn.Parameter(
+                        torch.as_tensor(key_stats["min"], dtype=torch.float32),
+                        requires_grad=False,
+                    ),
+                    "max": nn.Parameter(
+                        torch.as_tensor(key_stats["max"], dtype=torch.float32),
+                        requires_grad=False,
+                    ),
+                }
+            )
+
+        self.stats = stats
+        self._turn_off_gradients()
+        return f"<Loaded stats for keys {list(self.stats.keys())}.>"
+
+    @classmethod
+    def from_stats(cls, stats_dict):
+        normalizer = cls()
+        normalizer.load_stats(stats_dict)
+        return normalizer
 
     def keys(self):
         return self.stats.keys()
