@@ -169,6 +169,60 @@ def _scatter_block_segment(output_array, items, segment_start, segment_end, segm
         output_array[dest_start:dest_end] = segment_array[source_start:source_end]
 
 
+def _group_output_items_by_path(output_items: List[dict]) -> Dict[int, List[dict]]:
+    grouped_items = defaultdict(list)
+    for item in output_items:
+        grouped_items[item["ref"].path_idx].append(item)
+
+    for path_idx in grouped_items:
+        grouped_items[path_idx].sort(
+            key=lambda item: (item["ref"].frame_start, item["ref"].episode_idx)
+        )
+    return grouped_items
+
+
+def _dataset_chunk_frames(dataset, key: str, fallback_frames: int = 1000) -> int:
+    chunks = getattr(dataset[key], "chunks", None)
+    if chunks is None or len(chunks) == 0 or chunks[0] is None:
+        return int(fallback_frames)
+    return int(chunks[0])
+
+
+def _copy_chunk_intersections(
+    output_array,
+    path_items: List[dict],
+    chunk_start: int,
+    chunk_end: int,
+    chunk_array,
+    item_idx: int,
+) -> int:
+    while item_idx < len(path_items) and path_items[item_idx]["ref"].frame_end <= chunk_start:
+        item_idx += 1
+
+    scan_idx = item_idx
+    while scan_idx < len(path_items):
+        item = path_items[scan_idx]
+        ref = item["ref"]
+        if ref.frame_start >= chunk_end:
+            break
+
+        overlap_start = max(chunk_start, ref.frame_start)
+        overlap_end = min(chunk_end, ref.frame_end)
+        if overlap_start < overlap_end:
+            source_start = overlap_start - chunk_start
+            source_end = overlap_end - chunk_start
+            dest_start = item["output_start"] + (overlap_start - ref.frame_start)
+            dest_end = dest_start + (overlap_end - overlap_start)
+            output_array[dest_start:dest_end] = chunk_array[source_start:source_end]
+
+        scan_idx += 1
+
+    while item_idx < len(path_items) and path_items[item_idx]["ref"].frame_end <= chunk_end:
+        item_idx += 1
+
+    return item_idx
+
+
 def _balance_blocks_by_frames(blocks: List[dict], world_size: int) -> List[List[dict]]:
     if world_size <= 1:
         return [blocks]
@@ -388,7 +442,6 @@ def combine_zarr_episode_subset(
 
     frame_cursor = 0
     output_items = []
-    image_chunk_size = min(int(first_dataset.attrs.asdict().get("chunksize", 256)), 256)
 
     for episode_cursor, ref in enumerate(episode_refs):
         path = zarr_paths[ref.path_idx]
@@ -434,14 +487,25 @@ def combine_zarr_episode_subset(
         frame_cursor += frame_count
 
     read_blocks = _build_read_blocks(output_items)
-    total_block_frames = sum(_block_frame_count(block) for block in read_blocks)
-    total_bytes = _estimate_transfer_bytes(first_dataset, keys, total_block_frames)
-    key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in keys}
+    items_by_path = _group_output_items_by_path(output_items)
     load_desc = progress_desc or "Loading shard"
+    total_selected_frames = total_frames
+    total_scan_frames = sum(
+        path_items[-1]["ref"].frame_end
+        for path_items in items_by_path.values()
+        if path_items
+    )
+    total_scan_bytes = 0
+    for key in keys:
+        total_scan_bytes += sum(
+            path_items[-1]["ref"].frame_end * _key_bytes_per_frame(opened[path_idx], key)
+            for path_idx, path_items in items_by_path.items()
+            if path_items
+        )
     _debug_log(
         f"{load_desc}: {len(episode_refs)} episodes, {len(keys)} datasets, "
-        f"{len(read_blocks)} read blocks, {total_block_frames} frames, "
-        f"est_read={_format_gib(total_bytes)}",
+        f"{len(read_blocks)} selected blocks, selected_frames={total_selected_frames}, "
+        f"scan_frames={total_scan_frames}, est_read={_format_gib(total_scan_bytes)}",
         enabled=not progress_disable,
     )
 
@@ -455,49 +519,54 @@ def combine_zarr_episode_subset(
     )
     per_key_position = progress_position + 1
     for key in keys:
-        key_total_bytes = total_block_frames * key_bytes[key]
+        key_total_scan_frames = sum(
+            path_items[-1]["ref"].frame_end
+            for path_items in items_by_path.values()
+            if path_items
+        )
+        key_total_bytes = sum(
+            path_items[-1]["ref"].frame_end * _key_bytes_per_frame(opened[path_idx], key)
+            for path_idx, path_items in items_by_path.items()
+            if path_items
+        )
         key_desc = f"{load_desc}: {key}"
         if key_total_bytes > 0:
             key_desc = f"{key_desc} ({_format_gib(key_total_bytes)})"
 
         key_iterator = tqdm(
             desc=key_desc,
-            total=total_block_frames,
+            total=key_total_scan_frames,
             position=per_key_position,
             leave=False,
             disable=progress_disable,
             unit="frame",
         )
 
-        for block in read_blocks:
-            dataset = opened[block["path_idx"]]
-            block_start = block["frame_start"]
-            block_end = block["frame_end"]
-            block_frames = block_end - block_start
-
-            if "image" in key:
-                for segment_start in range(block_start, block_end, image_chunk_size):
-                    segment_end = min(segment_start + image_chunk_size, block_end)
-                    segment_array = dataset[key][segment_start:segment_end]
-                    _scatter_block_segment(
-                        combined_data[key],
-                        block["items"],
-                        segment_start,
-                        segment_end,
-                        segment_array,
-                    )
-                    key_iterator.update(segment_end - segment_start)
+        for path_idx, path_items in items_by_path.items():
+            if not path_items:
                 continue
 
-            segment_array = dataset[key][block_start:block_end]
-            _scatter_block_segment(
-                combined_data[key],
-                block["items"],
-                block_start,
-                block_end,
-                segment_array,
+            dataset = opened[path_idx]
+            chunk_frames = _dataset_chunk_frames(
+                dataset,
+                key,
+                fallback_frames=int(dataset.attrs.asdict().get("chunksize", 1000)),
             )
-            key_iterator.update(block_frames)
+            scan_end = path_items[-1]["ref"].frame_end
+            item_idx = 0
+
+            for chunk_start in range(0, scan_end, chunk_frames):
+                chunk_end = min(chunk_start + chunk_frames, scan_end)
+                chunk_array = dataset[key][chunk_start:chunk_end]
+                item_idx = _copy_chunk_intersections(
+                    combined_data[key],
+                    path_items,
+                    chunk_start,
+                    chunk_end,
+                    chunk_array,
+                    item_idx,
+                )
+                key_iterator.update(chunk_end - chunk_start)
 
         key_iterator.close()
         dataset_iterator.update(1)
