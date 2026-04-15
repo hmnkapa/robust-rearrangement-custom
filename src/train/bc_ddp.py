@@ -5,7 +5,7 @@ import shutil
 import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Optional, Tuple, Union
@@ -86,10 +86,45 @@ trigger_sync = TriggerWandbSyncHook(
     communication_dir=os.environ.get("WANDB_OSH_COMM_DIR", _comm_default_dir),
 )
 
+DEFAULT_DDP_TIMEOUT_SECONDS = 60 * 60
+SLOW_PHASE_WARNING_SECONDS = 60.0
+
 
 print("=== Activate TF32 training? Deactivated for now...")
 # torch.backends.cuda.matmul.allow_tf32 = True
 # torch.backends.cudnn.allow_tf32 = True
+
+
+def get_ddp_timeout() -> timedelta:
+    timeout_seconds_raw = os.environ.get("TORCH_DDP_TIMEOUT_SECONDS")
+    timeout_seconds = DEFAULT_DDP_TIMEOUT_SECONDS
+
+    if timeout_seconds_raw is not None:
+        try:
+            timeout_seconds = int(timeout_seconds_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "TORCH_DDP_TIMEOUT_SECONDS must be a positive integer, got "
+                f"{timeout_seconds_raw!r}."
+            ) from exc
+
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "TORCH_DDP_TIMEOUT_SECONDS must be a positive integer, got "
+            f"{timeout_seconds}."
+        )
+
+    return timedelta(seconds=timeout_seconds)
+
+
+def log_slow_phase(rank: int, epoch_idx: int, phase_name: str, duration_seconds: float):
+    if duration_seconds < SLOW_PHASE_WARNING_SECONDS:
+        return
+
+    print(
+        f"[Rank {rank}] Slow phase at epoch {epoch_idx}: "
+        f"{phase_name} took {duration_seconds:.1f}s"
+    )
 
 
 def ddp_setup():
@@ -104,9 +139,17 @@ def ddp_setup():
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    ddp_timeout = get_ddp_timeout()
 
-    init_process_group(backend="nccl")
+    init_process_group(backend="nccl", timeout=ddp_timeout)
     torch.cuda.set_device(local_rank)
+
+    if rank == 0:
+        print(
+            "Initialized NCCL process group with timeout "
+            f"{int(ddp_timeout.total_seconds())}s. "
+            "Override with TORCH_DDP_TIMEOUT_SECONDS."
+        )
 
     return rank, local_rank, world_size
 
@@ -1085,6 +1128,8 @@ def main(cfg: DictConfig):
             for name, opt in optimizers:
                 epoch_log[f"{name}_lr"] = opt.param_groups[0]["lr"]
 
+            main_process_post_train_start_perf = perf_counter() if main_process else None
+
             if (
                 main_process
                 and cfg.training.eval_every > 0
@@ -1097,6 +1142,7 @@ def main(cfg: DictConfig):
 
                 eval_losses_log = defaultdict(list)
                 test_loss = []
+                validation_start_perf = perf_counter()
 
                 test_tepoch = tqdm(testloader, desc="Validation", leave=False)
                 for test_batch in test_tepoch:
@@ -1112,6 +1158,9 @@ def main(cfg: DictConfig):
                             eval_losses_log[key].append(value)
 
                 test_tepoch.close()
+                validation_duration = perf_counter() - validation_start_perf
+                epoch_log["timing/validation_seconds"] = validation_duration
+                log_slow_phase(rank, epoch_idx, "validation", validation_duration)
 
                 epoch_log["test_epoch_loss"] = test_loss_mean = np.mean(test_loss)
                 for key, value in eval_losses_log.items():
@@ -1137,6 +1186,7 @@ def main(cfg: DictConfig):
                             verbose=True,
                         )
 
+                    rollout_start_perf = perf_counter()
                     best_success_rate = do_rollout_evaluation(
                         config=cfg,
                         env=env,
@@ -1146,11 +1196,17 @@ def main(cfg: DictConfig):
                         best_success_rate=best_success_rate,
                         epoch_idx=epoch_idx,
                     )
+                    rollout_duration = perf_counter() - rollout_start_perf
+                    epoch_log["timing/rollout_eval_seconds"] = rollout_duration
+                    log_slow_phase(
+                        rank, epoch_idx, "rollout_evaluation", rollout_duration
+                    )
 
                 if (
                     cfg.training.sample_every > 0
                     and (epoch_idx + 1) % cfg.training.sample_every == 0
                 ):
+                    sampling_start_perf = perf_counter()
                     with torch.no_grad():
                         train_sampling_batch = prepare_batch(next(iter(trainloader)))
                         pred_action = actor.module.action_pred(train_sampling_batch)
@@ -1165,26 +1221,50 @@ def main(cfg: DictConfig):
                         )
                         pred_action = actor.module.action_pred(val_sampling_batch)
                         log_action_mse(epoch_log, "val", pred_action, gt_action)
+                    sampling_duration = perf_counter() - sampling_start_perf
+                    epoch_log["timing/action_sampling_seconds"] = sampling_duration
+                    log_slow_phase(rank, epoch_idx, "action_sampling", sampling_duration)
 
                 if (
                     cfg.training.store_best_test_loss_model
                     and test_loss_mean < best_test_loss
                 ):
                     best_test_loss = test_loss_mean
+                    checkpoint_start_perf = perf_counter()
                     save_checkpoint(model_save_dir / "actor_chkpt_best_test_loss.pt")
+                    log_slow_phase(
+                        rank,
+                        epoch_idx,
+                        "save_best_test_loss_checkpoint",
+                        perf_counter() - checkpoint_start_perf,
+                    )
 
                 if (
                     cfg.training.store_best_success_rate_model
                     and best_success_rate > prev_best_success_rate
                 ):
                     prev_best_success_rate = best_success_rate
+                    checkpoint_start_perf = perf_counter()
                     save_checkpoint(model_save_dir / "actor_chkpt_best_success_rate.pt")
+                    log_slow_phase(
+                        rank,
+                        epoch_idx,
+                        "save_best_success_rate_checkpoint",
+                        perf_counter() - checkpoint_start_perf,
+                    )
 
                 if (
                     cfg.training.checkpoint_interval > 0
                     and (epoch_idx + 1) % cfg.training.checkpoint_interval == 0
                 ):
+                    checkpoint_start_perf = perf_counter()
                     save_checkpoint(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
+                    log_slow_phase(
+                        rank,
+                        epoch_idx,
+                        "save_interval_checkpoint",
+                        perf_counter() - checkpoint_start_perf,
+                    )
 
                 if ema is not None:
                     ema.restore()
@@ -1195,27 +1275,65 @@ def main(cfg: DictConfig):
                 epoch_log["early_stopper/ema_loss"] = early_stopper.ema_loss
 
             if main_process and cfg.training.store_last_model:
+                checkpoint_start_perf = perf_counter()
                 save_checkpoint(model_save_dir / "actor_chkpt_last.pt")
+                log_slow_phase(
+                    rank,
+                    epoch_idx,
+                    "save_last_checkpoint",
+                    perf_counter() - checkpoint_start_perf,
+                )
 
             if (
                 main_process
                 and checkpoint_archive_interval > 0
                 and (epoch_idx + 1) % checkpoint_archive_interval == 0
             ):
+                checkpoint_start_perf = perf_counter()
                 save_checkpoint(model_save_dir / f"actor_chkpt_latest_{epoch_idx + 1}.pt")
+                log_slow_phase(
+                    rank,
+                    epoch_idx,
+                    "save_archived_latest_checkpoint",
+                    perf_counter() - checkpoint_start_perf,
+                )
 
                 best_test_loss_checkpoint = model_save_dir / "actor_chkpt_best_test_loss.pt"
                 if best_test_loss_checkpoint.exists():
+                    archive_copy_start_perf = perf_counter()
                     shutil.copy2(
                         best_test_loss_checkpoint,
                         model_save_dir / f"actor_chkpt_best_test_loss_{epoch_idx + 1}.pt",
+                    )
+                    log_slow_phase(
+                        rank,
+                        epoch_idx,
+                        "copy_best_test_loss_checkpoint",
+                        perf_counter() - archive_copy_start_perf,
                     )
 
             if ema is not None and cfg.training.ema.switch:
                 ema.copy_to_model()
 
+            if main_process and main_process_post_train_start_perf is not None:
+                post_train_duration = perf_counter() - main_process_post_train_start_perf
+                epoch_log["timing/main_process_post_train_seconds"] = post_train_duration
+                log_slow_phase(
+                    rank,
+                    epoch_idx,
+                    "main_process_post_train",
+                    post_train_duration,
+                )
+
             if main_process:
+                wandb_log_start_perf = perf_counter()
                 wandb.log(epoch_log, step=global_step)
+                log_slow_phase(
+                    rank,
+                    epoch_idx,
+                    "wandb_log",
+                    perf_counter() - wandb_log_start_perf,
+                )
                 epoch_iter.set_postfix(
                     time=now(),
                     loss=epoch_log["epoch_loss"],
@@ -1228,9 +1346,23 @@ def main(cfg: DictConfig):
                     cfg.wandb.mode == "offline"
                     and (epoch_idx % cfg.wandb.get("osh_sync_interval", 1)) == 0
                 ):
+                    sync_start_perf = perf_counter()
                     trigger_sync()
+                    log_slow_phase(
+                        rank,
+                        epoch_idx,
+                        "wandb_offline_sync",
+                        perf_counter() - sync_start_perf,
+                    )
 
+            barrier_start_perf = perf_counter()
             dist.barrier()
+            log_slow_phase(
+                rank,
+                epoch_idx,
+                "epoch_barrier_wait",
+                perf_counter() - barrier_start_perf,
+            )
             early_stop_tensor = torch.tensor(
                 [1 if early_stop else 0], device=device, dtype=torch.int32
             )
