@@ -213,6 +213,15 @@ def _estimate_transfer_bytes(dataset, keys, total_frames: int) -> int:
     return int(bytes_per_frame * total_frames)
 
 
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / float(1024**3):.2f} GiB"
+
+
+def _debug_log(message: str, *, enabled: bool = True):
+    if enabled:
+        print(message, flush=True)
+
+
 def _can_use_precomputed_stats(dataset, episode_refs: List[EpisodeRef], stats_key_map):
     if len(episode_refs) == 0:
         return {}
@@ -408,6 +417,12 @@ def combine_zarr_episode_subset(
     total_bytes = _estimate_transfer_bytes(first_dataset, keys, total_block_frames)
     key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in keys}
     load_desc = progress_desc or "Loading shard"
+    _debug_log(
+        f"{load_desc}: {len(episode_refs)} episodes, "
+        f"{len(read_blocks)} read blocks, {total_block_frames} frames, "
+        f"est_read={_format_gib(total_bytes)}",
+        enabled=not progress_disable,
+    )
 
     block_iterator = tqdm(
         desc=load_desc,
@@ -472,16 +487,25 @@ def compute_global_minmax_stats(
     local_stats = _init_feature_stats(first_dataset, stats_key_map)
     opened = {}
     refs_by_path = defaultdict(list)
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
     for ref in episode_refs:
         refs_by_path[ref.path_idx].append(ref)
 
     scan_items = []
+    precomputed_paths = []
+    fallback_paths = []
     for path_idx, path_refs in refs_by_path.items():
         dataset = zarr.open(zarr_paths[path_idx], mode="r")
         opened[path_idx] = dataset
 
         precomputed_stats = _can_use_precomputed_stats(dataset, path_refs, stats_key_map)
         if precomputed_stats is not None:
+            precomputed_paths.append(str(zarr_paths[path_idx]))
             for stat_key, zarr_key in stats_key_map.items():
                 stored_key_stats = precomputed_stats[zarr_key]
                 _update_feature_stats(
@@ -492,17 +516,12 @@ def compute_global_minmax_stats(
                 )
             continue
 
+        fallback_paths.append(str(zarr_paths[path_idx]))
         for ref in path_refs:
             scan_items.append({"ref": ref})
 
     if scan_items:
         scan_blocks = _build_read_blocks(scan_items)
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        else:
-            rank = 0
-            world_size = 1
         local_blocks = _balance_blocks_by_frames(scan_blocks, world_size)[rank]
 
         total_block_frames = sum(_block_frame_count(block) for block in local_blocks)
@@ -514,6 +533,19 @@ def compute_global_minmax_stats(
         )
         key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in stats_keys}
         minmax_desc = progress_desc or "Computing min/max"
+        _debug_log(
+            f"{minmax_desc}: fallback scan on rank {rank}, "
+            f"precomputed_paths={len(precomputed_paths)}, "
+            f"fallback_paths={len(fallback_paths)}, "
+            f"local_blocks={len(local_blocks)}, local_frames={total_block_frames}, "
+            f"est_read={_format_gib(total_bytes)}",
+            enabled=not progress_disable,
+        )
+        if fallback_paths:
+            _debug_log(
+                f"{minmax_desc}: fallback paths={fallback_paths}",
+                enabled=not progress_disable,
+            )
 
         block_iterator = tqdm(
             desc=minmax_desc,
@@ -536,7 +568,11 @@ def compute_global_minmax_stats(
                 block_iterator.update((block_end - block_start) * key_bytes[zarr_key])
         block_iterator.close()
     elif progress_desc and not progress_disable:
-        print(f"{progress_desc}: using precomputed zarr normalizer stats")
+        _debug_log(
+            f"{progress_desc}: using precomputed zarr normalizer stats "
+            f"for {len(precomputed_paths)} path(s)",
+            enabled=True,
+        )
 
     reduced_stats: Dict[str, Dict[str, torch.Tensor]] = {}
     for stat_key, key_stats in local_stats.items():
