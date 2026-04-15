@@ -92,7 +92,7 @@ class BaseSequenceDataset(torch.utils.data.Dataset):
                 progress_desc = (
                     f"[Rank {self.shard_spec.rank}] Load {self.shard_spec.split} shard"
                 )
-                progress_position = self.shard_spec.rank
+                progress_position = self.shard_spec.rank * 2
 
             return subset_loader(
                 self.dataset_paths,

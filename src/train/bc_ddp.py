@@ -948,7 +948,7 @@ def main(cfg: DictConfig):
                 get_normalizer_stats_key_map(cfg),
                 device=device,
                 progress_desc=f"[Rank {rank}] Min/max",
-                progress_position=rank,
+                progress_position=rank * 2,
             )
             stats_duration = perf_counter() - stats_start_perf
             shared_normalizer = build_normalizer_from_global_stats(cfg, global_stats)

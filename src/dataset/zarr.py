@@ -194,6 +194,27 @@ def _balance_blocks_by_frames(blocks: List[dict], world_size: int) -> List[List[
     return shards
 
 
+def _split_blocks_by_frame_window(blocks: List[dict], window_frames: int) -> List[dict]:
+    if window_frames <= 0:
+        raise ValueError(f"window_frames must be positive, got {window_frames}.")
+
+    split_blocks = []
+    for block in blocks:
+        block_start = block["frame_start"]
+        block_end = block["frame_end"]
+        for window_start in range(block_start, block_end, window_frames):
+            window_end = min(window_start + window_frames, block_end)
+            split_blocks.append(
+                {
+                    "path_idx": block["path_idx"],
+                    "frame_start": window_start,
+                    "frame_end": window_end,
+                    "items": [],
+                }
+            )
+    return split_blocks
+
+
 def _block_frame_count(block: dict) -> int:
     return int(block["frame_end"] - block["frame_start"])
 
@@ -219,7 +240,7 @@ def _format_gib(num_bytes: int) -> str:
 
 def _debug_log(message: str, *, enabled: bool = True):
     if enabled:
-        print(message, flush=True)
+        tqdm.write(message)
 
 
 def _can_use_precomputed_stats(dataset, episode_refs: List[EpisodeRef], stats_key_map):
@@ -418,28 +439,42 @@ def combine_zarr_episode_subset(
     key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in keys}
     load_desc = progress_desc or "Loading shard"
     _debug_log(
-        f"{load_desc}: {len(episode_refs)} episodes, "
+        f"{load_desc}: {len(episode_refs)} episodes, {len(keys)} datasets, "
         f"{len(read_blocks)} read blocks, {total_block_frames} frames, "
         f"est_read={_format_gib(total_bytes)}",
         enabled=not progress_disable,
     )
 
-    block_iterator = tqdm(
-        desc=load_desc,
-        total=total_bytes,
+    dataset_iterator = tqdm(
+        desc=f"{load_desc}: datasets",
+        total=len(keys),
         position=progress_position,
         leave=False,
         disable=progress_disable,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
+        unit="dataset",
     )
-    for block in read_blocks:
-        dataset = opened[block["path_idx"]]
-        block_start = block["frame_start"]
-        block_end = block["frame_end"]
+    per_key_position = progress_position + 1
+    for key in keys:
+        key_total_bytes = total_block_frames * key_bytes[key]
+        key_desc = f"{load_desc}: {key}"
+        if key_total_bytes > 0:
+            key_desc = f"{key_desc} ({_format_gib(key_total_bytes)})"
 
-        for key in keys:
+        key_iterator = tqdm(
+            desc=key_desc,
+            total=total_block_frames,
+            position=per_key_position,
+            leave=False,
+            disable=progress_disable,
+            unit="frame",
+        )
+
+        for block in read_blocks:
+            dataset = opened[block["path_idx"]]
+            block_start = block["frame_start"]
+            block_end = block["frame_end"]
+            block_frames = block_end - block_start
+
             if "image" in key:
                 for segment_start in range(block_start, block_end, image_chunk_size):
                     segment_end = min(segment_start + image_chunk_size, block_end)
@@ -451,7 +486,7 @@ def combine_zarr_episode_subset(
                         segment_end,
                         segment_array,
                     )
-                    block_iterator.update((segment_end - segment_start) * key_bytes[key])
+                    key_iterator.update(segment_end - segment_start)
                 continue
 
             segment_array = dataset[key][block_start:block_end]
@@ -462,8 +497,11 @@ def combine_zarr_episode_subset(
                 block_end,
                 segment_array,
             )
-            block_iterator.update((block_end - block_start) * key_bytes[key])
-    block_iterator.close()
+            key_iterator.update(block_frames)
+
+        key_iterator.close()
+        dataset_iterator.update(1)
+    dataset_iterator.close()
 
     return combined_data, metadata
 
@@ -522,7 +560,9 @@ def compute_global_minmax_stats(
 
     if scan_items:
         scan_blocks = _build_read_blocks(scan_items)
-        local_blocks = _balance_blocks_by_frames(scan_blocks, world_size)[rank]
+        scan_window_frames = int(first_dataset.attrs.asdict().get("chunksize", 1000))
+        scan_windows = _split_blocks_by_frame_window(scan_blocks, scan_window_frames)
+        local_blocks = _balance_blocks_by_frames(scan_windows, world_size)[rank]
 
         total_block_frames = sum(_block_frame_count(block) for block in local_blocks)
         stats_keys = list(dict.fromkeys(stats_key_map.values()))
@@ -537,6 +577,8 @@ def compute_global_minmax_stats(
             f"{minmax_desc}: fallback scan on rank {rank}, "
             f"precomputed_paths={len(precomputed_paths)}, "
             f"fallback_paths={len(fallback_paths)}, "
+            f"datasets={len(stats_keys)}, "
+            f"scan_blocks={len(scan_blocks)}, scan_windows={len(scan_windows)}, "
             f"local_blocks={len(local_blocks)}, local_frames={total_block_frames}, "
             f"est_read={_format_gib(total_bytes)}",
             enabled=not progress_disable,
@@ -547,26 +589,56 @@ def compute_global_minmax_stats(
                 enabled=not progress_disable,
             )
 
-        block_iterator = tqdm(
-            desc=minmax_desc,
-            total=total_bytes,
+        dataset_iterator = tqdm(
+            desc=f"{minmax_desc}: datasets",
+            total=len(stats_keys),
             position=progress_position,
             leave=False,
             disable=progress_disable,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
+            unit="dataset",
         )
-        for block in local_blocks:
-            dataset = opened[block["path_idx"]]
-            block_start = block["frame_start"]
-            block_end = block["frame_end"]
-            for stat_key, zarr_key in stats_key_map.items():
+        per_key_position = progress_position + 1
+        per_key_minmax = {}
+        for zarr_key in stats_keys:
+            key_desc = f"{minmax_desc}: {zarr_key}"
+            key_total_bytes = total_block_frames * key_bytes[zarr_key]
+            if key_total_bytes > 0:
+                key_desc = f"{key_desc} ({_format_gib(key_total_bytes)})"
+
+            key_iterator = tqdm(
+                desc=key_desc,
+                total=total_block_frames,
+                position=per_key_position,
+                leave=False,
+                disable=progress_disable,
+                unit="frame",
+            )
+
+            feature_shape = first_dataset[zarr_key].shape[1:]
+            key_min = np.full(feature_shape, np.inf, dtype=np.float64)
+            key_max = np.full(feature_shape, -np.inf, dtype=np.float64)
+            for block in local_blocks:
+                dataset = opened[block["path_idx"]]
+                block_start = block["frame_start"]
+                block_end = block["frame_end"]
                 array = dataset[zarr_key][block_start:block_end]
                 local_min, local_max = _feature_min_max(array)
-                _update_feature_stats(local_stats, stat_key, local_min, local_max)
-                block_iterator.update((block_end - block_start) * key_bytes[zarr_key])
-        block_iterator.close()
+                key_min = np.minimum(key_min, local_min)
+                key_max = np.maximum(key_max, local_max)
+                key_iterator.update(block_end - block_start)
+
+            key_iterator.close()
+            dataset_iterator.update(1)
+            per_key_minmax[zarr_key] = {"min": key_min, "max": key_max}
+
+        dataset_iterator.close()
+        for stat_key, zarr_key in stats_key_map.items():
+            _update_feature_stats(
+                local_stats,
+                stat_key,
+                per_key_minmax[zarr_key]["min"],
+                per_key_minmax[zarr_key]["max"],
+            )
     elif progress_desc and not progress_disable:
         _debug_log(
             f"{progress_desc}: using precomputed zarr normalizer stats "
