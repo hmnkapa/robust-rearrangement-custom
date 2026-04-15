@@ -198,18 +198,19 @@ def _block_frame_count(block: dict) -> int:
     return int(block["frame_end"] - block["frame_start"])
 
 
-def _estimate_transfer_gib(dataset, keys, total_frames: int) -> float:
+def _key_bytes_per_frame(dataset, key: str) -> int:
+    array = dataset[key]
+    trailing_shape = array.shape[1:]
+    bytes_per_element = np.dtype(array.dtype).itemsize
+    return int(np.prod(trailing_shape, dtype=np.int64)) * bytes_per_element
+
+
+def _estimate_transfer_bytes(dataset, keys, total_frames: int) -> int:
     if total_frames <= 0:
-        return 0.0
+        return 0
 
-    bytes_per_frame = 0
-    for key in keys:
-        array = dataset[key]
-        trailing_shape = array.shape[1:]
-        bytes_per_element = np.dtype(array.dtype).itemsize
-        bytes_per_frame += int(np.prod(trailing_shape, dtype=np.int64)) * bytes_per_element
-
-    return (bytes_per_frame * total_frames) / float(1024**3)
+    bytes_per_frame = sum(_key_bytes_per_frame(dataset, key) for key in keys)
+    return int(bytes_per_frame * total_frames)
 
 
 def _can_use_precomputed_stats(dataset, episode_refs: List[EpisodeRef], stats_key_map):
@@ -404,24 +405,24 @@ def combine_zarr_episode_subset(
 
     read_blocks = _build_read_blocks(output_items)
     total_block_frames = sum(_block_frame_count(block) for block in read_blocks)
-    estimated_gib = _estimate_transfer_gib(first_dataset, keys, total_block_frames)
+    total_bytes = _estimate_transfer_bytes(first_dataset, keys, total_block_frames)
+    key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in keys}
     load_desc = progress_desc or "Loading shard"
-    if estimated_gib > 0:
-        load_desc = f"{load_desc} ({estimated_gib:.2f} GiB)"
 
     block_iterator = tqdm(
         desc=load_desc,
-        total=total_block_frames,
+        total=total_bytes,
         position=progress_position,
         leave=False,
         disable=progress_disable,
-        unit="frame",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
     )
     for block in read_blocks:
         dataset = opened[block["path_idx"]]
         block_start = block["frame_start"]
         block_end = block["frame_end"]
-        block_frames = _block_frame_count(block)
 
         for key in keys:
             if "image" in key:
@@ -435,6 +436,7 @@ def combine_zarr_episode_subset(
                         segment_end,
                         segment_array,
                     )
+                    block_iterator.update((segment_end - segment_start) * key_bytes[key])
                 continue
 
             segment_array = dataset[key][block_start:block_end]
@@ -445,7 +447,7 @@ def combine_zarr_episode_subset(
                 block_end,
                 segment_array,
             )
-        block_iterator.update(block_frames)
+            block_iterator.update((block_end - block_start) * key_bytes[key])
     block_iterator.close()
 
     return combined_data, metadata
@@ -504,34 +506,37 @@ def compute_global_minmax_stats(
         local_blocks = _balance_blocks_by_frames(scan_blocks, world_size)[rank]
 
         total_block_frames = sum(_block_frame_count(block) for block in local_blocks)
-        estimated_gib = _estimate_transfer_gib(
+        stats_keys = list(dict.fromkeys(stats_key_map.values()))
+        total_bytes = _estimate_transfer_bytes(
             first_dataset,
-            list(stats_key_map.values()),
+            stats_keys,
             total_block_frames,
         )
+        key_bytes = {key: _key_bytes_per_frame(first_dataset, key) for key in stats_keys}
         minmax_desc = progress_desc or "Computing min/max"
-        if estimated_gib > 0:
-            minmax_desc = f"{minmax_desc} ({estimated_gib:.2f} GiB)"
 
         block_iterator = tqdm(
             desc=minmax_desc,
-            total=total_block_frames,
+            total=total_bytes,
             position=progress_position,
             leave=False,
             disable=progress_disable,
-            unit="frame",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
         )
         for block in local_blocks:
             dataset = opened[block["path_idx"]]
             block_start = block["frame_start"]
             block_end = block["frame_end"]
-            block_frames = _block_frame_count(block)
             for stat_key, zarr_key in stats_key_map.items():
                 array = dataset[zarr_key][block_start:block_end]
                 local_min, local_max = _feature_min_max(array)
                 _update_feature_stats(local_stats, stat_key, local_min, local_max)
-            block_iterator.update(block_frames)
+                block_iterator.update((block_end - block_start) * key_bytes[zarr_key])
         block_iterator.close()
+    elif progress_desc and not progress_disable:
+        print(f"{progress_desc}: using precomputed zarr normalizer stats")
 
     reduced_stats: Dict[str, Dict[str, torch.Tensor]] = {}
     for stat_key, key_stats in local_stats.items():
