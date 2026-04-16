@@ -39,6 +39,7 @@ def get_processed_path(
     randomness: Union[List[Randomness], Randomness, None] = None,
     demo_outcome: Union[List[DemoStatus], DemoStatus, None] = "success",
     suffix: Union[str, None] = None,
+    dataset_format: str = "zarr",
 ) -> Path:
     path = Path(os.environ["DATA_DIR_PROCESSED"]) / "processed"
 
@@ -65,7 +66,7 @@ def get_processed_path(
         path = add_subdir(path, suffix)
 
     # Set the file extension
-    path = path.with_suffix(".zarr")
+    path = path.with_suffix(f".{dataset_format}")
 
     return path
 
@@ -78,6 +79,7 @@ def get_processed_paths(
     randomness: Union[List[Randomness], Randomness, None] = None,
     demo_outcome: Union[List[DemoStatus], DemoStatus] = "success",
     suffix: Union[str, None] = None,
+    dataset_format: str = "zarr",
 ) -> Path:
     """
     Takes in a set of parameters and returns a list of paths to
@@ -88,6 +90,20 @@ def get_processed_paths(
     """
 
     path = Path(os.environ["DATA_DIR_PROCESSED"]) / "processed"
+
+    if dataset_format == "lmdb" and isinstance(task, list):
+        merged_path = get_processed_path(
+            controller=controller,
+            domain=domain,
+            task=task,
+            demo_source=demo_source,
+            randomness=randomness,
+            demo_outcome=demo_outcome,
+            suffix=suffix,
+            dataset_format=dataset_format,
+        )
+        if merged_path.exists():
+            return [merged_path]
 
     paths = [path]
 
@@ -118,7 +134,7 @@ def get_processed_paths(
         paths = add_glob_part(paths, suffix)
 
     # Add the extension pattern to all paths
-    paths = [path.with_suffix(".zarr") for path in paths]
+    paths = [path.with_suffix(f".{dataset_format}") for path in paths]
 
     # Use glob to find all the zarr paths
     paths = [Path(path) for p in paths for path in glob(str(p), recursive=True)]

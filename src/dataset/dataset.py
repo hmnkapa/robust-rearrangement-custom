@@ -4,13 +4,12 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
-import zarr
 
 import src.common.geometry as C
 from src.common.control import ControlMode
 from src.dataset.base import BaseSequenceDataset, DatasetShardSpec, EpisodeRef
 from src.dataset.normalizer import LinearNormalizer
-from src.dataset.zarr import combine_zarr_datasets, combine_zarr_episode_subset
+from src.dataset.storage import build_lazy_image_stores, combine_datasets, combine_episode_subset
 
 from ipdb import set_trace as bp
 
@@ -85,8 +84,8 @@ def load_combined_data(
 ):
     return dataset._load_combined_data(
         keys,
-        full_loader=combine_zarr_datasets,
-        subset_loader=combine_zarr_episode_subset,
+        full_loader=combine_datasets,
+        subset_loader=combine_episode_subset,
         data_subset=data_subset,
         max_episode_count=max_episode_count,
     )
@@ -143,16 +142,6 @@ class ImageDataset(BaseSequenceDataset):
 
         control_mode_key = "pos" if control_mode == ControlMode.relative else control_mode
 
-        if not self.load_into_memory and self.obs_horizon > 1:
-            raise ValueError(
-                "data.load_into_memory=false currently only supports "
-                f"obs_horizon=1 for ImageDataset, but got {self.obs_horizon}."
-            )
-        if not self.load_into_memory and self.episode_refs is not None:
-            raise ValueError(
-                "ImageDataset episode sharding currently requires load_into_memory=true."
-            )
-
         if self.load_into_memory:
             load_into_memory_start_perf = perf_counter()
             combined_data, metadata = load_combined_data(
@@ -169,9 +158,7 @@ class ImageDataset(BaseSequenceDataset):
                 data_subset=data_subset,
                 max_episode_count=max_episode_count,
             )
-            self.zarr_datasets = [zarr.open(path, mode="r") for path in self.dataset_paths]
-            self.zarr_ci1 = [zd["color_image1"] for zd in self.zarr_datasets]
-            self.zarr_ci2 = [zd["color_image2"] for zd in self.zarr_datasets]
+            self.image_stores = build_lazy_image_stores(self.dataset_paths)
 
         self._set_episode_metadata(combined_data, metadata)
         self.train_data = {
@@ -224,16 +211,17 @@ class ImageDataset(BaseSequenceDataset):
             sample_end_idx=sample_end_idx,
         )
         if not self.load_into_memory:
-            zarr_idx = nsample["zarr_idx"][0]
-            within_zarr_idx_start = nsample["within_zarr_idx"][0].item()
-            within_zarr_idx_end = within_zarr_idx_start + 1
+            frame_indices = nsample["within_zarr_idx"][: self.obs_horizon].cpu().numpy()
+            zarr_indices = nsample["zarr_idx"][: self.obs_horizon].cpu().numpy()
+            if np.any(zarr_indices != zarr_indices[0]):
+                raise ValueError("Lazy image loading expects all observation frames to come from one dataset.")
 
-            nsample["color_image1"] = torch.from_numpy(
-                self.zarr_ci1[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).permute(0, 3, 1, 2)
-            nsample["color_image2"] = torch.from_numpy(
-                self.zarr_ci2[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).permute(0, 3, 1, 2)
+            frame_batch = self.image_stores[int(zarr_indices[0])].get_frames(
+                frame_indices,
+                self.image_keys,
+            )
+            nsample["color_image1"] = torch.from_numpy(frame_batch["color_image1"]).permute(0, 3, 1, 2)
+            nsample["color_image2"] = torch.from_numpy(frame_batch["color_image2"]).permute(0, 3, 1, 2)
 
         nsample["color_image1"] = nsample["color_image1"][: self.obs_horizon, :]
         nsample["color_image2"] = nsample["color_image2"][: self.obs_horizon, :]
@@ -305,16 +293,6 @@ class RGBDDataset(BaseSequenceDataset):
 
         control_mode_key = "pos" if control_mode == ControlMode.relative else control_mode
 
-        if not self.load_into_memory and self.obs_horizon > 1:
-            raise ValueError(
-                "data.load_into_memory=false currently only supports "
-                f"obs_horizon=1 for RGBDDataset, but got {self.obs_horizon}."
-            )
-        if not self.load_into_memory and self.episode_refs is not None:
-            raise ValueError(
-                "RGBDDataset episode sharding currently requires load_into_memory=true."
-            )
-
         if self.load_into_memory:
             load_into_memory_start_perf = perf_counter()
             combined_data, metadata = load_combined_data(
@@ -331,11 +309,7 @@ class RGBDDataset(BaseSequenceDataset):
                 data_subset=data_subset,
                 max_episode_count=max_episode_count,
             )
-            self.zarr_datasets = [zarr.open(path, mode="r") for path in self.dataset_paths]
-            self.zarr_ci1 = [zd["color_image1"] for zd in self.zarr_datasets]
-            self.zarr_ci2 = [zd["color_image2"] for zd in self.zarr_datasets]
-            self.zarr_di1 = [zd["depth_image1"] for zd in self.zarr_datasets]
-            self.zarr_di2 = [zd["depth_image2"] for zd in self.zarr_datasets]
+            self.image_stores = build_lazy_image_stores(self.dataset_paths)
 
         self._set_episode_metadata(combined_data, metadata)
         self.train_data = {
@@ -394,22 +368,19 @@ class RGBDDataset(BaseSequenceDataset):
             sample_end_idx=sample_end_idx,
         )
         if not self.load_into_memory:
-            zarr_idx = nsample["zarr_idx"][0]
-            within_zarr_idx_start = nsample["within_zarr_idx"][0].item()
-            within_zarr_idx_end = within_zarr_idx_start + 1
+            frame_indices = nsample["within_zarr_idx"][: self.obs_horizon].cpu().numpy()
+            zarr_indices = nsample["zarr_idx"][: self.obs_horizon].cpu().numpy()
+            if np.any(zarr_indices != zarr_indices[0]):
+                raise ValueError("Lazy RGBD loading expects all observation frames to come from one dataset.")
 
-            nsample["color_image1"] = torch.from_numpy(
-                self.zarr_ci1[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).permute(0, 3, 1, 2)
-            nsample["color_image2"] = torch.from_numpy(
-                self.zarr_ci2[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).permute(0, 3, 1, 2)
-            nsample["depth_image1"] = torch.from_numpy(
-                self.zarr_di1[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).to(dtype=torch.float32).unsqueeze(1)
-            nsample["depth_image2"] = torch.from_numpy(
-                self.zarr_di2[zarr_idx][within_zarr_idx_start:within_zarr_idx_end]
-            ).to(dtype=torch.float32).unsqueeze(1)
+            frame_batch = self.image_stores[int(zarr_indices[0])].get_frames(
+                frame_indices,
+                self.image_keys + self.depth_keys,
+            )
+            nsample["color_image1"] = torch.from_numpy(frame_batch["color_image1"]).permute(0, 3, 1, 2)
+            nsample["color_image2"] = torch.from_numpy(frame_batch["color_image2"]).permute(0, 3, 1, 2)
+            nsample["depth_image1"] = torch.from_numpy(frame_batch["depth_image1"]).to(dtype=torch.float32).unsqueeze(1)
+            nsample["depth_image2"] = torch.from_numpy(frame_batch["depth_image2"]).to(dtype=torch.float32).unsqueeze(1)
 
         nsample["color_image1"] = nsample["color_image1"][: self.obs_horizon, :]
         nsample["color_image2"] = nsample["color_image2"][: self.obs_horizon, :]
