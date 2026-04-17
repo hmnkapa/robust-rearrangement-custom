@@ -39,6 +39,88 @@ LOWDIM_KEYS = tuple(key for key in TIMESERIES_KEYS if key not in {
     "depth_image1",
     "depth_image2",
 })
+IMAGE_KEYS = ("color_image1", "color_image2", "depth_image1", "depth_image2")
+
+
+def format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def log_lmdb_storage_layout(frame_specs, lowdim_specs, resize_image: bool):
+    print(
+        "[INFO] LMDB storage format: images are stored as raw per-frame byte payloads "
+        "(no compression), low-dimensional arrays are stored once per episode."
+    )
+    print(f"[INFO] resize_image={resize_image} (default: False)")
+    print("[INFO] Image frame layout:")
+    for key in frame_specs["ordered_keys"]:
+        spec = frame_specs["specs"][key]
+        print(
+            f"[INFO]   {key}: dtype={spec['dtype']}, shape={tuple(spec['shape'])}, "
+            f"nbytes/frame={spec['nbytes']} ({format_bytes(int(spec['nbytes']))})"
+        )
+    print(
+        "[INFO]   total image bytes/timestep="
+        f"{frame_specs['total_nbytes']} ({format_bytes(int(frame_specs['total_nbytes']))})"
+    )
+    print("[INFO] Low-dimensional episode arrays:")
+    for key in LOWDIM_KEYS:
+        spec = lowdim_specs[key]
+        print(
+            f"[INFO]   {key}: dtype={spec['dtype']}, shape={tuple(spec['shape'])}"
+        )
+
+
+def log_episode_storage_debug(
+    episode_data,
+    frame_specs,
+    packed_lowdim_nbytes: int,
+):
+    episode_length = int(episode_data["episode_length"])
+    image_nbytes = int(frame_specs["total_nbytes"]) * episode_length
+    total_nbytes = image_nbytes + packed_lowdim_nbytes
+    print(
+        f"[DEBUG] Example episode storage: timesteps={episode_length}, "
+        f"image_bytes={image_nbytes} ({format_bytes(image_nbytes)}), "
+        f"lowdim_bytes={packed_lowdim_nbytes} ({format_bytes(packed_lowdim_nbytes)}), "
+        f"total={total_nbytes} ({format_bytes(total_nbytes)})"
+    )
+    for key in IMAGE_KEYS:
+        array = np.asarray(episode_data[key])
+        print(
+            f"[DEBUG]   {key}: shape={tuple(array.shape)}, dtype={array.dtype}, "
+            f"bytes/episode={array.nbytes} ({format_bytes(int(array.nbytes))})"
+        )
+
+
+def log_batch_storage_debug(
+    batch_index: int,
+    total_batches: int,
+    batch_timesteps: int,
+    batch_episodes: int,
+    batch_image_bytes: int,
+    batch_lowdim_bytes: int,
+    running_total_bytes: int,
+):
+    batch_total_bytes = batch_image_bytes + batch_lowdim_bytes
+    avg_bytes_per_timestep = (
+        batch_total_bytes / batch_timesteps if batch_timesteps > 0 else 0.0
+    )
+    print(
+        f"[DEBUG] Batch {batch_index}/{total_batches} payload estimate: "
+        f"episodes={batch_episodes}, timesteps={batch_timesteps}, "
+        f"image={format_bytes(batch_image_bytes)}, "
+        f"lowdim={format_bytes(batch_lowdim_bytes)}, "
+        f"total={format_bytes(batch_total_bytes)}, "
+        f"avg/timestep={format_bytes(int(round(avg_bytes_per_timestep)))}, "
+        f"running_total={format_bytes(running_total_bytes)}"
+    )
 
 
 def parse_task_episode_limits(entries: List[str]) -> Dict[str, int]:
@@ -255,6 +337,11 @@ def main():
         default=None,
         help="Per-task episode limits, for example: one_leg=100 round_table=50",
     )
+    parser.add_argument(
+        "--debug-storage-stats",
+        action="store_true",
+        help="Print detailed LMDB payload estimates for image and low-dimensional data.",
+    )
     args = parser.parse_args()
 
     assert not args.randomize_order or args.offset == 0, "Cannot offset with randomize"
@@ -308,6 +395,7 @@ def main():
     global_frame_idx = 0
     global_episode_idx = 0
     selected_task_counts = {task: 0 for task in args.task}
+    running_payload_bytes = 0
 
     total_batches = (len(pickle_paths) + batch_size - 1) // batch_size if pickle_paths else 0
     print(
@@ -323,6 +411,9 @@ def main():
             n_cpus=n_cpus,
             resize_image=args.resize_image,
         )
+        batch_image_bytes = 0
+        batch_lowdim_bytes = 0
+        batch_timesteps = 0
 
         with env.begin(write=True) as txn:
             for episode_data in batch_results:
@@ -330,10 +421,15 @@ def main():
                     frame_specs = build_frame_specs(
                         {
                             key: episode_data[key][0]
-                            for key in ("color_image1", "color_image2", "depth_image1", "depth_image2")
+                            for key in IMAGE_KEYS
                         }
                     )
                     lowdim_specs = build_lowdim_specs(episode_data)
+                    log_lmdb_storage_layout(
+                        frame_specs,
+                        lowdim_specs,
+                        resize_image=args.resize_image,
+                    )
 
                 episode_length = int(episode_data["episode_length"])
                 frame_start = global_frame_idx
@@ -342,15 +438,27 @@ def main():
                 lowdim_payload = {
                     key: np.asarray(episode_data[key]) for key in LOWDIM_KEYS
                 }
+                packed_lowdim_payload = pack_named_arrays(lowdim_payload)
                 txn.put(
                     episode_data_key(global_episode_idx),
-                    pack_named_arrays(lowdim_payload),
+                    packed_lowdim_payload,
                 )
+                packed_lowdim_nbytes = len(packed_lowdim_payload)
+                batch_lowdim_bytes += packed_lowdim_nbytes
+                batch_image_bytes += int(frame_specs["total_nbytes"]) * episode_length
+                batch_timesteps += episode_length
+
+                if args.debug_storage_stats and global_episode_idx == 0:
+                    log_episode_storage_debug(
+                        episode_data,
+                        frame_specs,
+                        packed_lowdim_nbytes,
+                    )
 
                 for local_frame_idx in range(episode_length):
                     frame_payload = {
                         key: episode_data[key][local_frame_idx]
-                        for key in ("color_image1", "color_image2", "depth_image1", "depth_image2")
+                        for key in IMAGE_KEYS
                     }
                     txn.put(
                         frame_key(global_frame_idx + local_frame_idx),
@@ -376,10 +484,22 @@ def main():
                 global_frame_idx = frame_end
                 global_episode_idx += 1
 
+        running_payload_bytes += batch_image_bytes + batch_lowdim_bytes
+
         print(
             f"[INFO] Written batch {batch_start // batch_size + 1}/{total_batches}, "
             f"timesteps so far: {global_frame_idx}, episodes so far: {global_episode_idx}"
         )
+        if args.debug_storage_stats:
+            log_batch_storage_debug(
+                batch_index=batch_start // batch_size + 1,
+                total_batches=total_batches,
+                batch_timesteps=batch_timesteps,
+                batch_episodes=len(batch_results),
+                batch_image_bytes=batch_image_bytes,
+                batch_lowdim_bytes=batch_lowdim_bytes,
+                running_total_bytes=running_payload_bytes,
+            )
 
     serialized_normalizer_stats = serialize_normalizer_stats(normalizer_stats)
     attrs = {
@@ -420,6 +540,11 @@ def main():
 
     env.sync()
     env.close()
+    if args.debug_storage_stats:
+        print(
+            "[DEBUG] Final LMDB payload estimate (metadata excluded): "
+            f"{format_bytes(running_payload_bytes)} across {global_frame_idx} timesteps"
+        )
     print("[INFO] LMDB processing complete.")
 
 
