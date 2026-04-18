@@ -661,6 +661,26 @@ def get_wandb_init_dir() -> Optional[str]:
     return wandb_dir
 
 
+def get_wandb_init_timeout_seconds(default_seconds: int = 300) -> int:
+    raw_timeout = os.environ.get("WANDB_INIT_TIMEOUT")
+    if raw_timeout is None:
+        return default_seconds
+
+    try:
+        timeout_seconds = int(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            f"WANDB_INIT_TIMEOUT must be a positive integer, got {raw_timeout!r}."
+        ) from exc
+
+    if timeout_seconds <= 0:
+        raise ValueError(
+            f"WANDB_INIT_TIMEOUT must be a positive integer, got {timeout_seconds}."
+        )
+
+    return timeout_seconds
+
+
 def get_wandb_run_dir_name(run, configured_name: Optional[str]) -> str:
     if run.name:
         return run.name
@@ -1291,6 +1311,9 @@ def main(cfg: DictConfig):
                     mode=cfg.wandb.mode,
                     notes=cfg.wandb.notes,
                     dir=wandb_init_dir,
+                    settings=wandb.Settings(
+                        init_timeout=get_wandb_init_timeout_seconds()
+                    ),
                 )
 
             if cfg.wandb.continue_run_id is not None:
