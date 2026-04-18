@@ -127,3 +127,5 @@ scene.xml
 /wandb_cache/
 
 /isaacgym/
+/.bench_tmp/
+/.tmp/
