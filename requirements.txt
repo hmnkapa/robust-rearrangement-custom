@@ -76,6 +76,7 @@ jupyterlab_widgets==3.0.10
 kiwisolver==1.4.5
 llvmlite==0.41.1
 locket==1.0.0
+lmdb==1.7.5
 manifold3d==2.4.5
 Markdown==3.3.7
 markdown-it-py==3.0.0

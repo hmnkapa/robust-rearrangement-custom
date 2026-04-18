@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-import zarr
 from diffusers.optimization import get_scheduler
 from gymnasium import Env
 from omegaconf import DictConfig, OmegaConf
@@ -40,11 +39,12 @@ from src.dataset.dataloader import (
 )
 from src.dataset.dataset import ImageDataset, RGBDDataset, StateDataset
 from src.dataset.normalizer import LinearNormalizer
-from src.dataset.zarr import (
+from src.dataset.storage import (
     balance_episode_manifest_by_frames,
     build_episode_manifest,
     compute_global_minmax_stats,
-    dataset_tuple,
+    resolve_load_into_memory,
+    summarize_manifest_metadata,
     split_episode_manifest,
 )
 from src.eval.eval_utils import get_model_from_api_or_cached
@@ -191,29 +191,6 @@ def sort_data_paths(data_paths: List[Path]) -> List[Path]:
     return sorted(data_paths, key=lambda path: str(path))
 
 
-def summarize_manifest_metadata(data_paths: List[Path], episode_refs) -> Dict[str, dict]:
-    metadata = {}
-    attrs_cache = {}
-    for ref in episode_refs:
-        metadata_key = str(dataset_tuple(data_paths[ref.path_idx]))
-        if ref.path_idx not in attrs_cache:
-            attrs_cache[ref.path_idx] = zarr.open(
-                data_paths[ref.path_idx], mode="r"
-            ).attrs.asdict()
-
-        if metadata_key not in metadata:
-            metadata[metadata_key] = {
-                "n_episodes_used": 0,
-                "n_frames_used": 0,
-                "attrs": attrs_cache[ref.path_idx],
-            }
-
-        metadata[metadata_key]["n_episodes_used"] += 1
-        metadata[metadata_key]["n_frames_used"] += ref.frame_count
-
-    return metadata
-
-
 def is_relative_control_mode(control_mode) -> bool:
     if control_mode == "relative":
         return True
@@ -242,18 +219,23 @@ def build_dataset_for_observation_type(
         normalizer=normalizer,
         shard_spec=shard_spec,
     )
+    load_into_memory = resolve_load_into_memory(
+        cfg.data.get("load_into_memory", None),
+        data_path,
+        cfg.observation_type,
+    )
 
     if cfg.observation_type == "image":
         return ImageDataset(
             **common_kwargs,
             minority_class_power=cfg.data.get("minority_class_power", False),
-            load_into_memory=cfg.data.get("load_into_memory", True),
+            load_into_memory=load_into_memory,
         )
     if cfg.observation_type == "rgbd":
         return RGBDDataset(
             **common_kwargs,
             minority_class_power=cfg.data.get("minority_class_power", False),
-            load_into_memory=cfg.data.get("load_into_memory", True),
+            load_into_memory=load_into_memory,
         )
     if cfg.observation_type == "state":
         return StateDataset(
@@ -862,6 +844,7 @@ def main(cfg: DictConfig):
                 randomness=to_native(cfg.data.randomness),
                 demo_outcome=to_native(cfg.data.demo_outcome),
                 suffix=to_native(cfg.data.suffix),
+                dataset_format=to_native(cfg.data.get("storage_format", "zarr")),
             )
         else:
             data_path = path_override(cfg.data.data_paths_override)
@@ -895,14 +878,6 @@ def main(cfg: DictConfig):
                 raise ValueError(
                     "data.minority_class_power is not supported when data.ddp_shard_enabled=true."
                 )
-            if (
-                cfg.observation_type in {"image", "rgbd"}
-                and not cfg.data.get("load_into_memory", True)
-            ):
-                raise ValueError(
-                    "Image/RGBD DDP sharding currently requires data.load_into_memory=true."
-                )
-
             manifest_payload = None
             manifest_start_perf = perf_counter()
             if main_process:

@@ -29,6 +29,7 @@ from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
 from src.dataset.dataloader import AsyncDevicePrefetchLoader, build_dataloader
 from src.dataset.dataset import ImageDataset, StateDataset, RGBDDataset
+from src.dataset.storage import resolve_load_into_memory
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
 from src.gym import get_rl_env
@@ -558,6 +559,7 @@ def main(cfg: DictConfig):
             randomness=to_native(cfg.data.randomness),
             demo_outcome=to_native(cfg.data.demo_outcome),
             suffix=to_native(cfg.data.suffix),
+            dataset_format=to_native(cfg.data.get("storage_format", "zarr")),
         )
     else:
         data_path = path_override(cfg.data.data_paths_override)
@@ -565,6 +567,11 @@ def main(cfg: DictConfig):
     print(f"Using data from {data_path}")
 
     dataset: Union[ImageDataset, StateDataset]
+    load_into_memory = resolve_load_into_memory(
+        cfg.data.get("load_into_memory", None),
+        data_path,
+        cfg.observation_type,
+    )
 
     if cfg.observation_type == "image":
         dataset = ImageDataset(
@@ -578,7 +585,7 @@ def main(cfg: DictConfig):
             pad_after=cfg.data.get("pad_after", True),
             max_episode_count=cfg.data.get("max_episode_count", None),
             minority_class_power=cfg.data.get("minority_class_power", False),
-            load_into_memory=cfg.data.get("load_into_memory", True),
+            load_into_memory=load_into_memory,
         )
     elif cfg.observation_type == "rgbd":
         dataset = RGBDDataset(
@@ -592,7 +599,7 @@ def main(cfg: DictConfig):
             pad_after=cfg.data.get("pad_after", True),
             max_episode_count=cfg.data.get("max_episode_count", None),
             minority_class_power=cfg.data.get("minority_class_power", False),
-            load_into_memory=cfg.data.get("load_into_memory", True),
+            load_into_memory=load_into_memory,
         )
     elif cfg.observation_type == "state":
         dataset = StateDataset(

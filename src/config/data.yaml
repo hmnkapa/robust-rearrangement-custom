@@ -21,7 +21,8 @@ data:
   include_future_obs: false
   minority_class_power: false
   data_paths_override: null
-  load_into_memory: true
+  storage_format: zarr
+  load_into_memory: auto
   ddp_shard_enabled: false
   ddp_split_unit: episode
   ddp_shard_balance: frames
