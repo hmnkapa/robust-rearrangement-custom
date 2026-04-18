@@ -217,19 +217,52 @@ def unpack_named_arrays(raw_value: bytes) -> Dict[str, np.ndarray]:
     return arrays
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean value, got {raw_value!r}. "
+        "Use one of: 1/0, true/false, yes/no, on/off."
+    )
+
+
+def _lmdb_subdir(path: Path, readonly: bool) -> bool:
+    if path.exists():
+        return path.is_dir()
+
+    if readonly:
+        return path.suffix == ".lmdb"
+
+    return path.suffix == ".lmdb" or path.suffix == ""
+
+
 def open_lmdb_env(path: Union[str, Path], readonly: bool = True):
     lmdb_module = require_lmdb()
     path = Path(path)
-    subdir = path.is_dir() or path.suffix == ".lmdb" or not path.exists()
+    subdir = _lmdb_subdir(path, readonly=readonly)
     if not readonly:
         path.mkdir(parents=True, exist_ok=True)
+
+    # Training only reads finalized datasets. Disabling reader locks for read-only
+    # opens avoids LMDB reader-table failures on shared/NAS filesystems and under
+    # many DDP ranks. Writers still use locks.
+    lock = True
+    if readonly:
+        lock = _env_bool("ROBUST_REARRANGEMENT_LMDB_READ_LOCK", False)
 
     return lmdb_module.open(
         str(path),
         subdir=subdir,
         readonly=readonly,
         create=not readonly,
-        lock=True,
+        lock=lock,
         readahead=not readonly,
         meminit=not readonly,
         map_size=1 << 40,
