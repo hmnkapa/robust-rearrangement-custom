@@ -3,6 +3,7 @@ from omegaconf import DictConfig
 
 from src.models.unet import ConditionalUnet1D
 from src.models.transformer import DiffusionTransformer
+from src.models.dit_policy_transformer import DitPolicyTransformer
 from src.models.vision import VisionEncoder
 
 from ipdb import set_trace as bp
@@ -90,5 +91,21 @@ def get_diffusion_backbone(
             obs_as_cond=actor_config.diffusion_model.obs_as_cond,
             n_cond_layers=actor_config.diffusion_model.n_cond_layers,
         )
+    elif actor_config.diffusion_model.name == "dit":
+        return DitPolicyTransformer(
+            action_dim=action_dim,
+            horizon=actor_config.pred_horizon,
+            conditioning_dim=obs_dim,
+            hidden_dim=actor_config.diffusion_model.hidden_dim,
+            num_layers=actor_config.diffusion_model.num_layers,
+            num_heads=actor_config.diffusion_model.num_heads,
+            dropout=actor_config.diffusion_model.dropout,
+            diffusion_step_embed_dim=actor_config.diffusion_model.diffusion_step_embed_dim,
+            use_positional_encoding=actor_config.diffusion_model.use_positional_encoding,
+            use_rope=actor_config.diffusion_model.use_rope,
+            rope_base=actor_config.diffusion_model.get("rope_base", 10000.0),
+        )
     else:
-        raise ValueError(f"Backbone {actor_config.model.backbone} not supported")
+        raise ValueError(
+            f"Backbone {actor_config.diffusion_model.name} not supported"
+        )

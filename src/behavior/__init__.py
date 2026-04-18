@@ -42,13 +42,21 @@ def get_actor(cfg: DictConfig, device) -> Actor:
             cfg=cfg,
             device=device,
         )
-    
+
+    elif actor_name == "fmt":
+        from src.behavior.fmt import FMTPolicy
+
+        return FMTPolicy(
+            cfg=cfg,
+            device=device,
+        )
+
     elif actor_name == "dp3":
         from src.behavior.dp3 import DP3Actor
-        
+
         return DP3Actor(
             cfg=cfg,
             device=device,
         )
-    
+
     raise ValueError(f"Unknown actor type: {cfg.actor}")

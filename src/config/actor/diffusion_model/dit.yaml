@@ -1,0 +1,10 @@
+name: dit
+hidden_dim: 512
+num_layers: 6
+num_heads: 8
+dropout: 0.1
+diffusion_step_embed_dim: 256
+use_positional_encoding: true
+use_rope: false
+rope_base: 10000.0
+flatten_obs: true
