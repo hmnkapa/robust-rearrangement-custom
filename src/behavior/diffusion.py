@@ -145,12 +145,17 @@ class DiffusionPolicy(Actor):
 
         if self.rescale_loss_for_domain:
             # Calculate class weights
-            class_sizes = torch.bincount(batch["domain"].squeeze())
-            class_weights = torch.pow(class_sizes.float(), -1.0 / 2)
+            domain = batch["domain"].squeeze().long()
+            if domain.dim() == 0:
+                domain = domain.unsqueeze(0)
+            class_sizes = torch.bincount(
+                domain, minlength=int(domain.max().item()) + 1
+            )
+            class_weights = torch.pow(class_sizes.clamp_min(1).float(), -1.0 / 2)
             class_weights = class_weights / class_weights.sum()
 
             # Apply class weights to the loss
-            class_weights = class_weights[batch["domain"]]
+            class_weights = class_weights[domain].unsqueeze(1)
             loss *= class_weights
 
         loss = loss.mean()
