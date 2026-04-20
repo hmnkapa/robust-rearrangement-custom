@@ -106,11 +106,20 @@ trigger_sync = TriggerWandbSyncHook(
 
 DEFAULT_DDP_TIMEOUT_SECONDS = 60 * 60
 SLOW_PHASE_WARNING_SECONDS = 60.0
-CHECKPOINT_TYPES = frozenset({"last", "best_test_loss", "best_success_rate"})
+DEFAULT_CHECKPOINT_TYPES = ("last", "best_val_action_mse_error")
+CHECKPOINT_TYPES = frozenset(
+    {
+        "last",
+        "best_test_loss",
+        "best_success_rate",
+        "best_val_action_mse_error",
+    }
+)
 CHECKPOINT_PRIORITY = {
     "best_success_rate": 0,
     "best_test_loss": 1,
-    "last": 2,
+    "best_val_action_mse_error": 2,
+    "last": 3,
 }
 
 
@@ -315,6 +324,7 @@ def checkpoint_type_from_path(path: Path) -> Optional[str]:
         "actor_chkpt_last.pt": "last",
         "actor_chkpt_best_test_loss.pt": "best_test_loss",
         "actor_chkpt_best_success_rate.pt": "best_success_rate",
+        "actor_chkpt_best_val_action_mse_error.pt": "best_val_action_mse_error",
     }
     return checkpoint_names.get(path.name)
 
@@ -336,7 +346,7 @@ def resolve_checkpoint_tmp_dir(cfg: DictConfig, run_dir_name: str) -> Path:
 
 def get_enabled_checkpoint_types(cfg: DictConfig) -> set:
     raw_checkpoint_types = cfg.training.get(
-        "save_checkpoints", ["last", "best_test_loss", "best_success_rate"]
+        "save_checkpoints", DEFAULT_CHECKPOINT_TYPES
     )
     if raw_checkpoint_types is None:
         return set()
@@ -620,6 +630,7 @@ def _resolve_checkpoint_in_run_dir(run_dir: Path) -> Optional[Path]:
         run_dir / "actor_chkpt_last.pt",
         run_dir / "actor_chkpt_best_test_loss.pt",
         run_dir / "actor_chkpt_best_success_rate.pt",
+        run_dir / "actor_chkpt_best_val_action_mse_error.pt",
     ]
 
     checkpoint_candidates = []
@@ -1026,6 +1037,7 @@ def build_save_dict(
     actor: DDP,
     best_test_loss: float,
     best_success_rate: float,
+    best_val_action_mse_error: float,
     epoch_idx: int,
     global_step: int,
     optimizers,
@@ -1035,6 +1047,7 @@ def build_save_dict(
         "model_state_dict": actor.module.state_dict(),
         "best_test_loss": best_test_loss,
         "best_success_rate": best_success_rate,
+        "best_val_action_mse_error": best_val_action_mse_error,
         "epoch": epoch_idx,
         "global_step": global_step,
         "config": OmegaConf.to_container(cfg, resolve=True),
@@ -1095,6 +1108,7 @@ def main(cfg: DictConfig):
         test_loss_mean = float("inf")
         best_success_rate = 0.0
         prev_best_success_rate = 0.0
+        best_val_action_mse_error = float("inf")
         global_step = 0
         is_resuming = resume_payload["state_dict_path"] is not None
 
@@ -1104,6 +1118,9 @@ def main(cfg: DictConfig):
             test_loss_mean = best_test_loss
             best_success_rate = state_dict.get("best_success_rate", 0.0)
             prev_best_success_rate = best_success_rate
+            best_val_action_mse_error = state_dict.get(
+                "best_val_action_mse_error", float("inf")
+            )
             global_step = state_dict.get("global_step", 0) or 0
 
         if cfg.training.batch_size % world_size != 0:
@@ -1563,6 +1580,7 @@ def main(cfg: DictConfig):
                             actor,
                             best_test_loss,
                             best_success_rate,
+                            best_val_action_mse_error,
                             checkpoint_epoch,
                             global_step,
                             optimizers,
@@ -1865,6 +1883,28 @@ def main(cfg: DictConfig):
                     sampling_duration = perf_counter() - sampling_start_perf
                     epoch_log["timing/action_sampling_seconds"] = sampling_duration
                     log_slow_phase(rank, epoch_idx, "action_sampling", sampling_duration)
+
+                val_action_mse_error = epoch_log.get(
+                    "action_sample/val_action_mse_error"
+                )
+                if (
+                    val_action_mse_error is not None
+                    and float(val_action_mse_error) < best_val_action_mse_error
+                ):
+                    best_val_action_mse_error = float(val_action_mse_error)
+                    if "best_val_action_mse_error" in enabled_checkpoint_types:
+                        checkpoint_start_perf = perf_counter()
+                        save_checkpoint(
+                            model_save_dir / "actor_chkpt_best_val_action_mse_error.pt",
+                            "best_val_action_mse_error",
+                            epoch_idx,
+                        )
+                        log_slow_phase(
+                            rank,
+                            epoch_idx,
+                            "save_best_val_action_mse_error_checkpoint",
+                            perf_counter() - checkpoint_start_perf,
+                        )
 
                 if test_loss_mean < best_test_loss:
                     best_test_loss = test_loss_mean

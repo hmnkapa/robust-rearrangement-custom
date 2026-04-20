@@ -20,8 +20,7 @@ training:
   model_save_dir: models
   save_checkpoints:
     - last
-    - best_test_loss
-    - best_success_rate
+    - best_val_action_mse_error
   save_last_every: 10
   async_checkpoint_saver: true
   checkpoint_saver_tmp_dir: null
