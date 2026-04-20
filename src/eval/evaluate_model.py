@@ -321,6 +321,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-rollouts", type=int, default=None)
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose assembly debug output from the evaluation environments.",
+    )
     parser.add_argument("--max-rollout-steps", type=int, default=None)
     parser.add_argument("--april-tags", action="store_true")
 
@@ -746,6 +751,7 @@ if __name__ == "__main__":
                             action_type=args.action_type,
                             april_tags=args.april_tags,
                             verbose=args.verbose,
+                            debug=args.debug,
                             headless=not args.visualize,
                             obs_keys=env_obs_keys,
                         )

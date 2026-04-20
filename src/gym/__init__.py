@@ -105,6 +105,7 @@ def get_rl_env(
     action_type="pos",  # Action type for the robot. Options are 'delta' and 'pos'.
     april_tags=False,
     verbose=False,
+    debug=False,
     headless=True,
     record=False,
     concat_robot_state=False,
@@ -173,7 +174,8 @@ def get_rl_env(
                 ctrl_mode="diffik",  # Control mode for the robot. Options are 'osc' and 'diffik'.
                 action_type=action_type,  # Action type for the robot. Options are 'delta' and 'pos'.
                 verbose=verbose,  # If true, prints debug information.
-                # **kwargs,
+                debug=debug,
+                **kwargs,
             )
 
         return env
