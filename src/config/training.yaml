@@ -18,6 +18,16 @@ training:
   sample_every: 100
   
   model_save_dir: models
+  save_checkpoints:
+    - last
+    - best_test_loss
+    - best_success_rate
+  save_last_every: 10
+  async_checkpoint_saver: true
+  checkpoint_saver_tmp_dir: null
+  checkpoint_saver_retry_seconds: 30
+
+  # Deprecated in bc_ddp.py; kept for compatibility with older entrypoints/configs.
   checkpoint_interval: -1
   save_per_epoch: 1000
 
