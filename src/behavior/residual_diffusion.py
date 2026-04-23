@@ -90,7 +90,7 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         # Predict the action
         with torch.no_grad():
             nobs = self._training_obs(batch, flatten=self.flatten_obs)
-            naction = self._normalized_action(nobs)
+            naction = self._normalized_action(nobs, use_warmstart=False)
 
         residual_nobs = torch.cat([batch["obs"], naction], dim=-1)
         gt_residual_naction = batch["action"] - naction
@@ -146,7 +146,7 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
     @torch.no_grad()
     def action_pred(self, batch):
         nobs = self._training_obs(batch, flatten=self.flatten_obs)
-        naction = self._normalized_action(nobs)
+        naction = self._normalized_action(nobs, use_warmstart=False)
 
         residual_nobs = torch.cat([batch["obs"], naction], dim=-1)
         residual = self.residual_policy.get_action(residual_nobs)
@@ -254,6 +254,7 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         self.observations.clear()
         if self.actions is not None:
             self.actions.clear()
+        self.prev_naction = None
 
     @property
     def actor_parameters(self):

@@ -29,6 +29,7 @@ from tqdm import trange
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 from src.behavior.base import Actor
+from src.behavior.diffusion import DiffusionPolicy
 from src.eval.load_model import load_bc_actor
 
 from src.dataset.normalizer import LinearNormalizer
@@ -374,6 +375,7 @@ if __name__ == "__main__":
     # bp()
     next_done = torch.zeros(args.num_envs)
     next_obs = env.reset()
+    bc_actor.reset()
 
     for iteration in range(1, args.num_iterations + 1):
         print(f"Iteration: {iteration}/{args.num_iterations}")
@@ -393,7 +395,15 @@ if __name__ == "__main__":
                 k = 20
                 expanded_next_obs = next_obs.unsqueeze(1).repeat(1, k, 1)
                 expanded_next_obs = expanded_next_obs.reshape(args.num_envs*k, -1)
-                out = bc_actor._normalized_action(expanded_next_obs)
+                # Candidate chunks are ranked independently, so diffusion warm
+                # start would couple samples that were never executed in order.
+                if isinstance(bc_actor, DiffusionPolicy):
+                    out = bc_actor._normalized_action(
+                        expanded_next_obs,
+                        use_warmstart=False,
+                    )
+                else:
+                    out = bc_actor._normalized_action(expanded_next_obs)
 
                 naction = out[:,:agent.action_horizon,:]
                 naction = naction + 0.02 * torch.randn(naction.shape, device=naction.device, )
@@ -422,7 +432,11 @@ if __name__ == "__main__":
                 )
 
         with torch.no_grad():
-            out = bc_actor._normalized_action(next_obs)
+            # Bootstrap estimates should be stateless for diffusion policies.
+            if isinstance(bc_actor, DiffusionPolicy):
+                out = bc_actor._normalized_action(next_obs, use_warmstart=False)
+            else:
+                out = bc_actor._normalized_action(next_obs)
             next_naction = out[:, :agent.action_horizon, :]
 
         if normrewenv is not None:

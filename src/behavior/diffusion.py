@@ -52,9 +52,17 @@ class DiffusionPolicy(Actor):
         self.eta = 0.0
 
     # === Inference ===
-    def _normalized_action(self, nobs: torch.Tensor) -> torch.Tensor:
+    def _normalized_action(
+        self,
+        nobs: torch.Tensor,
+        *,
+        use_warmstart: bool = True,
+    ) -> torch.Tensor:
         """
-        Perform diffusion to generate actions given the observation.
+        Sample a normalized action chunk.
+
+        Warm start is only valid for online rollout calls where consecutive
+        chunks come from the same reset-delimited trajectory.
         """
         B = nobs.shape[0]
 
@@ -62,24 +70,34 @@ class DiffusionPolicy(Actor):
             # If the observation is not flattened, we need to reshape it to (B, obs_horizon, obs_dim)
             nobs = nobs.reshape(B, self.obs_horizon, self.obs_dim)
 
-        # Now we know what batch size we have, so set the previous action to zeros of the correct size
-        if self.prev_naction is None or self.prev_naction.shape[0] != B:
-            self.prev_naction = torch.zeros(
-                (B, self.pred_horizon, self.action_dim), device=self.device
+        warmstart_shape = (B, self.pred_horizon, self.action_dim)
+        if (
+            use_warmstart
+            and self.prev_naction is not None
+            and self.prev_naction.shape == warmstart_shape
+        ):
+            warmstart_naction = self.prev_naction.to(
+                device=self.device,
+                dtype=nobs.dtype,
+            )
+        else:
+            warmstart_naction = torch.zeros(
+                warmstart_shape,
+                device=self.device,
+                dtype=nobs.dtype,
             )
 
-        # Important! `nobs` needs to be normalized and flattened before passing to this function
-        # Sample Gaussian noise to use to corrupt the actions
         noise = torch.randn(
             (B, self.pred_horizon, self.action_dim),
             device=self.device,
+            dtype=warmstart_naction.dtype,
         )
 
         # init scheduler
         self.inference_noise_scheduler.set_timesteps(self.inference_steps)
 
-        # Instead of sampling noise, we'll start with the previous action and add noise
-        naction = self.prev_naction
+        # Start diffusion around the previous same-trajectory chunk when available.
+        naction = warmstart_naction
 
         naction = self.inference_noise_scheduler.add_noise(
             naction,
@@ -99,12 +117,37 @@ class DiffusionPolicy(Actor):
                 eta=self.eta,
             ).prev_sample
 
-        # Store the remaining actions in the previous action to warm start the next horizon
-        self.prev_naction[:, : self.pred_horizon - self.action_horizon, :] = naction[
-            :, self.action_horizon :, :
-        ]
+        if use_warmstart:
+            # Only the overlap can belong to the next chunk. Zeroing the tail
+            # prevents stale actions from another batch or rollout from leaking in.
+            next_prev_naction = torch.zeros_like(naction.detach())
+            overlap = self.pred_horizon - self.action_horizon
+            if overlap > 0:
+                next_prev_naction[:, :overlap, :] = naction[
+                    :, self.action_horizon :, :
+                ].detach()
+            self.prev_naction = next_prev_naction
 
         return naction
+
+    @torch.no_grad()
+    def action_pred(self, batch):
+        """
+        Predict actions for an offline batch without persistent warm start.
+
+        Dataloader batches are not ordered by trajectory, so reusing
+        ``prev_naction`` here can couple train and validation samples.
+        """
+        nobs = self._training_obs(batch, flatten=self.flatten_obs)
+        naction = self._normalized_action(nobs, use_warmstart=False)
+        return self.normalizer(naction, "action", forward=False)
+
+    def reset(self):
+        """
+        Reset queues and diffusion warm start state at a trajectory boundary.
+        """
+        super().reset()
+        self.prev_naction = None
 
     # === Training ===
     def compute_loss(self, batch) -> Tuple[torch.Tensor, dict]:

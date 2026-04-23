@@ -257,6 +257,8 @@ def main(cfg: DictConfig):
     # bp()
     next_done = torch.zeros(cfg.num_envs)
     next_obs = env.reset()
+    agent.reset()
+    prev_eval_mode = None
 
     # Create model save dir
     model_save_dir: Path = Path("models") / wandb.run.name
@@ -274,6 +276,10 @@ def main(cfg: DictConfig):
         # Also reset the env to have more consistent results
         if eval_mode or cfg.reset_every_iteration:
             next_obs = env.reset()
+            agent.reset()
+        elif prev_eval_mode is not None and eval_mode != prev_eval_mode:
+            agent.reset()
+        prev_eval_mode = eval_mode
 
         print(f"Eval mode: {eval_mode}")
 
@@ -309,7 +315,12 @@ def main(cfg: DictConfig):
                     k = 20
                     expanded_next_obs = next_obs.unsqueeze(1).repeat(1, k, 1)
                     expanded_next_obs = expanded_next_obs.reshape(cfg.num_envs * k, -1)
-                    out = agent._normalized_action(expanded_next_obs)
+                    # Candidate chunks are independent samples for ranking, not
+                    # consecutive chunks from one executed trajectory.
+                    out = agent._normalized_action(
+                        expanded_next_obs,
+                        use_warmstart=False,
+                    )
                     naction = out[:, : agent.action_horizon, :]
                     naction = naction + sigma * torch.randn(
                         naction.shape,
@@ -402,7 +413,8 @@ def main(cfg: DictConfig):
 
         # bootstrap value if not done
         with torch.no_grad():
-            out = agent._normalized_action(next_obs)
+            # Bootstrap estimates should not update or depend on rollout warm start.
+            out = agent._normalized_action(next_obs, use_warmstart=False)
             next_naction = out[:, : agent.action_horizon, :]
             next_naction = next_naction + sigma * torch.randn(
                 next_naction.shape,
