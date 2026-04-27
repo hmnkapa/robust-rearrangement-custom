@@ -241,6 +241,96 @@ def format_success_rate(n_success: int, n_rollouts: int) -> str:
     return f"{n_success / n_rollouts:.2%} ({n_success}/{n_rollouts})"
 
 
+def _coerce_count_dict(counts: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    if not isinstance(counts, dict):
+        return {}
+
+    normalized_counts: Dict[str, int] = {}
+    for key, value in counts.items():
+        try:
+            normalized_counts[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return normalized_counts
+
+
+def _merge_count_dicts(
+    existing_counts: Optional[Dict[str, Any]],
+    new_counts: Optional[Dict[str, Any]],
+) -> Dict[str, int]:
+    merged_counts: Dict[str, int] = {}
+    for source in (_coerce_count_dict(existing_counts), _coerce_count_dict(new_counts)):
+        for key, value in source.items():
+            merged_counts[key] = merged_counts.get(key, 0) + value
+    return merged_counts
+
+
+def _build_success_rate_dict(
+    reached_counts: Dict[str, int],
+    completion_counts: Dict[str, int],
+) -> Dict[str, float]:
+    return {
+        key: (completion_counts.get(key, 0) / value if value > 0 else 0.0)
+        for key, value in reached_counts.items()
+    }
+
+
+def _print_skill_progress_stats(
+    task: str,
+    state_counts: Dict[str, int],
+    skill_completion_counts: Dict[str, int],
+    step_counts: Dict[str, int],
+    step_completion_counts: Dict[str, int],
+):
+    if not state_counts:
+        print(f"Skill-state statistics ({task}): unavailable")
+        return
+
+    print(f"Reached skill states ({task}):")
+    for state_label, reached in state_counts.items():
+        print(f"  {state_label}: {reached}")
+
+    print(f"Skill success rates ({task}):")
+    for state_label, reached in state_counts.items():
+        completed = skill_completion_counts.get(state_label, 0)
+        print(
+            f"  {state_label}: "
+            f"{completed / reached:.2%} ({completed}/{reached})"
+        )
+
+    if not step_counts:
+        print(f"Assembly step success rates ({task}): unavailable")
+        return
+
+    print(f"Assembly step success rates ({task}):")
+    for step_label, reached in step_counts.items():
+        completed = step_completion_counts.get(step_label, 0)
+        print(
+            f"  {step_label}: "
+            f"{completed / reached:.2%} ({completed}/{reached})"
+        )
+
+
+def _build_progress_summary(
+    state_counts: Dict[str, int],
+    skill_completion_counts: Dict[str, int],
+    step_counts: Dict[str, int],
+    step_completion_counts: Dict[str, int],
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        "skill_state_counts": dict(state_counts),
+        "skill_completion_counts": dict(skill_completion_counts),
+        "skill_success_rates": _build_success_rate_dict(
+            state_counts, skill_completion_counts
+        ),
+        "assembly_step_counts": dict(step_counts),
+        "assembly_step_completion_counts": dict(step_completion_counts),
+        "assembly_step_success_rates": _build_success_rate_dict(
+            step_counts, step_completion_counts
+        ),
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", type=str, required=False, nargs="*")
@@ -485,10 +575,7 @@ if __name__ == "__main__":
                     summary = json.load(f)
                 task_n_success = summary.get("n_success", 0)
                 task_n_rollouts = summary.get("n_rollouts", 0)
-                per_task_summaries[task] = {
-                    "n_success": task_n_success,
-                    "n_rollouts": task_n_rollouts,
-                }
+                per_task_summaries[task] = summary
                 total_success_all_tasks += task_n_success
                 total_rollouts_all_tasks += task_n_rollouts
             finally:
@@ -526,6 +613,10 @@ if __name__ == "__main__":
 
     summary_total_success = 0
     summary_total_rollouts = 0
+    summary_state_counts: Dict[str, int] = {}
+    summary_skill_completion_counts: Dict[str, int] = {}
+    summary_step_counts: Dict[str, int] = {}
+    summary_step_completion_counts: Dict[str, int] = {}
 
     # Start the evaluation loop
     print(f"Starting evaluation loop in continuous mode: {args.continuous_mode}")
@@ -796,6 +887,7 @@ if __name__ == "__main__":
                         annotate_skill=args.annotate_skill,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
+                        collect_skill_stats=True,
                         output_only_pickle=args.output_only_pickle,
                     )
 
@@ -807,10 +899,53 @@ if __name__ == "__main__":
                         f"Success rate ({task}): "
                         f"{format_success_rate(rollout_stats.n_success, rollout_stats.n_rollouts)}"
                     )
+                    _print_skill_progress_stats(
+                        task=task,
+                        state_counts=rollout_stats.state_counts,
+                        skill_completion_counts=rollout_stats.skill_completion_counts,
+                        step_counts=rollout_stats.step_counts,
+                        step_completion_counts=rollout_stats.step_completion_counts,
+                    )
 
                     if args.wandb:
                         print("Writing to wandb...")
                         s: dict = run.summary
+
+                        if how_update == "overwrite":
+                            state_counts = dict(rollout_stats.state_counts)
+                            skill_completion_counts = dict(
+                                rollout_stats.skill_completion_counts
+                            )
+                            step_counts = dict(rollout_stats.step_counts)
+                            step_completion_counts = dict(
+                                rollout_stats.step_completion_counts
+                            )
+                        elif how_update == "append":
+                            state_counts = _merge_count_dicts(
+                                s.get(spf + "skill_state_counts"),
+                                rollout_stats.state_counts,
+                            )
+                            skill_completion_counts = _merge_count_dicts(
+                                s.get(spf + "skill_completion_counts"),
+                                rollout_stats.skill_completion_counts,
+                            )
+                            step_counts = _merge_count_dicts(
+                                s.get(spf + "assembly_step_counts"),
+                                rollout_stats.step_counts,
+                            )
+                            step_completion_counts = _merge_count_dicts(
+                                s.get(spf + "assembly_step_completion_counts"),
+                                rollout_stats.step_completion_counts,
+                            )
+                        else:
+                            raise ValueError(f"Invalid how_update: {how_update}")
+
+                        progress_summary = _build_progress_summary(
+                            state_counts=state_counts,
+                            skill_completion_counts=skill_completion_counts,
+                            step_counts=step_counts,
+                            step_completion_counts=step_completion_counts,
+                        )
 
                         if how_update == "overwrite":
                             s[spf + "success_rate"] = success_rate
@@ -842,8 +977,9 @@ if __name__ == "__main__":
                             s[spf + "average_reward"] = (
                                 s[spf + "total_reward"] / s[spf + "n_rollouts"]
                             )
-                        else:
-                            raise ValueError(f"Invalid how_update: {how_update}")
+
+                        for key, value in progress_summary.items():
+                            s[spf + key] = value
 
                         run.update()
                     else:
@@ -853,6 +989,20 @@ if __name__ == "__main__":
                     total_rollouts += rollout_stats.n_rollouts
                     summary_total_success += rollout_stats.n_success
                     summary_total_rollouts += rollout_stats.n_rollouts
+                    summary_state_counts = _merge_count_dicts(
+                        summary_state_counts, rollout_stats.state_counts
+                    )
+                    summary_skill_completion_counts = _merge_count_dicts(
+                        summary_skill_completion_counts,
+                        rollout_stats.skill_completion_counts,
+                    )
+                    summary_step_counts = _merge_count_dicts(
+                        summary_step_counts, rollout_stats.step_counts
+                    )
+                    summary_step_completion_counts = _merge_count_dicts(
+                        summary_step_completion_counts,
+                        rollout_stats.step_completion_counts,
+                    )
 
                 if total_rollouts > 0:
                     print(
@@ -879,6 +1029,12 @@ if __name__ == "__main__":
             import json
 
             with open(args.task_summary_out, "w") as f:
+                progress_summary = _build_progress_summary(
+                    state_counts=summary_state_counts,
+                    skill_completion_counts=summary_skill_completion_counts,
+                    step_counts=summary_step_counts,
+                    step_completion_counts=summary_step_completion_counts,
+                )
                 json.dump(
                     {
                         "task": primary_task if len(tasks) == 1 else task_group,
@@ -889,6 +1045,7 @@ if __name__ == "__main__":
                             if summary_total_rollouts > 0
                             else None
                         ),
+                        **progress_summary,
                     },
                     f,
                 )

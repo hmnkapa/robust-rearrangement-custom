@@ -333,6 +333,8 @@ class SkillAnnotator:
     furniture_name: str
     previous_skill: Optional[str] = None
     previous_guidance_point_robot: Optional[np.ndarray] = None
+    previous_skill_state: Optional[str] = None
+    previous_assembly_step: Optional[str] = None
 
     def __post_init__(self):
         self.furniture = furniture_factory(self.furniture_name)
@@ -347,6 +349,36 @@ class SkillAnnotator:
         self.assemble_idx = 0
         self.previous_skill = None
         self.previous_guidance_point_robot = None
+        self.previous_skill_state = None
+        self.previous_assembly_step = None
+
+    def _short_part_name(self, part_name: str) -> str:
+        short_name = str(part_name)
+        for prefix in ("round_table_", "square_table_", "lamp_"):
+            if short_name.startswith(prefix):
+                short_name = short_name[len(prefix) :]
+                break
+
+        if self.furniture_name == "one_leg" and short_name.startswith("leg"):
+            return "leg"
+
+        return short_name
+
+    def _assembly_step_label(self, part1, part2) -> str:
+        return f"{self._short_part_name(part1.name)}-{self._short_part_name(part2.name)}"
+
+    def _skill_state_label(
+        self,
+        active_part_name: str,
+        partner_part_name: str,
+        skill: Optional[str],
+    ) -> Optional[str]:
+        if skill is None:
+            return None
+        return (
+            f"{self._short_part_name(active_part_name)}-"
+            f"{self._short_part_name(partner_part_name)}-{skill}"
+        )
 
     def _assembled(self, annotation_inputs, part_idx1, part_idx2):
         pair = (part_idx1, part_idx2)
@@ -477,6 +509,8 @@ class SkillAnnotator:
         if self.furniture_name not in {"one_leg", "round_table", "lamp"}:
             return {
                 "skill": None,
+                "skill_state": None,
+                "assembly_step": None,
                 "guidance_point": None,
                 "guidance_point_2d": {},
                 "camera_info": {},
@@ -499,6 +533,8 @@ class SkillAnnotator:
         if self.assemble_idx >= num_pairs:
             return {
                 "skill": self.previous_skill,
+                "skill_state": self.previous_skill_state,
+                "assembly_step": self.previous_assembly_step,
                 "guidance_point": self.previous_guidance_point_robot,
                 "guidance_point_2d": {},
                 "camera_info": camera_info,
@@ -507,13 +543,16 @@ class SkillAnnotator:
         part1_idx, part2_idx = self.furniture.should_be_assembled[self.assemble_idx]
         part1 = self.furniture.parts[part1_idx]
         part2 = self.furniture.parts[part2_idx]
+        assembly_step = self._assembly_step_label(part1, part2)
 
         skill_state = None
         skill = None
+        skill_state_label = None
         guidance_point_robot = None
         debug_info = {
             "assemble_idx": self.assemble_idx,
             "active_part": None,
+            "assembly_step": assembly_step,
             "phase": None,
         }
 
@@ -525,6 +564,7 @@ class SkillAnnotator:
             skill_state, skill, guidance_point_robot = self._update_part1_skill_state(
                 part1, annotation_inputs
             )
+            skill_state_label = self._skill_state_label(part1.name, part2.name, skill)
             if skill_state == "done":
                 part1.pre_assemble_done = True
             debug_info["active_part"] = part1.name
@@ -541,6 +581,7 @@ class SkillAnnotator:
                 assemble_to_name=part1.name,
                 assembled=assembled,
             )
+            skill_state_label = self._skill_state_label(part2.name, part1.name, skill)
             debug_info["active_part"] = part2.name
             debug_info["phase"] = "assemble"
 
@@ -553,9 +594,13 @@ class SkillAnnotator:
 
         if skill is None or skill_state == "done":
             skill = self.previous_skill
+            skill_state_label = self.previous_skill_state
+            assembly_step = self.previous_assembly_step
             guidance_point_robot = self.previous_guidance_point_robot
         else:
             self.previous_skill = skill
+            self.previous_skill_state = skill_state_label
+            self.previous_assembly_step = assembly_step
             if guidance_point_robot is not None:
                 self.previous_guidance_point_robot = _to_numpy(guidance_point_robot).astype(np.float32)
 
@@ -577,6 +622,8 @@ class SkillAnnotator:
 
         return {
             "skill": skill,
+            "skill_state": skill_state_label,
+            "assembly_step": assembly_step,
             "guidance_point": guidance_point,
             "guidance_point_2d": guidance_point_2d,
             "camera_info": camera_info,
@@ -630,6 +677,8 @@ def get_annotation_bundle_for_env(
     if getattr(env, "furniture_name", None) not in {"one_leg", "round_table", "lamp"}:
         return {
             "skill": None,
+            "skill_state": None,
+            "assembly_step": None,
             "guidance_point": None,
             "guidance_point_2d": {},
             "camera_info": {},

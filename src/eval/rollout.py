@@ -3,6 +3,8 @@ from omegaconf import DictConfig  # noqa: F401
 import torch
 
 import collections
+import json
+import os
 
 import numpy as np
 from tqdm import tqdm, trange
@@ -47,6 +49,12 @@ RolloutStats = collections.namedtuple(
         "rollout_max_steps",
         "total_return",
         "total_reward",
+        "state_counts",
+        "skill_completion_counts",
+        "skill_success_rates",
+        "step_counts",
+        "step_completion_counts",
+        "step_success_rates",
     ],
 )
 
@@ -63,6 +71,8 @@ RolloutSaveValues = collections.namedtuple(
         "depth_image1",
         "depth_image2",
         "skills",
+        "skill_states",
+        "assembly_steps",
         "guidance_points",
         "guidance_points_2d",
         "camera_infos",
@@ -160,6 +170,132 @@ def _transpose_step_env_annotations(values, num_envs: int):
     return [[values[step_idx][env_idx] for step_idx in range(len(values))] for env_idx in range(num_envs)]
 
 
+def _normalize_annotation_label(label):
+    if label is None:
+        return None
+    if isinstance(label, bytes):
+        label = label.decode("utf-8")
+    return str(label)
+
+
+def _ordered_unique_non_null(labels):
+    ordered_labels = []
+    seen = set()
+    for label in labels:
+        normalized_label = _normalize_annotation_label(label)
+        if normalized_label is None or normalized_label in seen:
+            continue
+        seen.add(normalized_label)
+        ordered_labels.append(normalized_label)
+    return ordered_labels
+
+
+def _increment_ordered_counter(counter: dict[str, int], label: str):
+    counter[label] = counter.get(label, 0) + 1
+
+
+def _accumulate_episode_skill_stats(
+    state_labels,
+    step_labels,
+    success: bool,
+    state_counts: dict[str, int],
+    skill_completion_counts: dict[str, int],
+    step_counts: dict[str, int],
+    step_completion_counts: dict[str, int],
+):
+    ordered_states = _ordered_unique_non_null(state_labels)
+    for state_label in ordered_states:
+        _increment_ordered_counter(state_counts, state_label)
+    for state_label in ordered_states[:-1]:
+        _increment_ordered_counter(skill_completion_counts, state_label)
+    if success and ordered_states:
+        _increment_ordered_counter(skill_completion_counts, ordered_states[-1])
+
+    ordered_steps = _ordered_unique_non_null(step_labels)
+    for step_label in ordered_steps:
+        _increment_ordered_counter(step_counts, step_label)
+    for step_label in ordered_steps[:-1]:
+        _increment_ordered_counter(step_completion_counts, step_label)
+    if success and ordered_steps:
+        _increment_ordered_counter(step_completion_counts, ordered_steps[-1])
+
+
+def _compute_success_rates(
+    reached_counts: dict[str, int],
+    completion_counts: dict[str, int],
+) -> dict[str, float]:
+    success_rates = {}
+    for label, reached in reached_counts.items():
+        completed = completion_counts.get(label, 0)
+        success_rates[label] = completed / reached if reached > 0 else 0.0
+    return success_rates
+
+
+def _build_rollout_progress_summary(rollout_stats: RolloutStats) -> dict:
+    return {
+        "n_success": int(rollout_stats.n_success),
+        "n_rollouts": int(rollout_stats.n_rollouts),
+        "success_rate": float(rollout_stats.success_rate),
+        "rollout_max_steps": int(rollout_stats.rollout_max_steps),
+        "total_return": float(rollout_stats.total_return),
+        "total_reward": float(rollout_stats.total_reward),
+        "skill_state_counts": dict(rollout_stats.state_counts),
+        "skill_completion_counts": dict(rollout_stats.skill_completion_counts),
+        "skill_success_rates": dict(rollout_stats.skill_success_rates),
+        "assembly_step_counts": dict(rollout_stats.step_counts),
+        "assembly_step_completion_counts": dict(rollout_stats.step_completion_counts),
+        "assembly_step_success_rates": dict(rollout_stats.step_success_rates),
+    }
+
+
+def _flatten_rollout_path_for_log_name(rollout_path_hint: Optional[Path]) -> str:
+    if rollout_path_hint is None:
+        return "rollout"
+
+    raw_root_env = os.environ.get("DATA_DIR_RAW")
+    candidate_path = rollout_path_hint.expanduser()
+    relative_path = candidate_path
+
+    if raw_root_env:
+        try:
+            raw_root = (Path(raw_root_env).expanduser().resolve() / "raw").resolve()
+            relative_path = candidate_path.resolve().relative_to(raw_root)
+        except (OSError, RuntimeError, ValueError):
+            relative_path = candidate_path
+
+    flattened_parts = [part for part in relative_path.parts if part not in ("", ".", "..")]
+    if not flattened_parts:
+        return "rollout"
+    return "__".join(flattened_parts)
+
+
+def write_rollout_progress_log(
+    log_dir: Path,
+    rollout_stats: RolloutStats,
+    epoch_idx: int,
+    task_name: str,
+    rollout_path_hint: Optional[Path] = None,
+) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")
+    rollout_name = _flatten_rollout_path_for_log_name(rollout_path_hint)
+    log_path = log_dir / f"{rollout_name}__epoch_{epoch_idx:06d}__{timestamp}.json"
+
+    payload = {
+        "task": task_name,
+        "epoch": int(epoch_idx),
+        "timestamp": timestamp,
+        "rollout_path_hint": str(rollout_path_hint) if rollout_path_hint is not None else None,
+        **_build_rollout_progress_summary(rollout_stats),
+    }
+
+    with open(log_path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+    print(f"Saved rollout progress log to: {log_path}")
+    return log_path
+
+
 class SuccessTqdm(tqdm):
     def __init__(
         self,
@@ -219,6 +355,7 @@ def rollout(
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
+    collect_skill_stats: bool = False,
     rollout_after_success: int = 0,
     full_length_rollout: bool = False,
 ) -> Optional[RolloutSaveValues]:
@@ -226,7 +363,7 @@ def rollout(
     with suppress_all_output(False):
         obs = env.reset()
         actor.reset()
-    collect_skill_annotations = annotate_skill or provide_skill_input
+    collect_skill_annotations = annotate_skill or provide_skill_input or collect_skill_stats
     if collect_skill_annotations:
         reset_skill_annotator(env)
 
@@ -243,6 +380,8 @@ def rollout(
         else [{} for _ in range(env.num_envs)]
     )
     initial_skills = [bundle.get("skill") for bundle in initial_annotations]
+    initial_skill_states = [bundle.get("skill_state") for bundle in initial_annotations]
+    initial_assembly_steps = [bundle.get("assembly_step") for bundle in initial_annotations]
     initial_guidance_points = [bundle.get("guidance_point") for bundle in initial_annotations]
     initial_guidance_points_2d = [
         bundle.get("guidance_point_2d", {}) for bundle in initial_annotations
@@ -302,6 +441,8 @@ def rollout(
     depth_image2 = [] if "depth_image2" not in video_obs else [video_obs["depth_image2"]]
     parts_poses = [video_obs["parts_poses"].cpu()]
     skills = [initial_skills]
+    skill_states = [initial_skill_states]
+    assembly_steps = [initial_assembly_steps]
     guidance_points = [initial_guidance_points]
     guidance_points_2d = [initial_guidance_points_2d]
     camera_infos = [[bundle.get("camera_info", {}) for bundle in initial_annotations]]
@@ -369,6 +510,8 @@ def rollout(
             else [{} for _ in range(env.num_envs)]
         )
         current_skills = [bundle.get("skill") for bundle in current_annotations]
+        current_skill_states = [bundle.get("skill_state") for bundle in current_annotations]
+        current_assembly_steps = [bundle.get("assembly_step") for bundle in current_annotations]
         current_guidance_points = [bundle.get("guidance_point") for bundle in current_annotations]
         current_guidance_points_2d = [
             bundle.get("guidance_point_2d", {}) for bundle in current_annotations
@@ -416,6 +559,10 @@ def rollout(
                 video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
             )
 
+        skills.append(current_skills)
+        skill_states.append(current_skill_states)
+        assembly_steps.append(current_assembly_steps)
+
         # Store the results for visualization and logging
         if save_rollouts:
             robot_states.append(
@@ -431,7 +578,6 @@ def rollout(
                 depth_image2.append(video_obs["depth_image2"])
             actions.append(action_pred.cpu())
             parts_poses.append(video_obs["parts_poses"].cpu())
-            skills.append(current_skills)
             guidance_points.append(current_guidance_points)
             guidance_points_2d.append(current_guidance_points_2d)
             camera_infos.append([bundle.get("camera_info", {}) for bundle in current_annotations])
@@ -490,6 +636,8 @@ def rollout(
         pcs_per_env = None
 
     skills_per_env = _transpose_step_env_annotations(skills, env.num_envs)
+    skill_states_per_env = _transpose_step_env_annotations(skill_states, env.num_envs)
+    assembly_steps_per_env = _transpose_step_env_annotations(assembly_steps, env.num_envs)
     guidance_points_per_env = _transpose_step_env_annotations(guidance_points, env.num_envs)
     guidance_points_2d_per_env = _transpose_step_env_annotations(
         guidance_points_2d, env.num_envs
@@ -513,6 +661,8 @@ def rollout(
         torch.stack(depth_image1, dim=1) if depth_image1 else [],
         torch.stack(depth_image2, dim=1) if depth_image2 else [],
         skills_per_env,
+        skill_states_per_env,
+        assembly_steps_per_env,
         guidance_points_per_env,
         guidance_points_2d_per_env,
         camera_infos_per_env,
@@ -543,6 +693,7 @@ def calculate_success_rate(
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
+    collect_skill_stats: bool = False,
     full_length_rollout: bool = False,
     output_only_pickle: bool = False,
 ) -> RolloutStats:
@@ -568,6 +719,10 @@ def calculate_success_rate(
     total_reward = 0
     episode_returns = []
     table_rows = []
+    state_counts: dict[str, int] = {}
+    skill_completion_counts: dict[str, int] = {}
+    step_counts: dict[str, int] = {}
+    step_completion_counts: dict[str, int] = {}
 
     save_rollouts = rollout_save_dir is not None or save_rollouts_to_wandb
 
@@ -596,6 +751,7 @@ def calculate_success_rate(
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
+            collect_skill_stats=collect_skill_stats,
             rollout_after_success=rollout_after_success,
             full_length_rollout=full_length_rollout,
         )
@@ -603,6 +759,23 @@ def calculate_success_rate(
         # Calculate the success rate
         success_flags = rollout_data.rewards.sum(dim=1) == n_parts_assemble
         n_success += success_flags.sum().item()
+
+        for env_idx in range(env.num_envs):
+            _accumulate_episode_skill_stats(
+                state_labels=(
+                    rollout_data.skill_states[env_idx] if rollout_data.skill_states else []
+                ),
+                step_labels=(
+                    rollout_data.assembly_steps[env_idx]
+                    if rollout_data.assembly_steps
+                    else []
+                ),
+                success=bool(success_flags[env_idx].item()),
+                state_counts=state_counts,
+                skill_completion_counts=skill_completion_counts,
+                step_counts=step_counts,
+                step_completion_counts=step_completion_counts,
+            )
 
         # Save the results from the rollout immediately
         if save_rollouts:
@@ -771,6 +944,9 @@ def calculate_success_rate(
 
     pbar.close()
 
+    skill_success_rates = _compute_success_rates(state_counts, skill_completion_counts)
+    step_success_rates = _compute_success_rates(step_counts, step_completion_counts)
+
     return RolloutStats(
         success_rate=n_success / n_rollouts,
         n_success=n_success,
@@ -779,6 +955,12 @@ def calculate_success_rate(
         rollout_max_steps=rollout_max_steps,
         total_return=np.sum(episode_returns) if episode_returns else 0,
         total_reward=total_reward,
+        state_counts=state_counts,
+        skill_completion_counts=skill_completion_counts,
+        skill_success_rates=skill_success_rates,
+        step_counts=step_counts,
+        step_completion_counts=step_completion_counts,
+        step_success_rates=step_success_rates,
     )
 
 
@@ -790,21 +972,30 @@ def do_rollout_evaluation(
     actor: Actor,
     best_success_rate: float,
     epoch_idx: int,
+    progress_log_dir: Optional[Path] = None,
 ) -> float:
+    rollout_task = config.rollout.get("task", config.task)
+    rollout_randomness = config.rollout.get("randomness", config.randomness)
+    rollout_path_hint = (
+        Path(str(env.ctrl_mode))
+        / "sim"
+        / str(rollout_task)
+        / "rollout"
+        / str(rollout_randomness)
+    )
     rollout_save_dir = None
-
     if save_rollouts_to_file:
         rollout_save_dir = trajectory_save_dir(
             controller=env.ctrl_mode,
-            environment="sim",
-            task=config.task,
+            domain="sim",
+            task=rollout_task,
             demo_source="rollout",
-            randomness=config.randomness,
-            # Don't create here because we have to do it when we save anyway
+            randomness=rollout_randomness,
             create=False,
         )
+        rollout_path_hint = rollout_save_dir
 
-    actor.set_task(task2idx[config.task])
+    actor.set_task(task2idx[rollout_task])
     provide_skill_input = model_requires_skill_input(config)
 
     rollout_stats = calculate_success_rate(
@@ -818,10 +1009,20 @@ def do_rollout_evaluation(
         save_rollouts_to_wandb=save_rollouts_to_wandb,
         save_failures=config.rollout.save_failures,
         provide_skill_input=provide_skill_input,
+        collect_skill_stats=True,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)
     mean_return = rollout_stats.total_return / rollout_stats.n_rollouts
+
+    if progress_log_dir is not None:
+        write_rollout_progress_log(
+            log_dir=progress_log_dir,
+            rollout_stats=rollout_stats,
+            epoch_idx=epoch_idx,
+            task_name=rollout_task,
+            rollout_path_hint=rollout_path_hint,
+        )
 
     # Log the success rate to wandb
     wandb.log(

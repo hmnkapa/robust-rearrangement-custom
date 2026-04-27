@@ -1015,6 +1015,7 @@ def main(cfg: DictConfig):
                     actor=actor,
                     best_success_rate=best_success_rate,
                     epoch_idx=epoch_idx,
+                    progress_log_dir=model_save_dir / "logs",
                 )
 
             # Save the model if the test loss is the best so far
