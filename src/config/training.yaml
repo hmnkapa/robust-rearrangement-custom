@@ -28,6 +28,7 @@ training:
 
   # Deprecated in bc_ddp.py; kept for compatibility with older entrypoints/configs.
   checkpoint_interval: -1
+  # Periodically archive checkpoint snapshots in bc.py and bc_ddp.py.
   save_per_epoch: 1000
 
   store_best_test_loss_model: true

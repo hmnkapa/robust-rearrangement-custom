@@ -115,12 +115,6 @@ CHECKPOINT_TYPES = frozenset(
         "best_val_action_mse_error",
     }
 )
-CHECKPOINT_PRIORITY = {
-    "best_success_rate": 0,
-    "best_test_loss": 1,
-    "best_val_action_mse_error": 2,
-    "last": 3,
-}
 
 
 print("=== Activate TF32 training? Deactivated for now...")
@@ -168,6 +162,7 @@ class CheckpointSaveTask:
     epoch: int
     global_step: int
     created_at: str
+    delete_source_on_success: bool = True
 
 
 def checkpoint_task_metadata(task: CheckpointSaveTask) -> Dict[str, Any]:
@@ -208,7 +203,11 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]):
 
 
 def copy_snapshot_to_checkpoint(
-    snapshot_path: Path, target_path: Path, metadata: Dict[str, Any]
+    snapshot_path: Path,
+    target_path: Path,
+    metadata: Dict[str, Any],
+    *,
+    delete_source_on_success: bool = True,
 ):
     target_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
@@ -223,13 +222,14 @@ def copy_snapshot_to_checkpoint(
             os.fsync(tmp_file.fileno())
         os.replace(tmp_path, target_path)
         write_json_atomic(checkpoint_sidecar_path(target_path), metadata)
-        try:
-            snapshot_path.unlink()
-        except OSError as exc:
-            print(
-                f"[CheckpointSave] Could not remove local snapshot {snapshot_path}: {exc!r}",
-                flush=True,
-            )
+        if delete_source_on_success:
+            try:
+                snapshot_path.unlink()
+            except OSError as exc:
+                print(
+                    f"[CheckpointSave] Could not remove local snapshot {snapshot_path}: {exc!r}",
+                    flush=True,
+                )
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -251,7 +251,12 @@ def checkpoint_saver_worker(save_queue, retry_seconds: float):
 
         while True:
             try:
-                copy_snapshot_to_checkpoint(snapshot_path, target_path, metadata)
+                copy_snapshot_to_checkpoint(
+                    snapshot_path,
+                    target_path,
+                    metadata,
+                    delete_source_on_success=task.delete_source_on_success,
+                )
                 print(
                     "[CheckpointSaver] Wrote "
                     f"{task.checkpoint_type} checkpoint for epoch {task.epoch} "
@@ -312,6 +317,7 @@ class AsyncCheckpointSaver:
 
 CHECKPOINT_POLICY_CONFIG_KEYS = (
     "save_checkpoints",
+    "save_per_epoch",
     "save_last_every",
     "async_checkpoint_saver",
     "checkpoint_saver_tmp_dir",
@@ -319,14 +325,39 @@ CHECKPOINT_POLICY_CONFIG_KEYS = (
 )
 
 
-def checkpoint_type_from_path(path: Path) -> Optional[str]:
-    checkpoint_names = {
-        "actor_chkpt_last.pt": "last",
-        "actor_chkpt_best_test_loss.pt": "best_test_loss",
-        "actor_chkpt_best_success_rate.pt": "best_success_rate",
-        "actor_chkpt_best_val_action_mse_error.pt": "best_val_action_mse_error",
-    }
-    return checkpoint_names.get(path.name)
+def checkpoint_path(
+    checkpoint_dir: Path, checkpoint_type: str, archive_epoch: Optional[int] = None
+) -> Path:
+    if checkpoint_type == "last":
+        filename = (
+            "actor_chkpt_last.pt"
+            if archive_epoch is None
+            else f"actor_chkpt_latest_{int(archive_epoch)}.pt"
+        )
+    elif checkpoint_type == "best_test_loss":
+        suffix = "" if archive_epoch is None else f"_{int(archive_epoch)}"
+        filename = f"actor_chkpt_best_test_loss{suffix}.pt"
+    elif checkpoint_type == "best_success_rate":
+        suffix = "" if archive_epoch is None else f"_{int(archive_epoch)}"
+        filename = f"actor_chkpt_best_success_rate{suffix}.pt"
+    elif checkpoint_type == "best_val_action_mse_error":
+        suffix = "" if archive_epoch is None else f"_{int(archive_epoch)}"
+        filename = f"actor_chkpt_best_val_action_mse_error{suffix}.pt"
+    else:
+        raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
+
+    return checkpoint_dir / filename
+
+
+def checkpoint_epoch_from_name(path: Path) -> int:
+    match = re.search(
+        (
+            r"actor_chkpt_(?:latest_|best_test_loss_|best_success_rate_|"
+            r"best_val_action_mse_error_)?(\d+)\.pt$"
+        ),
+        path.name,
+    )
+    return int(match.group(1)) if match else -1
 
 
 def safe_checkpoint_tmp_run_name(run_dir_name: str) -> str:
@@ -558,6 +589,10 @@ def _checkpoint_epoch(path: Path) -> int:
         except (TypeError, ValueError):
             pass
 
+    checkpoint_epoch = checkpoint_epoch_from_name(path)
+    if checkpoint_epoch >= 0:
+        return checkpoint_epoch
+
     try:
         state_dict = load_state_dict_from_path(str(path))
     except Exception as exc:
@@ -610,10 +645,25 @@ def _extract_path_datetime(path: Path) -> Optional[datetime]:
 
 
 def _checkpoint_priority(path: Path) -> int:
-    checkpoint_type = checkpoint_type_from_path(path)
-    if checkpoint_type is None:
-        return -1
-    return CHECKPOINT_PRIORITY[checkpoint_type]
+    if path.name == "actor_chkpt_last.pt":
+        return 8
+    if re.match(r"actor_chkpt_latest_\d+\.pt$", path.name):
+        return 7
+    if re.match(r"actor_chkpt_\d+\.pt$", path.name):
+        return 6
+    if path.name == "actor_chkpt_best_val_action_mse_error.pt":
+        return 5
+    if re.match(r"actor_chkpt_best_val_action_mse_error_\d+\.pt$", path.name):
+        return 4
+    if path.name == "actor_chkpt_best_test_loss.pt":
+        return 3
+    if re.match(r"actor_chkpt_best_test_loss_\d+\.pt$", path.name):
+        return 2
+    if path.name == "actor_chkpt_best_success_rate.pt":
+        return 1
+    if re.match(r"actor_chkpt_best_success_rate_\d+\.pt$", path.name):
+        return 0
+    return -1
 
 
 def _path_sort_key(path: Path) -> Tuple[float, float]:
@@ -632,6 +682,7 @@ def _resolve_checkpoint_in_run_dir(run_dir: Path) -> Optional[Path]:
         run_dir / "actor_chkpt_best_success_rate.pt",
         run_dir / "actor_chkpt_best_val_action_mse_error.pt",
     ]
+    possible_files.extend(run_dir.glob("actor_chkpt*.pt"))
 
     checkpoint_candidates = []
     seen_paths = set()
@@ -1077,6 +1128,12 @@ def main(cfg: DictConfig):
         cfg = OmegaConf.create(resume_payload["cfg_container"])
         OmegaConf.resolve(cfg)
         enabled_checkpoint_types = get_enabled_checkpoint_types(cfg)
+        checkpoint_archive_interval_raw = cfg.training.get("save_per_epoch", -1)
+        checkpoint_archive_interval = (
+            int(checkpoint_archive_interval_raw)
+            if checkpoint_archive_interval_raw is not None
+            else -1
+        )
         save_last_every = int(cfg.training.get("save_last_every", 1))
         if save_last_every <= 0:
             raise ValueError("training.save_last_every must be a positive integer.")
@@ -1556,6 +1613,38 @@ def main(cfg: DictConfig):
         config_dict = OmegaConf.to_container(cfg, resolve=True)
         wandb_init_dir = get_wandb_init_dir()
         checkpoint_snapshot_dir = None
+        checkpoint_source_epochs = {
+            checkpoint_type: -1 for checkpoint_type in CHECKPOINT_TYPES
+        }
+
+        def queue_checkpoint(
+            source_path: Path,
+            target_path: Path,
+            checkpoint_type: str,
+            checkpoint_epoch: int,
+            *,
+            keep_source: bool = False,
+        ):
+            task = CheckpointSaveTask(
+                snapshot_path=str(source_path.resolve()),
+                target_path=str(target_path.resolve()),
+                checkpoint_type=checkpoint_type,
+                epoch=int(checkpoint_epoch),
+                global_step=int(global_step),
+                created_at=datetime.now().isoformat(),
+                delete_source_on_success=not keep_source,
+            )
+            if async_checkpoint_saver_enabled:
+                if checkpoint_saver is None:
+                    raise RuntimeError("Async checkpoint saver was not initialized.")
+                checkpoint_saver.enqueue(task)
+            else:
+                copy_snapshot_to_checkpoint(
+                    Path(task.snapshot_path),
+                    Path(task.target_path),
+                    checkpoint_task_metadata(task),
+                    delete_source_on_success=task.delete_source_on_success,
+                )
 
         def save_checkpoint(path: Path, checkpoint_type: str, checkpoint_epoch: int):
             if checkpoint_type not in CHECKPOINT_TYPES:
@@ -1597,25 +1686,59 @@ def main(cfg: DictConfig):
                     pass
                 raise
 
-            task = CheckpointSaveTask(
-                snapshot_path=str(snapshot_path),
-                target_path=str(target_path),
-                checkpoint_type=checkpoint_type,
-                epoch=checkpoint_epoch,
-                global_step=int(global_step),
-                created_at=datetime.now().isoformat(),
-            )
+            queue_checkpoint(snapshot_path, target_path, checkpoint_type, checkpoint_epoch)
 
-            if async_checkpoint_saver_enabled:
-                if checkpoint_saver is None:
-                    raise RuntimeError("Async checkpoint saver was not initialized.")
-                checkpoint_saver.enqueue(task)
-            else:
-                copy_snapshot_to_checkpoint(
-                    snapshot_path,
-                    target_path,
-                    checkpoint_task_metadata(task),
+        def save_named_checkpoint(checkpoint_type: str, checkpoint_epoch: int):
+            if model_save_dir is None:
+                raise RuntimeError("Model save directory was not initialized.")
+
+            save_checkpoint(
+                checkpoint_path(model_save_dir, checkpoint_type),
+                checkpoint_type,
+                checkpoint_epoch,
+            )
+            checkpoint_source_epochs[checkpoint_type] = int(checkpoint_epoch)
+            updated_checkpoint_types.add(checkpoint_type)
+
+        def archive_named_checkpoint(
+            checkpoint_type: str,
+            archive_epoch: int,
+            *,
+            updated_this_epoch: bool = False,
+        ) -> bool:
+            if checkpoint_type not in CHECKPOINT_TYPES:
+                raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
+            if model_save_dir is None:
+                raise RuntimeError("Model save directory was not initialized.")
+
+            target_path = checkpoint_path(model_save_dir, checkpoint_type, archive_epoch)
+            if checkpoint_type == "last" or updated_this_epoch:
+                checkpoint_epoch = (
+                    int(checkpoint_source_epochs.get(checkpoint_type, archive_epoch - 1))
+                    if checkpoint_type != "last"
+                    else archive_epoch - 1
                 )
+                save_checkpoint(target_path, checkpoint_type, checkpoint_epoch)
+                return True
+
+            source_path = checkpoint_path(model_save_dir, checkpoint_type)
+            source_epoch = checkpoint_source_epochs.get(checkpoint_type, -1)
+            if source_epoch < 0:
+                if not source_path.exists():
+                    return False
+                source_epoch = _checkpoint_epoch(source_path)
+                if source_epoch < 0:
+                    return False
+                checkpoint_source_epochs[checkpoint_type] = source_epoch
+
+            queue_checkpoint(
+                source_path,
+                target_path,
+                checkpoint_type,
+                source_epoch,
+                keep_source=True,
+            )
+            return True
 
         if main_process:
             with patch_wandb_access_checks([wandb_init_dir, tempfile.gettempdir()]):
@@ -1719,6 +1842,7 @@ def main(cfg: DictConfig):
             train_metric_sums = defaultdict(float)
             train_metric_counts = defaultdict(int)
             train_loss_keys = set()
+            updated_checkpoint_types = set()
 
             actor.train()
             train_sampler.set_epoch(epoch_idx)
@@ -1894,11 +2018,7 @@ def main(cfg: DictConfig):
                     best_val_action_mse_error = float(val_action_mse_error)
                     if "best_val_action_mse_error" in enabled_checkpoint_types:
                         checkpoint_start_perf = perf_counter()
-                        save_checkpoint(
-                            model_save_dir / "actor_chkpt_best_val_action_mse_error.pt",
-                            "best_val_action_mse_error",
-                            epoch_idx,
-                        )
+                        save_named_checkpoint("best_val_action_mse_error", epoch_idx)
                         log_slow_phase(
                             rank,
                             epoch_idx,
@@ -1910,11 +2030,7 @@ def main(cfg: DictConfig):
                     best_test_loss = test_loss_mean
                     if "best_test_loss" in enabled_checkpoint_types:
                         checkpoint_start_perf = perf_counter()
-                        save_checkpoint(
-                            model_save_dir / "actor_chkpt_best_test_loss.pt",
-                            "best_test_loss",
-                            epoch_idx,
-                        )
+                        save_named_checkpoint("best_test_loss", epoch_idx)
                         log_slow_phase(
                             rank,
                             epoch_idx,
@@ -1926,11 +2042,7 @@ def main(cfg: DictConfig):
                     prev_best_success_rate = best_success_rate
                     if "best_success_rate" in enabled_checkpoint_types:
                         checkpoint_start_perf = perf_counter()
-                        save_checkpoint(
-                            model_save_dir / "actor_chkpt_best_success_rate.pt",
-                            "best_success_rate",
-                            epoch_idx,
-                        )
+                        save_named_checkpoint("best_success_rate", epoch_idx)
                         log_slow_phase(
                             rank,
                             epoch_idx,
@@ -1952,12 +2064,37 @@ def main(cfg: DictConfig):
                 and (epoch_idx + 1) % save_last_every == 0
             ):
                 checkpoint_start_perf = perf_counter()
-                save_checkpoint(model_save_dir / "actor_chkpt_last.pt", "last", epoch_idx)
+                save_named_checkpoint("last", epoch_idx)
                 log_slow_phase(
                     rank,
                     epoch_idx,
                     "save_last_checkpoint",
                     perf_counter() - checkpoint_start_perf,
+                )
+
+            if (
+                main_process
+                and checkpoint_archive_interval > 0
+                and (epoch_idx + 1) % checkpoint_archive_interval == 0
+            ):
+                checkpoint_archive_start_perf = perf_counter()
+                archive_epoch = epoch_idx + 1
+
+                if "last" in enabled_checkpoint_types:
+                    archive_named_checkpoint("last", archive_epoch, updated_this_epoch=True)
+
+                for checkpoint_type in sorted(enabled_checkpoint_types - {"last"}):
+                    archive_named_checkpoint(
+                        checkpoint_type,
+                        archive_epoch,
+                        updated_this_epoch=checkpoint_type in updated_checkpoint_types,
+                    )
+
+                log_slow_phase(
+                    rank,
+                    epoch_idx,
+                    "save_periodic_checkpoint_archives",
+                    perf_counter() - checkpoint_archive_start_perf,
                 )
 
             if ema is not None and cfg.training.ema.switch:
@@ -2053,11 +2190,7 @@ def main(cfg: DictConfig):
             and last_completed_epoch >= 0
         ):
             checkpoint_start_perf = perf_counter()
-            save_checkpoint(
-                model_save_dir / "actor_chkpt_last.pt",
-                "last",
-                last_completed_epoch,
-            )
+            save_named_checkpoint("last", last_completed_epoch)
             log_slow_phase(
                 rank,
                 last_completed_epoch,
