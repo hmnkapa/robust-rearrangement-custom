@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from gymnasium import Env
 from omegaconf import DictConfig  # noqa: F401
 import torch
