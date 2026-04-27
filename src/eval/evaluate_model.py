@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -331,6 +332,64 @@ def _build_progress_summary(
     }
 
 
+def _default_eval_logs_dir() -> Path:
+    log_dir = Path.cwd() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def _safe_path_part(value: str) -> str:
+    safe = str(value).strip()
+    safe = re.sub(r"[^A-Za-z0-9_.+-]+", "_", safe)
+    return safe.strip("._") or "unknown"
+
+
+def _resolve_checkpoint_name(args: argparse.Namespace) -> str:
+    if args.wt_path:
+        return Path(args.wt_path).stem
+
+    wt_type = getattr(args, "wt_type", None)
+    if wt_type is None:
+        return "unknown_checkpoint"
+
+    wt_name = Path(str(wt_type)).stem.strip()
+    if not wt_name:
+        return "unknown_checkpoint"
+    if wt_name.startswith("actor_chkpt_") or wt_name.startswith("student_chkpt_"):
+        return wt_name
+    if wt_name == "latest":
+        return "actor_chkpt_latest"
+    return f"actor_chkpt_{wt_name}"
+
+
+def _write_eval_stats_log(
+    *,
+    log_dir: Path,
+    task_name: str,
+    checkpoint_name: str,
+    payload: Dict[str, Any],
+) -> Path:
+    timestamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+    directory_parts = ["evaluate_model", _safe_path_part(task_name), _safe_path_part(checkpoint_name)]
+
+    target_dir = log_dir.joinpath(*directory_parts)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = target_dir / f"{timestamp}.json"
+    duplicate_idx = 1
+    while log_path.exists():
+        log_path = target_dir / f"{timestamp}_{duplicate_idx:02d}.json"
+        duplicate_idx += 1
+
+    with open(log_path, "w") as f:
+        import json
+
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+    print(f"Saved evaluation stats log to: {log_path}")
+    return log_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", type=str, required=False, nargs="*")
@@ -507,6 +566,7 @@ if __name__ == "__main__":
         if args.task_group is not None
         else ("+".join(tasks) if len(tasks) > 1 else None)
     )
+    eval_logs_dir = _default_eval_logs_dir()
 
     # If multiple tasks are provided, run each task in a fresh process to avoid IsaacGym core dumps.
     is_child = os.environ.get("RR_EVAL_MT_CHILD", "0") == "1"
@@ -596,6 +656,24 @@ if __name__ == "__main__":
         print(
             "Success rate (all tasks): "
             f"{format_success_rate(total_success_all_tasks, total_rollouts_all_tasks)}"
+        )
+        multitask_payload = {
+            "task_group": task_group,
+            "checkpoint_name": _resolve_checkpoint_name(args),
+            "n_success": total_success_all_tasks,
+            "n_rollouts": total_rollouts_all_tasks,
+            "success_rate": (
+                total_success_all_tasks / total_rollouts_all_tasks
+                if total_rollouts_all_tasks > 0
+                else None
+            ),
+            "per_task": per_task_summaries,
+        }
+        _write_eval_stats_log(
+            log_dir=eval_logs_dir,
+            task_name=task_group or "multitask",
+            checkpoint_name=_resolve_checkpoint_name(args),
+            payload=multitask_payload,
         )
         sys.exit(0)
 
@@ -724,6 +802,7 @@ if __name__ == "__main__":
 
                 total_success = 0
                 total_rollouts = 0
+                checkpoint_name = _resolve_checkpoint_name(args)
 
                 for task in tasks:
                     task_rollout_after_success = rollout_after_success_by_task[task]
@@ -792,6 +871,18 @@ if __name__ == "__main__":
                         )
                         if args.save_rollouts
                         else None
+                    )
+                    rollout_path_hint = (
+                        save_dir
+                        if save_dir is not None
+                        else (
+                            Path("diffik")
+                            / "sim"
+                            / task
+                            / "rollout"
+                            / args.randomness
+                            / suffix
+                        )
                     )
 
                     if args.store_video_wandb:
@@ -905,6 +996,32 @@ if __name__ == "__main__":
                         skill_completion_counts=rollout_stats.skill_completion_counts,
                         step_counts=rollout_stats.step_counts,
                         step_completion_counts=rollout_stats.step_completion_counts,
+                    )
+                    task_payload = {
+                        "run_name": run.name,
+                        "run_id": getattr(run, "id", None),
+                        "task": task,
+                        "task_group": task_group,
+                        "checkpoint_name": checkpoint_name,
+                        "n_success": rollout_stats.n_success,
+                        "n_rollouts": rollout_stats.n_rollouts,
+                        "success_rate": success_rate,
+                        "rollout_max_steps": rollout_stats.rollout_max_steps,
+                        "total_return": rollout_stats.total_return,
+                        "total_reward": rollout_stats.total_reward,
+                        "rollout_path_hint": str(rollout_path_hint),
+                        **_build_progress_summary(
+                            state_counts=rollout_stats.state_counts,
+                            skill_completion_counts=rollout_stats.skill_completion_counts,
+                            step_counts=rollout_stats.step_counts,
+                            step_completion_counts=rollout_stats.step_completion_counts,
+                        ),
+                    }
+                    _write_eval_stats_log(
+                        log_dir=eval_logs_dir,
+                        task_name=task,
+                        checkpoint_name=checkpoint_name,
+                        payload=task_payload,
                     )
 
                     if args.wandb:

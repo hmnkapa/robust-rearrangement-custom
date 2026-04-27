@@ -974,17 +974,9 @@ def do_rollout_evaluation(
     actor: Actor,
     best_success_rate: float,
     epoch_idx: int,
-    progress_log_dir: Optional[Path] = None,
 ) -> float:
     rollout_task = config.rollout.get("task", config.task)
     rollout_randomness = config.rollout.get("randomness", config.randomness)
-    rollout_path_hint = (
-        Path(str(env.ctrl_mode))
-        / "sim"
-        / str(rollout_task)
-        / "rollout"
-        / str(rollout_randomness)
-    )
     rollout_save_dir = None
     if save_rollouts_to_file:
         rollout_save_dir = trajectory_save_dir(
@@ -995,7 +987,6 @@ def do_rollout_evaluation(
             randomness=rollout_randomness,
             create=False,
         )
-        rollout_path_hint = rollout_save_dir
 
     actor.set_task(task2idx[rollout_task])
     provide_skill_input = model_requires_skill_input(config)
@@ -1016,15 +1007,6 @@ def do_rollout_evaluation(
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)
     mean_return = rollout_stats.total_return / rollout_stats.n_rollouts
-
-    if progress_log_dir is not None:
-        write_rollout_progress_log(
-            log_dir=progress_log_dir,
-            rollout_stats=rollout_stats,
-            epoch_idx=epoch_idx,
-            task_name=rollout_task,
-            rollout_path_hint=rollout_path_hint,
-        )
 
     # Log the success rate to wandb
     wandb.log(

@@ -1978,7 +1978,6 @@ def main(cfg: DictConfig):
                         actor=actor.module,
                         best_success_rate=best_success_rate,
                         epoch_idx=epoch_idx,
-                        progress_log_dir=model_save_dir / "logs",
                     )
                     rollout_duration = perf_counter() - rollout_start_perf
                     epoch_log["timing/rollout_eval_seconds"] = rollout_duration
