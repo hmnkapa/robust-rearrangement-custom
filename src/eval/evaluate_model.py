@@ -30,6 +30,7 @@ from src.common.tasks import task2idx, task_timeout
 from src.common.files import trajectory_save_dir
 from src.gym import get_rl_env
 from src.eval.eval_utils import load_model_weights
+from src.eval.perturb_util import PERTURB_MODES, PerturbRunner
 
 from typing import Any, Dict, List, Optional
 from ipdb import set_trace as bp  # noqa
@@ -486,6 +487,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--stop-after-n-success", type=int, default=0)
     parser.add_argument("--break-on-n-success", action="store_true")
+    parser.add_argument(
+        "--perturb-mode",
+        type=str,
+        choices=PERTURB_MODES,
+        default="none",
+        help="End-effector perturbation mode. All non-mode parameters live in src/eval/perturb_util.py.",
+    )
     parser.add_argument(
         "--rollout-after-success",
         type=int,
@@ -961,9 +969,15 @@ if __name__ == "__main__":
 
                     print(
                         f"Starting rollout of run: {run.name} task: {task} "
-                        f"(rollout_after_success={task_rollout_after_success})"
+                        f"(rollout_after_success={task_rollout_after_success}, "
+                        f"perturb_mode={args.perturb_mode})"
                     )
                     actor.set_task(task2idx[task])
+                    perturb_runner = (
+                        None
+                        if args.perturb_mode == "none"
+                        else PerturbRunner(args.perturb_mode)
+                    )
                     rollout_stats = calculate_success_rate(
                         actor=actor,
                         env=env,
@@ -988,6 +1002,7 @@ if __name__ == "__main__":
                         provide_skill_input=requires_skill_input,
                         collect_skill_stats=True,
                         output_only_pickle=args.output_only_pickle,
+                        perturb_runner=perturb_runner,
                     )
 
                     if args.store_video_wandb:
@@ -1018,6 +1033,7 @@ if __name__ == "__main__":
                         "total_return": rollout_stats.total_return,
                         "total_reward": rollout_stats.total_reward,
                         "rollout_path_hint": str(rollout_path_hint),
+                        "perturb_mode": args.perturb_mode,
                         **_build_progress_summary(
                             state_counts=rollout_stats.state_counts,
                             skill_completion_counts=rollout_stats.skill_completion_counts,
@@ -1025,6 +1041,8 @@ if __name__ == "__main__":
                             step_completion_counts=rollout_stats.step_completion_counts,
                         ),
                     }
+                    if perturb_runner is not None:
+                        task_payload["perturb_stats"] = perturb_runner.stats.summary()
                     _write_eval_stats_log(
                         log_dir=eval_logs_dir,
                         task_name=task,

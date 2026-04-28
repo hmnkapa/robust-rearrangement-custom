@@ -39,6 +39,7 @@ from src.eval.skill_annotation_util import (
     get_annotation_bundle_all_envs,
     reset_skill_annotator,
 )
+from src.eval.perturb_util import PerturbContext, PerturbRunner
 
 
 RolloutStats = collections.namedtuple(
@@ -404,6 +405,7 @@ def rollout(
     collect_skill_stats: bool = False,
     rollout_after_success: int = 0,
     full_length_rollout: bool = False,
+    perturb_runner: Optional[PerturbRunner] = None,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
@@ -414,6 +416,11 @@ def rollout(
         or annotate_guidance_point
         or provide_skill_input
         or collect_skill_stats
+        or (
+            perturb_runner is not None
+            and perturb_runner.enabled
+            and perturb_runner.requires_skill_annotations
+        )
     )
     if collect_skill_annotations:
         reset_skill_annotator(env)
@@ -501,6 +508,7 @@ def rollout(
     guidance_points = [initial_guidance_points]
     guidance_points_2d = [initial_guidance_points_2d]
     camera_infos = [[bundle.get("camera_info", {}) for bundle in initial_annotations]]
+    active_skill_states = initial_skill_states
     actions = list()
     rewards = torch.zeros((env.num_envs, rollout_max_steps), dtype=torch.float32)
     done = torch.zeros((env.num_envs, 1), dtype=torch.bool, device="cuda")
@@ -525,12 +533,33 @@ def rollout(
         point_clouds.append(pcs_step_np)
 
     step_idx = 0
+    apply_ee_force = None
+    perturb_device = None
+    if perturb_runner is not None and perturb_runner.enabled:
+        apply_ee_force = getattr(env, "apply_end_effector_force", None)
+        if not callable(apply_ee_force):
+            raise ValueError(
+                f"Perturb mode `{perturb_runner.mode}` requires an environment with "
+                "`apply_end_effector_force`. This is currently supported for "
+                "FurnitureRLSimEnv only."
+            )
+        perturb_device = getattr(env, "device", actor.device)
+        if not isinstance(perturb_device, torch.device):
+            perturb_device = torch.device(perturb_device)
+        perturb_runner.reset_episode(env.num_envs, perturb_device)
 
     # TODO - figure out how to fix this
     actor.normalizer = actor.normalizer.to(actor.device)
     actor.model = actor.model.to(actor.device)
 
     while True:
+        raw_robot_state = obs.get("robot_state") if isinstance(obs, dict) else None
+        ee_pos_vel = (
+            raw_robot_state.get("ee_pos_vel")
+            if isinstance(raw_robot_state, dict)
+            else None
+        )
+
         # Convert from robot state dict to robot state tensor
         if not getattr(actor, "expects_raw_robot_state", False):
             obs["robot_state"] = env.filter_and_concat_robot_state(obs["robot_state"])
@@ -542,6 +571,22 @@ def rollout(
         # print("[DEBUG] gripper action: ", action_pred[:, 7])
         # action_pred = torch.tensor(actions[step_idx], device="cuda").unsqueeze(0)
         # action_pred = actor.normalizer(action_pred, "action", forward=False)
+
+        if perturb_runner is not None and perturb_runner.enabled:
+            assert apply_ee_force is not None
+            assert perturb_device is not None
+            perturb_forces = perturb_runner.compute_force(
+                PerturbContext(
+                    step_idx=step_idx,
+                    num_envs=env.num_envs,
+                    device=perturb_device,
+                    furniture_name=getattr(env, "furniture_name", None),
+                    task_name=getattr(env, "task_name", None),
+                    skill_states=active_skill_states,
+                    ee_pos_vel=ee_pos_vel,
+                )
+            )
+            apply_ee_force(perturb_forces)
 
         obs, reward, done, _ = env.step(action_pred, sample_perturbations=False)
 
@@ -621,6 +666,7 @@ def rollout(
         skills.append(current_skills)
         skill_states.append(current_skill_states)
         assembly_steps.append(current_assembly_steps)
+        active_skill_states = current_skill_states
 
         # Store the results for visualization and logging
         if save_rollouts:
@@ -756,6 +802,7 @@ def calculate_success_rate(
     collect_skill_stats: bool = False,
     full_length_rollout: bool = False,
     output_only_pickle: bool = False,
+    perturb_runner: Optional[PerturbRunner] = None,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -815,6 +862,7 @@ def calculate_success_rate(
             collect_skill_stats=collect_skill_stats,
             rollout_after_success=rollout_after_success,
             full_length_rollout=full_length_rollout,
+            perturb_runner=perturb_runner,
         )
 
         # Calculate the success rate
@@ -1004,6 +1052,8 @@ def calculate_success_rate(
             )
 
     pbar.close()
+    if perturb_runner is not None and perturb_runner.enabled:
+        print(f"Perturbation stats: {perturb_runner.stats.summary()}")
 
     skill_success_rates = _compute_success_rates(state_counts, skill_completion_counts)
     step_success_rates = _compute_success_rates(step_counts, step_completion_counts)
