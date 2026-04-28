@@ -2,7 +2,7 @@ from typing import List
 import furniture_bench
 from furniture_bench.envs.furniture_sim_env import FurnitureSimEnv
 from src.behavior.base import Actor  # noqa
-from src.behavior.base import model_requires_skill_input
+from src.behavior.base import model_requires_skill_input, model_uses_guidance_point
 import torch
 from omegaconf import OmegaConf, DictConfig
 from src.eval.rollout import calculate_success_rate
@@ -152,6 +152,7 @@ if __name__ == "__main__":
         n_parts_assemble=n_parts_assemble,
         compress_pickles=compress_pickles,
         resize_video=True,
+        annotate_guidance_point=model_uses_guidance_point(config),
         provide_skill_input=model_requires_skill_input(config),
     )
 

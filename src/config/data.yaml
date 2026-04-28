@@ -10,6 +10,9 @@ data:
   action_horizon: ${action_horizon}
   predict_past_actions: ${predict_past_actions}
   augment_image: true
+  # 引导信息
+  annotate_guidance_point: false
+  annotate_skill_one_hot: false
   environment: ${environment}
   task: ${task}
   demo_source: ${demo_source}

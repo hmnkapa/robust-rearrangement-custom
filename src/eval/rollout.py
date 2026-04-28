@@ -16,7 +16,7 @@ from typing import Dict, Optional, Union
 from pathlib import Path
 
 from src.behavior.base import Actor
-from src.behavior.base import model_requires_skill_input
+from src.behavior.base import model_requires_skill_input, model_uses_guidance_point
 from src.common.skills import batch_skills_to_onehot_tensor
 from src.visualization.render_mp4 import create_in_memory_mp4
 from src.common.context import suppress_all_output
@@ -89,9 +89,9 @@ def resize_image(obs, key):
         pass
 
 def resize_depth(obs, key):
-    # key : [B, H, W]
-    depth_image = obs[key].unsqueeze(-1) # [B, H, W, C]
     try:
+        # key : [B, H, W]
+        depth_image = obs[key].unsqueeze(-1)  # [B, H, W, C]
         obs[key] = resize(depth_image).squeeze(-1)
     except KeyError:
         pass
@@ -103,9 +103,9 @@ def resize_crop_image(obs, key):
         pass
 
 def resize_crop_depth(obs, key):
-    # key : [B, H, W]
-    depth_image = obs[key].unsqueeze(-1) # [B, H, W, C]
     try:
+        # key : [B, H, W]
+        depth_image = obs[key].unsqueeze(-1)  # [B, H, W, C]
         obs[key] = resize_crop(depth_image).squeeze(-1)
     except KeyError:
         pass
@@ -148,6 +148,44 @@ def tensordict_to_list_of_dicts(tensordict):
     return list_of_dicts
 
 
+def _resize_guidance_point_for_image(
+    guidance_point_2d,
+    bundle,
+    image_key: str,
+    image_shape,
+):
+    if guidance_point_2d is None:
+        return None
+
+    camera_info = bundle.get("camera_info", {}).get(image_key)
+    if not camera_info:
+        return guidance_point_2d
+
+    source_width, source_height = [int(v) for v in camera_info["image_size"]]
+    target_height, target_width = image_shape[:2]
+    if source_width == target_width and source_height == target_height:
+        return guidance_point_2d
+
+    uv = np.asarray(guidance_point_2d, dtype=np.float32)
+    if image_key == "color_image1":
+        sx = target_width / max(source_width, 1)
+        sy = target_height / max(source_height, 1)
+        uv = np.array([uv[0] * sx, uv[1] * sy], dtype=np.float32)
+    elif image_key == "color_image2":
+        aspect_ratio = source_width / max(source_height, 1)
+        resized_width = int(target_height * aspect_ratio)
+        crop_size = max(0, (resized_width - target_width) // 2)
+        sx = resized_width / max(source_width, 1)
+        sy = target_height / max(source_height, 1)
+        uv = np.array([uv[0] * sx - crop_size, uv[1] * sy], dtype=np.float32)
+    else:
+        return guidance_point_2d
+
+    if uv[0] < 0 or uv[0] >= target_width or uv[1] < 0 or uv[1] >= target_height:
+        return None
+    return uv.astype(np.float32)
+
+
 def _draw_guidance_points_for_all_envs(video_obs, annotation_bundles, annotate_wrist_camera: bool):
     image_keys = ["color_image2"]
     if annotate_wrist_camera:
@@ -159,7 +197,12 @@ def _draw_guidance_points_for_all_envs(video_obs, annotation_bundles, annotate_w
         image_batch = video_obs[image_key].cpu().numpy()
         annotated_batch = image_batch.copy()
         for env_idx, bundle in enumerate(annotation_bundles):
-            guidance = bundle.get("guidance_point_2d", {}).get(image_key)
+            guidance = _resize_guidance_point_for_image(
+                bundle.get("guidance_point_2d", {}).get(image_key),
+                bundle,
+                image_key,
+                annotated_batch[env_idx].shape,
+            )
             annotated_batch[env_idx] = draw_guidance_point_on_image(
                 annotated_batch[env_idx], guidance
             )
@@ -354,6 +397,7 @@ def rollout(
     save_rollouts: bool = False,
     pc_generator = None,
     annotate_skill: bool = False,
+    annotate_guidance_point: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -365,7 +409,12 @@ def rollout(
     with suppress_all_output(False):
         obs = env.reset()
         actor.reset()
-    collect_skill_annotations = annotate_skill or provide_skill_input or collect_skill_stats
+    collect_skill_annotations = (
+        annotate_skill
+        or annotate_guidance_point
+        or provide_skill_input
+        or collect_skill_stats
+    )
     if collect_skill_annotations:
         reset_skill_annotator(env)
 
@@ -422,6 +471,10 @@ def rollout(
     # Resize the depth image
     resize_depth(obs, "depth_image1")
     resize_crop_depth(obs, "depth_image2")
+    if annotate_guidance_point:
+        _draw_guidance_points_for_all_envs(
+            obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
+        )
     _attach_skill_tensor_to_obs(obs, actor, initial_skills)
 
     if resize_video:
@@ -430,7 +483,7 @@ def rollout(
         resize_depth(video_obs, "depth_image1")
         resize_crop_depth(video_obs, "depth_image2")
 
-    if annotate_skill:
+    if annotate_skill or annotate_guidance_point:
         _draw_guidance_points_for_all_envs(
             video_obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
         )
@@ -547,6 +600,10 @@ def rollout(
         resize_crop_image(obs, "color_image2")
         resize_depth(obs, "depth_image1")
         resize_crop_depth(obs, "depth_image2")
+        if annotate_guidance_point:
+            _draw_guidance_points_for_all_envs(
+                obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
+            )
         _attach_skill_tensor_to_obs(obs, actor, current_skills)
 
         # Save observations for the policy
@@ -556,7 +613,7 @@ def rollout(
             resize_depth(video_obs, "depth_image1")
             resize_crop_depth(video_obs, "depth_image2")
 
-        if annotate_skill:
+        if annotate_skill or annotate_guidance_point:
             _draw_guidance_points_for_all_envs(
                 video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
             )
@@ -692,6 +749,7 @@ def calculate_success_rate(
     record_first_state_only: bool = False,
     pc_generator = None,
     annotate_skill: bool = False,
+    annotate_guidance_point: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -750,6 +808,7 @@ def calculate_success_rate(
             save_rollouts=save_rollouts,
             pc_generator=pc_generator,
             annotate_skill=annotate_skill,
+            annotate_guidance_point=annotate_guidance_point,
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
@@ -990,6 +1049,7 @@ def do_rollout_evaluation(
 
     actor.set_task(task2idx[rollout_task])
     provide_skill_input = model_requires_skill_input(config)
+    annotate_guidance_point = model_uses_guidance_point(config)
 
     rollout_stats = calculate_success_rate(
         env,
@@ -1001,6 +1061,7 @@ def do_rollout_evaluation(
         rollout_save_dir=rollout_save_dir,
         save_rollouts_to_wandb=save_rollouts_to_wandb,
         save_failures=config.rollout.save_failures,
+        annotate_guidance_point=annotate_guidance_point,
         provide_skill_input=provide_skill_input,
         collect_skill_stats=True,
     )

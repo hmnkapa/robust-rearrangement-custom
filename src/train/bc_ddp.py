@@ -29,11 +29,16 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 from src.behavior import get_actor
-from src.behavior.base import Actor
+from src.behavior.base import (
+    Actor,
+    model_requires_skill_input,
+    model_uses_guidance_point,
+)
 from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
+from src.common.skills import SKILL_ORDER
 from src.dataset.base import DatasetShardSpec
 from src.dataset.dataloader import (
     AsyncDevicePrefetchLoader,
@@ -464,6 +469,38 @@ def sort_data_paths(data_paths: List[Path]) -> List[Path]:
     return sorted(data_paths, key=lambda path: str(path))
 
 
+def configure_observation_annotation_flags(cfg: DictConfig):
+    annotate_guidance_point = model_uses_guidance_point(cfg)
+    annotate_skill_one_hot = model_requires_skill_input(cfg)
+
+    OmegaConf.set_struct(cfg, False)
+    cfg.data.annotate_guidance_point = annotate_guidance_point
+    cfg.data.annotate_skill_one_hot = annotate_skill_one_hot
+    cfg.skill_dim = len(SKILL_ORDER) if annotate_skill_one_hot else 0
+    OmegaConf.set_struct(cfg, True)
+
+
+def validate_guidance_point_dataset(cfg: DictConfig, dataset):
+    if not model_uses_guidance_point(cfg):
+        return
+
+    if cfg.observation_type not in {"image", "rgbd"}:
+        raise ValueError(
+            "data.annotate_guidance_point is only supported for image/rgbd observations."
+        )
+
+    if int(getattr(dataset, "skill_dim", 0)) <= 0 or getattr(dataset, "skills", None) is None:
+        raise ValueError(
+            "data.annotate_guidance_point=true requires dataset skill annotations to be loaded."
+        )
+
+    if not bool(getattr(dataset, "has_nonzero_skill", False)):
+        raise ValueError(
+            "data.annotate_guidance_point=true requires at least one non-zero skill annotation "
+            "in the dataset."
+        )
+
+
 def is_relative_control_mode(control_mode) -> bool:
     if control_mode == "relative":
         return True
@@ -497,18 +534,24 @@ def build_dataset_for_observation_type(
         data_path,
         cfg.observation_type,
     )
+    include_skill_input = model_requires_skill_input(cfg)
+    load_skill_metadata = model_uses_guidance_point(cfg)
 
     if cfg.observation_type == "image":
         return ImageDataset(
             **common_kwargs,
             minority_class_power=cfg.data.get("minority_class_power", False),
             load_into_memory=load_into_memory,
+            include_skill_input=include_skill_input,
+            load_skill_metadata=load_skill_metadata,
         )
     if cfg.observation_type == "rgbd":
         return RGBDDataset(
             **common_kwargs,
             minority_class_power=cfg.data.get("minority_class_power", False),
             load_into_memory=load_into_memory,
+            include_skill_input=include_skill_input,
+            load_skill_metadata=load_skill_metadata,
         )
     if cfg.observation_type == "state":
         return StateDataset(
@@ -525,8 +568,9 @@ def get_normalizer_stats_key_map(cfg: DictConfig) -> Dict[str, str]:
         stats_key_map = {
             "robot_state": "robot_state",
             "action": f"action/{image_action_mode}",
-            "skill": "skill",
         }
+        if model_requires_skill_input(cfg):
+            stats_key_map["skill"] = "skill"
         if is_relative_control_mode(control_mode):
             stats_key_map["__action_delta__"] = "action/delta"
         return stats_key_map
@@ -1123,10 +1167,12 @@ def main(cfg: DictConfig):
     try:
         set_dryrun_params(cfg)
         OmegaConf.resolve(cfg)
+        configure_observation_annotation_flags(cfg)
 
         resume_payload = resolve_resume_payload(cfg, main_process)
         cfg = OmegaConf.create(resume_payload["cfg_container"])
         OmegaConf.resolve(cfg)
+        configure_observation_annotation_flags(cfg)
         enabled_checkpoint_types = get_enabled_checkpoint_types(cfg)
         checkpoint_archive_interval_raw = cfg.training.get("save_per_epoch", -1)
         checkpoint_archive_interval = (
@@ -1311,6 +1357,7 @@ def main(cfg: DictConfig):
             )
             train_dataset_duration = perf_counter() - train_dataset_start_perf
             dataset = train_dataset
+            validate_guidance_point_dataset(cfg, train_dataset)
 
             if main_process:
                 val_dataset_start_perf = perf_counter()
@@ -1430,6 +1477,7 @@ def main(cfg: DictConfig):
             }
         else:
             dataset = build_dataset_for_observation_type(cfg, data_path)
+            validate_guidance_point_dataset(cfg, dataset)
 
             train_size = int(len(dataset) * (1 - cfg.data.test_split))
             test_size = len(dataset) - train_size
@@ -1497,8 +1545,7 @@ def main(cfg: DictConfig):
         OmegaConf.set_struct(cfg, False)
         cfg.robot_state_dim = dataset.robot_state_dim
         cfg.action_dim = dataset.action_dim
-        if hasattr(dataset, "skill_dim"):
-            cfg.skill_dim = dataset.skill_dim
+        cfg.skill_dim = len(SKILL_ORDER) if model_requires_skill_input(cfg) else 0
         if cfg.observation_type == "state":
             cfg.parts_poses_dim = dataset.parts_poses_dim
         OmegaConf.set_struct(cfg, True)

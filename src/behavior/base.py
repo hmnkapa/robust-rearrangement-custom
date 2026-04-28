@@ -14,6 +14,7 @@ from src.models import get_encoder
 from ipdb import set_trace as bp  # noqa
 from src.common.geometry import proprioceptive_quat_to_6d_rotation
 from src.common.vision import FrontCameraTransform, WristCameraTransform
+from src.common.skills import SKILL_ORDER
 
 import src.common.geometry as C
 
@@ -22,9 +23,41 @@ def actor_name_from_config(cfg: DictConfig) -> str:
     return cfg.actor_name if "actor_name" in cfg else cfg.actor.name
 
 
+def _config_data_flag(cfg: DictConfig, flag_name: str) -> Optional[bool]:
+    data_cfg = cfg.get("data", None)
+    if data_cfg is None:
+        return None
+
+    flag_value = data_cfg.get(flag_name, None)
+    if flag_value is None:
+        return None
+
+    return bool(flag_value)
+
+
+def model_uses_guidance_point(cfg: DictConfig) -> bool:
+    guidance_flag = _config_data_flag(cfg, "annotate_guidance_point")
+    return False if guidance_flag is None else guidance_flag
+
+
 def model_requires_skill_input(cfg: DictConfig) -> bool:
+    skill_flag = _config_data_flag(cfg, "annotate_skill_one_hot")
+    if skill_flag is not None:
+        return skill_flag
+
     skill_dim = cfg.get("skill_dim", None)
     return skill_dim is not None and int(skill_dim) > 0
+
+
+def model_skill_dim(cfg: DictConfig) -> int:
+    if not model_requires_skill_input(cfg):
+        return 0
+
+    skill_dim = cfg.get("skill_dim", None)
+    if skill_dim is None:
+        return len(SKILL_ORDER)
+
+    return int(skill_dim)
 
 
 # Update the PostInitCaller to be compatible
@@ -93,9 +126,7 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         self.observation_type = cfg.observation_type
         self.requires_skill_input = model_requires_skill_input(cfg)
-        self.skill_dim = (
-            int(getattr(cfg, "skill_dim", 0)) if self.requires_skill_input else None
-        )
+        self.skill_dim = model_skill_dim(cfg) if self.requires_skill_input else None
 
         # Define what parts of the robot state to use
         self.include_proprioceptive_pos = actor_cfg.get(

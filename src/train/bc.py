@@ -22,11 +22,12 @@ from torch.utils.data import random_split
 from tqdm import tqdm, trange
 
 from src.behavior import get_actor
-from src.behavior.base import Actor
+from src.behavior.base import Actor, model_requires_skill_input, model_uses_guidance_point
 from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
 from src.common.hydra import to_native
 from src.common.pytorch_util import dict_to_device
+from src.common.skills import SKILL_ORDER
 from src.dataset.dataloader import AsyncDevicePrefetchLoader, build_dataloader
 from src.dataset.dataset import ImageDataset, StateDataset, RGBDDataset
 from src.dataset.storage import resolve_load_into_memory
@@ -131,6 +132,38 @@ def set_dryrun_params(cfg: DictConfig):
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def configure_observation_annotation_flags(cfg: DictConfig):
+    annotate_guidance_point = model_uses_guidance_point(cfg)
+    annotate_skill_one_hot = model_requires_skill_input(cfg)
+
+    OmegaConf.set_struct(cfg, False)
+    cfg.data.annotate_guidance_point = annotate_guidance_point
+    cfg.data.annotate_skill_one_hot = annotate_skill_one_hot
+    cfg.skill_dim = len(SKILL_ORDER) if annotate_skill_one_hot else 0
+    OmegaConf.set_struct(cfg, True)
+
+
+def validate_guidance_point_dataset(cfg: DictConfig, dataset):
+    if not model_uses_guidance_point(cfg):
+        return
+
+    if cfg.observation_type not in {"image", "rgbd"}:
+        raise ValueError(
+            "data.annotate_guidance_point is only supported for image/rgbd observations."
+        )
+
+    if int(getattr(dataset, "skill_dim", 0)) <= 0 or getattr(dataset, "skills", None) is None:
+        raise ValueError(
+            "data.annotate_guidance_point=true requires dataset skill annotations to be loaded."
+        )
+
+    if not bool(getattr(dataset, "has_nonzero_skill", False)):
+        raise ValueError(
+            "data.annotate_guidance_point=true requires at least one non-zero skill annotation "
+            "in the dataset."
+        )
 
 
 def emit_timing_metrics(timing_metrics):
@@ -511,6 +544,7 @@ def resolve_resume_state(
 def main(cfg: DictConfig):
     set_dryrun_params(cfg)
     OmegaConf.resolve(cfg)
+    configure_observation_annotation_flags(cfg)
     job_start_perf = perf_counter()
 
     # Set the random seed
@@ -534,6 +568,7 @@ def main(cfg: DictConfig):
 
     if is_resuming:
         cfg = resumed_cfg
+        configure_observation_annotation_flags(cfg)
         print(resume_message)
 
         best_test_loss = state_dict.get("best_test_loss", float("inf"))
@@ -572,6 +607,8 @@ def main(cfg: DictConfig):
         data_path,
         cfg.observation_type,
     )
+    include_skill_input = model_requires_skill_input(cfg)
+    load_skill_metadata = model_uses_guidance_point(cfg)
 
     if cfg.observation_type == "image":
         dataset = ImageDataset(
@@ -586,6 +623,8 @@ def main(cfg: DictConfig):
             max_episode_count=cfg.data.get("max_episode_count", None),
             minority_class_power=cfg.data.get("minority_class_power", False),
             load_into_memory=load_into_memory,
+            include_skill_input=include_skill_input,
+            load_skill_metadata=load_skill_metadata,
         )
     elif cfg.observation_type == "rgbd":
         dataset = RGBDDataset(
@@ -600,6 +639,8 @@ def main(cfg: DictConfig):
             max_episode_count=cfg.data.get("max_episode_count", None),
             minority_class_power=cfg.data.get("minority_class_power", False),
             load_into_memory=load_into_memory,
+            include_skill_input=include_skill_input,
+            load_skill_metadata=load_skill_metadata,
         )
     elif cfg.observation_type == "state":
         dataset = StateDataset(
@@ -617,6 +658,8 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(f"Unknown observation type: {cfg.observation_type}")
 
+    validate_guidance_point_dataset(cfg, dataset)
+
     # Split the dataset into train and test (effective, meaning that this is after upsampling)
     train_size = int(len(dataset) * (1 - cfg.data.test_split))
     test_size = len(dataset) - train_size
@@ -629,8 +672,7 @@ def main(cfg: DictConfig):
 
     cfg.robot_state_dim = dataset.robot_state_dim
     cfg.action_dim = dataset.action_dim
-    if hasattr(dataset, "skill_dim"):
-        cfg.skill_dim = dataset.skill_dim
+    cfg.skill_dim = len(SKILL_ORDER) if include_skill_input else 0
 
     if cfg.observation_type == "state":
         cfg.parts_poses_dim = dataset.parts_poses_dim
