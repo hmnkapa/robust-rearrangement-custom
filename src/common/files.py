@@ -1,7 +1,8 @@
 import os
+import re
+from glob import glob
 from pathlib import Path
 from typing import Union, List
-from glob import glob
 from ipdb import set_trace as bp
 
 from src.common.types import (
@@ -71,6 +72,40 @@ def get_processed_path(
     return path
 
 
+def lmdb_shard_path(base_path: Path, shard_index: int) -> Path:
+    if shard_index < 1:
+        raise ValueError(f"LMDB shard indices start at 1, got {shard_index}.")
+    return base_path.with_name(f"{base_path.stem}-{shard_index}{base_path.suffix}")
+
+
+def lmdb_shard_sort_key(path: Path):
+    match = re.match(r"^(?P<stem>.*)-(?P<index>\d+)\.lmdb$", path.name)
+    if match:
+        return (match.group("stem"), 1, int(match.group("index")), path.name)
+    return (path.stem, 0, 0, path.name)
+
+
+def expand_lmdb_shard_paths(base_path: Path) -> List[Path]:
+    base_path = Path(base_path)
+    paths = []
+    if base_path.exists():
+        paths.append(base_path)
+
+    pattern = re.compile(
+        rf"^{re.escape(base_path.stem)}-(\d+){re.escape(base_path.suffix)}$"
+    )
+    if base_path.parent.exists():
+        for candidate in base_path.parent.glob(f"{base_path.stem}-*{base_path.suffix}"):
+            if pattern.match(candidate.name) and candidate.exists():
+                paths.append(candidate)
+
+    return sorted(set(paths), key=lmdb_shard_sort_key)
+
+
+def has_glob_magic(path: Path) -> bool:
+    return any(char in str(path) for char in "*?[")
+
+
 def get_processed_paths(
     controller: Union[List[Controllers], Controllers, None] = None,
     domain: Union[List[Domains], Domains, None] = "sim",
@@ -102,8 +137,9 @@ def get_processed_paths(
             suffix=suffix,
             dataset_format=dataset_format,
         )
-        if merged_path.exists():
-            return [merged_path]
+        merged_paths = expand_lmdb_shard_paths(merged_path)
+        if merged_paths:
+            return merged_paths
 
     paths = [path]
 
@@ -135,6 +171,17 @@ def get_processed_paths(
 
     # Add the extension pattern to all paths
     paths = [path.with_suffix(f".{dataset_format}") for path in paths]
+
+    if dataset_format == "lmdb":
+        lmdb_paths = []
+        for path in paths:
+            if has_glob_magic(path):
+                lmdb_paths.extend(
+                    Path(match) for match in glob(str(path), recursive=True)
+                )
+            else:
+                lmdb_paths.extend(expand_lmdb_shard_paths(path))
+        return sorted(set(lmdb_paths), key=lmdb_shard_sort_key)
 
     # Use glob to find all the zarr paths
     paths = [Path(path) for p in paths for path in glob(str(p), recursive=True)]

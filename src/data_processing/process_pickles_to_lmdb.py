@@ -1,14 +1,21 @@
 import argparse
 import os
 import random
+import re
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
-from src.common.files import get_processed_path, get_raw_paths
+from src.common.files import (
+    expand_lmdb_shard_paths,
+    get_processed_path,
+    get_raw_paths,
+    lmdb_shard_path,
+)
 from src.data_processing.process_pickles import (
     NORMALIZER_STATS_KEYS,
     TIMESERIES_KEYS,
@@ -29,6 +36,8 @@ from src.dataset.lmdb import (
     pack_frame,
     pack_named_arrays,
     require_lmdb,
+    read_lmdb_episode_index,
+    read_lmdb_meta,
 )
 from src.visualization.render_mp4 import unpickle_data
 
@@ -138,6 +147,196 @@ def parse_task_episode_limits(entries: List[str]) -> Dict[str, int]:
     return limits
 
 
+def parse_datetime_from_pickle_name(path: Path) -> Optional[datetime]:
+    name = path.name
+    patterns = (
+        (
+            r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d+)?",
+            ("%Y-%m-%dT%H-%M-%S.%f", "%Y-%m-%dT%H-%M-%S"),
+        ),
+        (
+            r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:\.\d+)?",
+            ("%Y-%m-%d_%H-%M-%S.%f", "%Y-%m-%d_%H-%M-%S"),
+        ),
+        (
+            r"\d{8}_\d{6}(?:\.\d+)?",
+            ("%Y%m%d_%H%M%S.%f", "%Y%m%d_%H%M%S"),
+        ),
+    )
+    for pattern, formats in patterns:
+        for match in re.findall(pattern, name):
+            for time_format in formats:
+                try:
+                    return datetime.strptime(match, time_format)
+                except ValueError:
+                    continue
+    return None
+
+
+def pickle_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def newest_pickle_sort_key(path: Path):
+    parsed_time = parse_datetime_from_pickle_name(path)
+    timestamp = (
+        parsed_time.timestamp() if parsed_time is not None else pickle_mtime(path)
+    )
+    return (-timestamp, str(path))
+
+
+def order_pickle_paths(
+    paths: List[Path],
+    randomize_order: bool,
+    rng: random.Random,
+) -> List[Path]:
+    paths = list(paths)
+    if randomize_order:
+        rng.shuffle(paths)
+        return paths
+    return sorted(paths, key=newest_pickle_sort_key)
+
+
+def pickle_identity(path: Path) -> str:
+    path = Path(path).expanduser()
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        resolved_path = path.absolute()
+
+    for candidate in (resolved_path, path):
+        parts = candidate.parts
+        if "raw" in parts:
+            return "/".join(parts[parts.index("raw") + 1 :])
+    return str(resolved_path)
+
+
+def absolute_pickle_path(path: Path) -> str:
+    path = Path(path).expanduser()
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
+def unnumbered_lmdb_base_path(path: Path) -> Path:
+    match = re.match(r"^(?P<stem>.*)-\d+$", path.stem)
+    if match:
+        return path.with_name(f"{match.group('stem')}{path.suffix}")
+    return path
+
+
+def next_lmdb_shard_path(base_path: Path) -> Path:
+    shard_index = 1
+    while True:
+        candidate = lmdb_shard_path(base_path, shard_index)
+        if not candidate.exists():
+            return candidate
+        shard_index += 1
+
+
+def infer_shard_index(base_path: Path, output_path: Path) -> Optional[int]:
+    match = re.match(
+        rf"^{re.escape(base_path.stem)}-(\d+){re.escape(base_path.suffix)}$",
+        output_path.name,
+    )
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def resolve_output_path(
+    base_path: Path,
+    overwrite: bool,
+    explicit_output_dir: bool,
+) -> Path:
+    if explicit_output_dir:
+        return base_path
+    if overwrite:
+        return lmdb_shard_path(base_path, 1)
+    return next_lmdb_shard_path(base_path)
+
+
+def string_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, bytes):
+        return [value.decode("utf-8")]
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [
+            item.decode("utf-8") if isinstance(item, bytes) else str(item)
+            for item in value
+        ]
+    return [str(value)]
+
+
+def read_used_pickle_files(path: Path) -> List[str]:
+    used_pickle_files = []
+    try:
+        meta = read_lmdb_meta(path)
+        attrs = meta.get("attrs", {})
+        used_pickle_files.extend(string_list(attrs.get("pickle_files")))
+        used_pickle_files.extend(string_list(attrs.get("selected_pickle_files")))
+        used_pickle_files.extend(string_list(attrs.get("pickle_paths")))
+        used_pickle_files.extend(string_list(attrs.get("selected_pickle_paths")))
+    except Exception as exc:
+        print(f"[WARNING] Could not read LMDB metadata from {path}: {exc}")
+
+    try:
+        episode_index = read_lmdb_episode_index(path)
+        used_pickle_files.extend(
+            str(episode_meta["pickle_file"])
+            for episode_meta in episode_index
+            if "pickle_file" in episode_meta
+        )
+    except Exception as exc:
+        print(f"[WARNING] Could not read LMDB episode index from {path}: {exc}")
+
+    return used_pickle_files
+
+
+def confirm_no_duplicate_pickles(
+    selected_pickle_files: List[str],
+    selected_pickle_paths: List[str],
+    existing_lmdb_paths: List[Path],
+):
+    if not existing_lmdb_paths:
+        return
+
+    selected = set(selected_pickle_files) | set(selected_pickle_paths)
+    duplicates_by_lmdb = {}
+    for lmdb_path in existing_lmdb_paths:
+        used = set(read_used_pickle_files(lmdb_path))
+        overlap = sorted(selected & used)
+        if overlap:
+            duplicates_by_lmdb[lmdb_path] = overlap
+
+    if not duplicates_by_lmdb:
+        return
+
+    print("[WARNING] Some selected pickle files already appear in existing LMDB shards:")
+    for lmdb_path, overlaps in duplicates_by_lmdb.items():
+        print(f"[WARNING]   {lmdb_path}")
+        for pickle_file in overlaps[:20]:
+            print(f"[WARNING]     {pickle_file}")
+        if len(overlaps) > 20:
+            print(f"[WARNING]     ... and {len(overlaps) - 20} more")
+
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Duplicate pickle files were detected and stdin is not interactive; aborting."
+        )
+
+    answer = input("Continue and write a shard with duplicate pickle files? [y/N] ")
+    if answer.strip().lower() != "y":
+        raise RuntimeError("Aborted because selected pickle files were already used.")
+
+
 def log_first_pickle_shape(pickle_paths: List[Path]):
     total_files = len(pickle_paths)
     if total_files == 0:
@@ -165,6 +364,8 @@ def log_first_pickle_shape(pickle_paths: List[Path]):
 
 
 def gather_pickle_paths(args, task_episode_limits: Dict[str, int]) -> List[Path]:
+    rng = random.Random(args.random_seed)
+
     if args.input_dir is not None:
         if task_episode_limits:
             raise ValueError(
@@ -173,16 +374,19 @@ def gather_pickle_paths(args, task_episode_limits: Dict[str, int]) -> List[Path]
         input_dir = Path(args.input_dir).expanduser().resolve()
         if not input_dir.exists():
             raise ValueError(f"Input directory does not exist: {input_dir}")
-        pickle_paths = sorted(input_dir.rglob("*.pkl*"))
+        pickle_paths = order_pickle_paths(
+            list(input_dir.rglob("*.pkl*")),
+            randomize_order=args.randomize_order,
+            rng=rng,
+        )
         print(f"Using explicit input directory: {input_dir}")
         return pickle_paths
 
     tasks = args.task if isinstance(args.task, list) else [args.task]
     selected_paths = []
-    rng = random.Random(args.random_seed)
 
     for task in tasks:
-        task_paths = sorted(
+        task_paths = order_pickle_paths(
             get_raw_paths(
                 controller=args.controller,
                 domain=args.domain,
@@ -191,11 +395,10 @@ def gather_pickle_paths(args, task_episode_limits: Dict[str, int]) -> List[Path]
                 randomness=args.randomness,
                 demo_outcome=args.demo_outcome,
                 suffix=args.suffix,
-            )
+            ),
+            randomize_order=args.randomize_order,
+            rng=rng,
         )
-
-        if args.randomize_order:
-            rng.shuffle(task_paths)
 
         task_limit = task_episode_limits.get(task)
         if task_limit is not None:
@@ -206,6 +409,12 @@ def gather_pickle_paths(args, task_episode_limits: Dict[str, int]) -> List[Path]
 
     if args.randomize_order:
         rng.shuffle(selected_paths)
+    else:
+        selected_paths = order_pickle_paths(
+            selected_paths,
+            randomize_order=False,
+            rng=rng,
+        )
 
     return selected_paths
 
@@ -306,7 +515,12 @@ def main():
     parser.add_argument("--suffix", type=str, default=None)
     parser.add_argument("--output-suffix", type=str, default=None)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--num-pickles",
+        type=int,
+        default=None,
+        help="Maximum number of newest pickle files to process in this shard.",
+    )
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--randomize-order", action="store_true")
     parser.add_argument("--random-seed", type=int, default=0)
@@ -345,23 +559,35 @@ def main():
     args = parser.parse_args()
 
     assert not args.randomize_order or args.offset == 0, "Cannot offset with randomize"
+    if args.offset < 0:
+        raise ValueError(f"--offset must be non-negative, got {args.offset}.")
+    if args.num_pickles is not None and args.num_pickles <= 0:
+        raise ValueError(f"--num-pickles must be positive, got {args.num_pickles}.")
 
     task_episode_limits = parse_task_episode_limits(args.task_episode_limit)
     pickle_paths = gather_pickle_paths(args, task_episode_limits)
     log_first_pickle_shape(pickle_paths)
 
     start = args.offset
-    end = args.offset + args.max_files if args.max_files is not None else len(pickle_paths)
+    end = (
+        args.offset + args.num_pickles
+        if args.num_pickles is not None
+        else len(pickle_paths)
+    )
     pickle_paths = pickle_paths[start:end]
     print(f"Found {len(pickle_paths)} pickle files after filtering")
     if len(pickle_paths) == 0:
         raise ValueError("No pickle files selected; refusing to create an empty LMDB dataset.")
 
+    selected_pickle_files = [pickle_identity(path) for path in pickle_paths]
+    selected_pickle_paths = [absolute_pickle_path(path) for path in pickle_paths]
+
+    explicit_output_dir = args.output_dir is not None
     if args.output_dir is not None:
-        output_path = Path(args.output_dir).expanduser().resolve()
-        print(f"Using explicit output path: {output_path}")
+        base_output_path = Path(args.output_dir).expanduser().resolve()
+        print(f"Using explicit output path: {base_output_path}")
     else:
-        output_path = get_processed_path(
+        base_output_path = get_processed_path(
             controller=args.controller,
             domain=args.domain,
             task=args.task,
@@ -372,12 +598,30 @@ def main():
             dataset_format="lmdb",
         )
 
-    print(f"Output path: {output_path}")
+    duplicate_scan_base = unnumbered_lmdb_base_path(base_output_path)
+    existing_lmdb_paths = expand_lmdb_shard_paths(duplicate_scan_base)
+    output_path = resolve_output_path(
+        base_output_path,
+        overwrite=args.overwrite,
+        explicit_output_dir=explicit_output_dir,
+    )
+    shard_index = infer_shard_index(duplicate_scan_base, output_path)
+
+    print(f"Base output path: {base_output_path}")
+    print(f"Resolved output path: {output_path}")
     if output_path.exists():
         if not args.overwrite:
             raise ValueError(
                 f"Output path already exists: {output_path}. Use --overwrite to overwrite."
             )
+
+    confirm_no_duplicate_pickles(
+        selected_pickle_files=selected_pickle_files,
+        selected_pickle_paths=selected_pickle_paths,
+        existing_lmdb_paths=existing_lmdb_paths,
+    )
+
+    if output_path.exists():
         ensure_removed_output_path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -509,10 +753,20 @@ def main():
         "rotation_mode": "rot_6d",
         "n_episodes": global_episode_idx,
         "n_timesteps": global_frame_idx,
-        "mean_episode_length": round(global_frame_idx / global_episode_idx) if global_episode_idx else 0,
+        "mean_episode_length": (
+            round(global_frame_idx / global_episode_idx) if global_episode_idx else 0
+        ),
         "calculated_pos_action_from_delta": True,
         "randomize_order": args.randomize_order,
         "random_seed": args.random_seed,
+        "pickle_order": "random" if args.randomize_order else "newest",
+        "offset": args.offset,
+        "num_pickles": args.num_pickles,
+        "selected_pickle_count": len(pickle_paths),
+        "pickle_files": selected_pickle_files,
+        "pickle_paths": selected_pickle_paths,
+        "shard_index": shard_index,
+        "shard_path": str(output_path),
         "demo_source": args.source,
         "controller": args.controller,
         "domain": args.domain if args.domain == "real" else "sim",
@@ -522,6 +776,7 @@ def main():
         "randomness": args.randomness,
         "demo_outcome": args.demo_outcome,
         "suffix": args.suffix,
+        "output_suffix": args.output_suffix,
         "storage_format": "lmdb",
         "normalizer_stats": serialized_normalizer_stats,
         "normalizer_stats_keys": list(NORMALIZER_STATS_KEYS),
