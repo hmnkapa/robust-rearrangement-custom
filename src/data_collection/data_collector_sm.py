@@ -1,11 +1,18 @@
 """Define data collection class that rollout the environment, get action from the interface (e.g., teleoperation, automatic scripts), and save data."""
 
 import json
+import os
+import pickle
+import select
+import struct
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Union, List, Dict
 
+import cv2
 from furniture_bench.envs.furniture_sim_env import FurnitureSimEnv
 from furniture_bench.envs.furniture_rl_sim_env import FurnitureRLSimEnv
 from furniture_bench.envs.observation import FULL_OBS
@@ -54,6 +61,9 @@ class DataCollectorSpaceMouse:
     `pkl` files have resized images while `mp4` / `png` files save raw camera inputs.
     """
 
+    DEFAULT_SM_POS_SPEED = 0.54
+    DEFAULT_SM_ROT_SPEED = 2.8
+
     env: FurnitureSimEnv
 
     def __init__(
@@ -76,6 +86,10 @@ class DataCollectorSpaceMouse:
         compress_pickles: bool = False,
         resume_trajectory_paths: Union[List[str], None] = None,
         sample_perturbations: bool = False,
+        sm_pos_speed: float = None,
+        sm_rot_speed: float = None,
+        teleop_setting: int = 1,
+        show_teleop_cameras: bool = False,
     ):
         """
         Args:
@@ -92,16 +106,29 @@ class DataCollectorSpaceMouse:
             ctrl_mode (str): 'osc' (joint torque, with operation space control) or 'diffik' (joint impedance, with differential inverse kinematics control)
             ee_laser (bool): If True, show a line coming from the end-effector in the viewer
             right_multiply_rot (bool): If True, convert rotation actions (delta rot) assuming they're applied as RIGHT multiplys (local rotations)
+            sm_pos_speed (float): SpaceMouse max translational speed in meters per second. Default matches the old src 0.3 speed with 1.8x scalar.
+            sm_rot_speed (float): SpaceMouse max rotational speed in radians per second. Default matches the old src 0.7 speed with 4x scalar.
+            teleop_setting (int): 1 matches existing src world-frame position/rotation control. 2 matches furniture-bench end-effector-frame control.
+            show_teleop_cameras (bool): If True, show an OpenCV preview window for teleoperation cameras.
         """
         assert ctrl_mode == "diffik", "Highly suspicious that this is not 'diffik'"
+
+        self.teleop_preview_stdin = None
+        self.teleop_preview_stdout = None
+        self.teleop_preview_process = None
+        self.teleop_preview_frame_count = 0
 
         if not draw_marker:
             turn_off_april_tags()
 
         print("[NB] Creating 4 envs for debugging purposes")
+        obs_keys = list(FULL_OBS)
+        for depth_key in ("depth_image1", "depth_image2"):
+            if depth_key not in obs_keys:
+                obs_keys.append(depth_key)
         self.env = FurnitureRLSimEnv(
             furniture=furniture,
-            obs_keys=FULL_OBS,
+            obs_keys=obs_keys,
             headless=False,
             max_env_steps=3_000,  # Arbitrary number
             num_envs=1,
@@ -132,6 +159,37 @@ class DataCollectorSpaceMouse:
         self.compress_pickles = compress_pickles
         self.resume_trajectory_paths = resume_trajectory_paths
         self.sample_perturbations = sample_perturbations
+        if sm_pos_speed is not None and sm_pos_speed <= 0:
+            raise ValueError("sm_pos_speed must be positive.")
+        if sm_rot_speed is not None and sm_rot_speed <= 0:
+            raise ValueError("sm_rot_speed must be positive.")
+        if teleop_setting not in (1, 2):
+            raise ValueError("teleop_setting must be 1 or 2.")
+        self.sm_pos_speed = (
+            self.DEFAULT_SM_POS_SPEED if sm_pos_speed is None else sm_pos_speed
+        )
+        self.sm_rot_speed = (
+            self.DEFAULT_SM_ROT_SPEED if sm_rot_speed is None else sm_rot_speed
+        )
+        self.teleop_setting = teleop_setting
+        if teleop_setting == 1:
+            self.sm_pos_frame = "world"
+            self.sm_rot_frame = "world"
+            self.ee_rot_sign = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        else:
+            self.sm_pos_frame = "ee"
+            self.sm_rot_frame = "ee"
+            self.ee_rot_sign = np.array([1.0, -1.0, -1.0], dtype=np.float32)
+        self.show_teleop_cameras = show_teleop_cameras
+        self.teleop_camera_keys = ("color_image2", "color_image1")
+        self.teleop_camera_labels = (
+            "Fixed camera (color_image2)",
+            "Wrist camera (color_image1)",
+        )
+        self.teleop_display_scale = 4.0
+        self.teleop_window_name = "Teleop Camera View"
+        self.teleop_window_scale = 0.3
+        self.teleop_window_pos = (0, 0)
 
         self.iter_idx = 0
 
@@ -170,6 +228,11 @@ class DataCollectorSpaceMouse:
             "start_delay": self.start_delay,
             "right_multiply_rot": self.right_multiply_rot,
             "sample_perturbations": self.sample_perturbations,
+            "max_pos_speed": self.sm_pos_speed,
+            "max_rot_speed": self.sm_rot_speed,
+            "teleop_setting": self.teleop_setting,
+            "sm_pos_frame": self.sm_pos_frame,
+            "sm_rot_frame": self.sm_rot_frame,
         }
 
     def _squeeze_and_numpy(
@@ -201,6 +264,187 @@ class DataCollectorSpaceMouse:
 
         return d
 
+    def _camera_image_to_rgb(self, img):
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+        img = np.asarray(img).squeeze()
+        if img.ndim != 3:
+            return None
+        if img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)
+        if img.shape[-1] == 4:
+            img = img[..., :3]
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    def _start_teleop_camera_preview(self):
+        if self.teleop_preview_process is not None:
+            return
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        self.teleop_preview_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "src.data_collection.teleop_camera_preview",
+                "--window-name",
+                self.teleop_window_name,
+                "--window-scale",
+                str(self.teleop_window_scale),
+                "--window-x",
+                str(self.teleop_window_pos[0]),
+                "--window-y",
+                str(self.teleop_window_pos[1]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self.teleop_preview_stdin = self.teleop_preview_process.stdin
+        self.teleop_preview_stdout = self.teleop_preview_process.stdout
+        self.teleop_preview_frame_count = 0
+
+    def _stop_teleop_camera_preview(self):
+        if self.teleop_preview_stdin is not None:
+            try:
+                self.teleop_preview_stdin.write(struct.pack("!I", 0))
+                self.teleop_preview_stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.teleop_preview_stdin.close()
+            except Exception:
+                pass
+        if self.teleop_preview_process is not None:
+            try:
+                self.teleop_preview_process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.teleop_preview_process.kill()
+                self.teleop_preview_process.wait(timeout=1.0)
+        self.teleop_preview_stdin = None
+        self.teleop_preview_stdout = None
+        self.teleop_preview_process = None
+        self.teleop_preview_frame_count = 0
+
+    def _show_teleop_cameras(self, obs):
+        if not self.show_teleop_cameras:
+            return
+
+        frames = []
+        for key, label in zip(self.teleop_camera_keys, self.teleop_camera_labels):
+            if key not in obs:
+                continue
+            img = self._camera_image_to_rgb(obs[key])
+            if img is None:
+                continue
+            img = img.copy()
+            cv2.putText(
+                img,
+                label,
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            frames.append(img)
+
+        if not frames:
+            return
+
+        min_h = min(frame.shape[0] for frame in frames)
+        display_h = int(min_h * self.teleop_display_scale)
+        frames = [
+            cv2.resize(
+                frame,
+                (int(frame.shape[1] * display_h / frame.shape[0]), display_h),
+            )
+            for frame in frames
+        ]
+        img = np.hstack(frames)
+
+        if self.teleop_preview_process is None:
+            self._start_teleop_camera_preview()
+
+        try:
+            payload = pickle.dumps(img, protocol=pickle.HIGHEST_PROTOCOL)
+            self.teleop_preview_stdin.write(struct.pack("!I", len(payload)))
+            self.teleop_preview_stdin.write(payload)
+            self.teleop_preview_stdin.flush()
+        except Exception as exc:
+            self.verbose_print(
+                f"[data collection] Failed to send teleop camera frame, disabling preview: {exc}"
+            )
+            self.show_teleop_cameras = False
+            self._stop_teleop_camera_preview()
+            return
+
+        if self.teleop_preview_stdout is None:
+            return
+
+        ack_timeout = 4.0 if self.teleop_preview_frame_count == 0 else 1.0
+        deadline = time.monotonic() + ack_timeout
+        ack = None
+        while time.monotonic() < deadline:
+            timeout = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select([self.teleop_preview_stdout], [], [], timeout)
+            if not ready:
+                break
+
+            line = self.teleop_preview_stdout.readline()
+            if not line:
+                break
+            message = line.decode("utf-8", errors="replace").strip()
+            if message == "ok":
+                ack = "ok"
+                break
+            if message.startswith("error:"):
+                ack = message
+                break
+
+        if ack != "ok":
+            if ack is None:
+                self.verbose_print(
+                    "[data collection] Teleop camera preview did not respond, disabling it."
+                )
+            else:
+                self.verbose_print(
+                    f"[data collection] Teleop camera preview failed, disabling it: {ack}"
+                )
+            self.show_teleop_cameras = False
+            self._stop_teleop_camera_preview()
+            return
+
+        self.teleop_preview_frame_count += 1
+
+    def _resize_depth_obs(self, depth_image, crop=False):
+        if depth_image is None:
+            return None
+
+        if isinstance(depth_image, torch.Tensor):
+            depth = depth_image
+            if depth.ndim == 2:
+                depth = depth.unsqueeze(0)
+            if depth.ndim == 3:
+                depth = depth.unsqueeze(-1)
+            resized = resize_crop(depth) if crop else resize(depth)
+            return resized.squeeze(-1)
+
+        if isinstance(depth_image, np.ndarray):
+            depth = depth_image
+            if depth.ndim == 2:
+                depth = depth[None, ...]
+            if depth.ndim == 3:
+                depth = depth[..., None]
+            resized = resize_crop(depth) if crop else resize(depth)
+            return np.squeeze(resized, axis=-1)
+
+        raise ValueError(f"Unsupported depth image type: {type(depth_image)}")
+
     def collect(self):
         self.verbose_print("[data collection] Start collecting the data!")
 
@@ -220,20 +464,16 @@ class DataCollectorSpaceMouse:
         args.frequency = 10
         args.command_latency = 0.01
         args.deadzone = 0.05
-        if self.env.ctrl_mode == "diffik":
-            args.max_pos_speed = 0.3  # 0.8
-            args.max_rot_speed = 0.7  # 3.0
-        else:
-            args.max_pos_speed = 0.8
-            # args.max_rot_speed = 2.5
-            args.max_rot_speed = 4.0
+        args.max_pos_speed = self.sm_pos_speed
+        args.max_rot_speed = self.sm_rot_speed
 
         frequency = args.frequency
         dt = 1 / frequency
         command_latency = args.command_latency
-
-        self.sm_dpos_scalar = np.array([1.8] * 3)
-        self.sm_drot_scalar = np.array([4] * 3)
+        pos_bounds_m = max(self.pos_bounds_m, args.max_pos_speed / frequency)
+        ori_bounds_deg = max(
+            self.ori_bounds_deg, np.rad2deg(args.max_rot_speed / frequency)
+        )
 
         # Add these to the metadata
         self.metadata["frequency"] = frequency
@@ -241,10 +481,22 @@ class DataCollectorSpaceMouse:
         self.metadata["deadzone"] = args.deadzone
         self.metadata["max_pos_speed"] = args.max_pos_speed
         self.metadata["max_rot_speed"] = args.max_rot_speed
-        self.metadata["sm_dpos_scalar"] = self.sm_dpos_scalar.tolist()
-        self.metadata["sm_drot_scalar"] = self.sm_drot_scalar.tolist()
+        self.metadata["pos_bounds_m"] = pos_bounds_m
+        self.metadata["ori_bounds_deg"] = ori_bounds_deg
+        self.verbose_print(
+            "[data collection] SpaceMouse limits: "
+            f"frequency={frequency}Hz, "
+            f"max_pos_speed={args.max_pos_speed:.3f}m/s, "
+            f"max_rot_speed={args.max_rot_speed:.3f}rad/s, "
+            f"teleop_setting={self.teleop_setting}, "
+            f"pos_frame={self.sm_pos_frame}, "
+            f"rot_frame={self.sm_rot_frame}, "
+            f"pos_step_bound={pos_bounds_m:.4f}m, "
+            f"rot_step_bound={ori_bounds_deg:.2f}deg"
+        )
 
         obs = self.reset()
+        next_obs = obs
         done = False
 
         target_pose_rv, gripper_width, gripper_open, grasp_flag = self.set_target_pose()
@@ -290,6 +542,7 @@ class DataCollectorSpaceMouse:
         with SharedMemoryManager() as shm_manager:
             with Spacemouse(shm_manager=shm_manager, deadzone=args.deadzone) as sm:
                 t_start = time.monotonic()
+                self.iter_idx = 0
 
                 prev_keyboard_gripper = -1
                 global_start_time = time.time()
@@ -298,26 +551,15 @@ class DataCollectorSpaceMouse:
                     # calculate timing
                     t_cycle_end = t_start + (self.iter_idx + 1) * dt
                     t_sample = t_cycle_end - command_latency
-                    t_command_target = t_cycle_end + dt
                     precise_wait(t_sample)
 
                     # get teleop command
                     sm_state = sm.get_motion_state_transformed()
-                    # dpos = sm_state[:3] * (args.max_pos_speed / frequency)
-                    # drot_xyz = sm_state[3:] * (args.max_rot_speed / frequency)
-                    # drot = st.Rotation.from_euler("xyz", drot_xyz)
-                    # scale pos command
-                    dpos = (
-                        sm_state[:3]
-                        * (args.max_pos_speed / frequency)
-                        * self.sm_dpos_scalar
-                    )
-
-                    # convert and scale rot command
+                    dpos = sm_state[:3] * (args.max_pos_speed / frequency)
                     drot_xyz = sm_state[3:] * (args.max_rot_speed / frequency)
-                    drot_rotvec = st.Rotation.from_euler("xyz", drot_xyz).as_rotvec()
-                    drot_rotvec *= self.sm_drot_scalar
-                    drot = st.Rotation.from_rotvec(drot_rotvec)
+                    if self.sm_rot_frame == "ee":
+                        drot_xyz *= self.ee_rot_sign
+                    drot = st.Rotation.from_euler("xyz", drot_xyz)
 
                     (
                         keyboard_action,
@@ -382,11 +624,20 @@ class DataCollectorSpaceMouse:
                         steps_since_grasp = 0
                     prev_keyboard_gripper = keyboard_action[-1]
 
+                    target_rot = st.Rotation.from_rotvec(target_pose_rv[3:])
+                    if self.sm_pos_frame == "ee":
+                        dpos[[1, 2]] *= -1
+                        dpos = target_rot.apply(dpos)
+
                     new_target_pose_rv = target_pose_rv.copy()
                     new_target_pose_rv[:3] += dpos
-                    new_target_pose_rv[3:] = (
-                        drot * st.Rotation.from_rotvec(target_pose_rv[3:])
-                    ).as_rotvec()
+                    if self.sm_rot_frame == "world":
+                        new_target_rot = drot * target_rot
+                    elif self.sm_rot_frame == "ee":
+                        new_target_rot = target_rot * drot
+                    else:
+                        raise ValueError(f"Invalid sm_rot_frame: {self.sm_rot_frame}")
+                    new_target_pose_rv[3:] = new_target_rot.as_rotvec()
 
                     target_pose_mat = pose_rv2mat(target_pose_rv)
                     if target_pose_last_action_rv is not None:
@@ -414,8 +665,8 @@ class DataCollectorSpaceMouse:
 
                     action = scale_scripted_action(
                         action.detach().cpu().clone(),
-                        pos_bounds_m=self.pos_bounds_m,
-                        ori_bounds_deg=self.ori_bounds_deg,
+                        pos_bounds_m=pos_bounds_m,
+                        ori_bounds_deg=ori_bounds_deg,
                         device=self.env.device,
                     )
 
@@ -463,16 +714,21 @@ class DataCollectorSpaceMouse:
                             f"Success: {self.num_success}, Fail: {self.num_fail}"
                         )
 
+                        next_obs = obs
                         done = False
 
                         steps_since_grasp = 0
                         ready_to_grasp = True
                         target_pose_last_action_rv = None
-
-                        gripper_open = gripper_width >= 0.06
-                        grasp_flag = torch.from_numpy(
-                            np.array([-1 if gripper_open else 1])
-                        ).to(self.env.device)
+                        prev_keyboard_gripper = -1
+                        self.iter_idx = 0
+                        t_start = time.monotonic()
+                        (
+                            target_pose_rv,
+                            gripper_width,
+                            gripper_open,
+                            grasp_flag,
+                        ) = self.set_target_pose()
 
                         continue
 
@@ -482,6 +738,7 @@ class DataCollectorSpaceMouse:
                         action,
                         sample_perturbations=action_taken and self.sample_perturbations,
                     )
+                    self._show_teleop_cameras(next_obs)
 
                     if rew == 1:
                         self.last_reward_idx = len(self.transitions)
@@ -491,12 +748,21 @@ class DataCollectorSpaceMouse:
                         self.verbose_print(
                             "Getting observation failed, save trajectory."
                         )
-                        # Pop the last reward and action so that obs has length plus 1 then those of actions and rewards.
-                        self.transitions["rewards"] = None
-                        self.transitions["actions"] = None
-                        self.transitions["skills"] = None
-
                         obs = self.save_and_reset(CollectEnum.FAIL, info)
+                        next_obs = obs
+                        done = False
+                        steps_since_grasp = 0
+                        ready_to_grasp = True
+                        target_pose_last_action_rv = None
+                        prev_keyboard_gripper = -1
+                        self.iter_idx = 0
+                        t_start = time.monotonic()
+                        (
+                            target_pose_rv,
+                            gripper_width,
+                            gripper_open,
+                            grasp_flag,
+                        ) = self.set_target_pose()
                         continue
 
                     # Logging a step.
@@ -547,13 +813,21 @@ class DataCollectorSpaceMouse:
         gripper_width = self.env.gripper_width()
         rotvec = st.Rotation.from_quat(quat_xyzw).as_rotvec()
         target_pose_rv = np.array([*translation, *rotvec])
-        gripper_open = gripper_width >= 0.05
-        grasp_flag = torch.where(gripper_open, -1, 1).view(-1).to(self.env.device)
+        if isinstance(gripper_width, torch.Tensor):
+            gripper_open = bool((gripper_width >= 0.05).view(-1)[0].item())
+        else:
+            gripper_open = bool(gripper_width >= 0.05)
+        grasp_flag = torch.tensor(
+            [-1 if gripper_open else 1], dtype=torch.float32, device=self.env.device
+        )
 
         return target_pose_rv, gripper_width, gripper_open, grasp_flag
 
     def undo_actions(self):
         self.verbose_print("Undo the last 10 actions.")
+        if not self.transitions:
+            self.verbose_print("Nothing to undo.")
+            return
 
         # Remove the last 10 transitions from the buffer but keep at least one
         self.transitions = self.transitions[:1] + self.transitions[1:-10]
@@ -575,6 +849,10 @@ class DataCollectorSpaceMouse:
         n_ob = {}
         n_ob["color_image1"] = resize(obs["color_image1"])
         n_ob["color_image2"] = resize_crop(obs["color_image2"])
+        n_ob["depth_image1"] = self._resize_depth_obs(obs.get("depth_image1"))
+        n_ob["depth_image2"] = self._resize_depth_obs(
+            obs.get("depth_image2"), crop=True
+        )
         n_ob["robot_state"] = obs["robot_state"]
         n_ob["parts_poses"] = obs["parts_poses"]
 
@@ -626,26 +904,19 @@ class DataCollectorSpaceMouse:
         return self.reset()
 
     def reset(self):
+        self.verbose_print("[data collection] Resetting environment...", flush=True)
         obs = self.env.reset()
-
-        print("State from reset:")
-        for k, v in obs.items():
-            print(k, type(v))
-
         self._reset_collector_buffer()
+        self._show_teleop_cameras(obs)
 
         if self.resume_trajectory_paths:
             obs = self.load_state()
 
         self.verbose_print("Start collecting the data!")
-        self.verbose_print("Press enter to start")
-        while True:
-            if input() == "":
-                break
-        time.sleep(0.2)
 
         self.starttime = datetime.now()
         self.robot_settled = False
+        self.recording = True
         return obs
 
     def _reset_collector_buffer(self):
@@ -677,11 +948,13 @@ class DataCollectorSpaceMouse:
                 obs={
                     "color_image1": np.array(state["observations"][i]["color_image1"]),
                     "color_image2": np.array(state["observations"][i]["color_image2"]),
+                    "depth_image1": state["observations"][i].get("depth_image1"),
+                    "depth_image2": state["observations"][i].get("depth_image2"),
                     "robot_state": state["observations"][i]["robot_state"],
                     "parts_poses": np.array(state["observations"][i]["parts_poses"]),
                 },
                 action=state["actions"][i] if i < len(state["actions"]) else None,
-                rew=state["r/manuewards"][i] if i < len(state["rewards"]) else None,
+                rew=state["rewards"][i] if i < len(state["rewards"]) else None,
                 skill_complete=state["skills"][i] if i < len(state["skills"]) else None,
                 setup_phase=True,
             )
@@ -769,6 +1042,7 @@ class DataCollectorSpaceMouse:
             self.pbar.update(1)
 
     def __del__(self):
+        self._stop_teleop_camera_preview()
         del self.env
 
         if self.device_interface is not None:

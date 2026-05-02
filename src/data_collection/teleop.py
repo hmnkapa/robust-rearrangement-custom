@@ -2,7 +2,6 @@ import argparse
 import random
 
 import furniture_bench
-from furniture_bench.device import make_device
 from furniture_bench.config import config
 
 from pathlib import Path
@@ -16,13 +15,24 @@ from src.gym import turn_off_april_tags
 
 from ipdb import set_trace as bp
 
+SUPPORTED_TELEOP_FURNITURE = [
+    "one_leg",
+    "lamp",
+    "round_table",
+    "square_table",
+    "desk",
+    "cabinet",
+    "factory_peg_hole",
+    "factory_nut_bolt",
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Collect IL data")
     parser.add_argument(
         "--furniture",
         help="Name of the furniture",
-        choices=list(config["furniture"].keys()),
+        choices=SUPPORTED_TELEOP_FURNITURE,
         required=True,
     )
     parser.add_argument(
@@ -61,6 +71,42 @@ def main():
         "--sample-perturbations",
         action="store_true",
     )
+    parser.add_argument(
+        "--sm-pos-speed",
+        type=float,
+        default=None,
+        help=(
+            "Override SpaceMouse max translational speed in meters per second. "
+            "Default is 0.54 for the src diffik collector, matching the old "
+            "0.3 speed with 1.8x scalar."
+        ),
+    )
+    parser.add_argument(
+        "--sm-rot-speed",
+        type=float,
+        default=None,
+        help=(
+            "Override SpaceMouse max rotational speed in radians per second. "
+            "Default is 2.8 for the src diffik collector, matching the old "
+            "0.7 speed with 4x scalar."
+        ),
+    )
+    parser.add_argument(
+        "--teleop-setting",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help=(
+            "Teleoperation preset. 1 matches the existing src behavior "
+            "(world-frame position/rotation). 2 matches furniture-bench "
+            "(end-effector-frame position/rotation with adjusted signs)."
+        ),
+    )
+    parser.add_argument(
+        "--show-teleop-cameras",
+        action="store_true",
+        help="Show an OpenCV preview window for fixed and wrist cameras.",
+    )
 
     args = parser.parse_args()
 
@@ -94,7 +140,7 @@ def main():
         device_interface=keyboard_device_interface,
         furniture=args.furniture,
         draw_marker=args.draw_marker,
-        resize_sim_img=False,
+        resize_sim_img=True,
         randomness=randomness,
         compute_device_id=args.gpu_id,
         graphics_device_id=args.gpu_id,
@@ -105,6 +151,10 @@ def main():
         compress_pickles=False,
         resume_trajectory_paths=pickle_paths,
         sample_perturbations=args.sample_perturbations,
+        sm_pos_speed=args.sm_pos_speed,
+        sm_rot_speed=args.sm_rot_speed,
+        teleop_setting=args.teleop_setting,
+        show_teleop_cameras=args.show_teleop_cameras,
     )
     data_collector.collect()
 
