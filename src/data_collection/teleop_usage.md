@@ -15,7 +15,7 @@ python -m src.data_collection.teleop \
   --num-demos 1 \
   --ctrl-mode diffik \
   --sm-pos-speed 0.54 \
-  --sm-rot-speed 2.8 \
+  --sm-rot-speed 4.8 \
   --teleop-setting 1 \
   --show-teleop-cameras
 ```
@@ -109,14 +109,61 @@ sudo systemctl start spacenavd
 
 `--show-teleop-cameras`：显示 OpenCV 预览窗口。默认关闭。开启后会启动一个同步刷新的 preview helper 进程。
 
+## teleop_checkpoint 断点续采
+
+`src/data_collection/teleop_checkpoint.py` 是 `teleop.py` 的变体，增加了**断点续采**功能：可以在采集过程中随时保存一个断点（checkpoint），之后一键恢复到该断点状态（包括机械臂所有关节、夹爪、以及场景中所有零件的位姿）。参数与 `teleop.py` 完全兼容，同样支持 `--resume-dir`。
+
+### 运行命令
+
+```bash
+python -m src.data_collection.teleop_checkpoint \
+  --furniture desk \
+  --randomness low \
+  --num-demos 1 \
+  --ctrl-mode diffik \
+  --sm-pos-speed 0.54 \
+  --sm-rot-speed 4.8 \
+  --teleop-setting 1 \
+  --show-teleop-cameras
+```
+
+### 与 teleop 的按键差异
+
+`teleop_checkpoint` 对以下三个按键做了重新映射，其余按键（`t`/`y`/`n`/`b`/`z`/`[`/`]`/数字键/`\``/方向键等）与 `teleop.py` 完全一致。
+
+| 按键 | teleop | teleop_checkpoint |
+|------|--------|-------------------|
+| `c` | 继续记录（CONTINUE） | **打断点** — 保存当前 robot joints + gripper + parts poses 作为断点 |
+| `r` | 重置环境（RESET） | **回到上一个断点** — 恢复机械臂关节、夹爪、场景零件到断点状态，并截断 transition buffer |
+| `p` | 暂停记录（PAUSE） | **切换 暂停/继续** — 第一次按暂停，再按一次继续 |
+
+`teleop_checkpoint` 不再使用原来的 `RESET` 按键，轨迹保存后的环境重置由脚本自动完成。
+
+### 断点续采流程
+
+1. 正常使用 SpaceMouse 或键盘操作机械臂进行采集。
+2. 在某个希望保存的状态按 `c` 打断点，脚本会记录当前 transition 对应的 observation（robot_state + parts_poses）以及 transition 索引。
+3. 继续操作；如果后续操作不理想，按 `r` 回到上一个断点：
+   - 机械臂所有关节恢复到断点位置。
+   - 夹爪恢复到断点状态。
+   - 场景中所有家具零件恢复到断点位姿。
+   - transition buffer 截断到断点处，后续 transition 被丢弃。
+   - 进入 2 秒稳定期后继续采集。
+4. 可以在同一条轨迹中多次打新的断点，每次按 `c` 都会覆盖上一个断点。
+5. 轨迹保存（`t`/`y`）或重置后，断点自动清除。
+
+### 断点实现
+
+打断点时保存的是 `transitions[-1]["observations"]`，其结构与 pkl 中的 observation 一致，包含 `robot_state` 和 `parts_poses`。恢复时调用 `env.reset_env_to(env_idx=0, state=checkpoint_state)`（与 `undo_actions` 和 `--resume-dir` 的 `load_state` 使用同一底层接口），然后 `env.refresh()` 刷新仿真状态。
+
 ## Replay 单条轨迹
 
 回放单条已采集轨迹：
 
 ```bash
 python -m src.eval.replay \
-  --pickle-path /data/hy/robust-rearrangement/raw/raw/diffik/sim/one_leg/teleop/low/success/2026-05-02T21-03-16.pkl \
-  --task one_leg \
+  --pickle-path /data/hy/robust-rearrangement/raw/raw/diffik/sim/desk/teleop/low/success/2026-05-03T14-40-55.pkl \
+  --task desk \
   --action-src action \
   --visualize
 ```
