@@ -536,16 +536,17 @@ def rollout(
     apply_ee_force = None
     perturb_device = None
     if perturb_runner is not None and perturb_runner.enabled:
-        apply_ee_force = getattr(env, "apply_end_effector_force", None)
-        if not callable(apply_ee_force):
-            raise ValueError(
-                f"Perturb mode `{perturb_runner.mode}` requires an environment with "
-                "`apply_end_effector_force`. This is currently supported for "
-                "FurnitureRLSimEnv only."
-            )
         perturb_device = getattr(env, "device", actor.device)
         if not isinstance(perturb_device, torch.device):
             perturb_device = torch.device(perturb_device)
+        if perturb_runner.applies_force:
+            apply_ee_force = getattr(env, "apply_end_effector_force", None)
+            if not callable(apply_ee_force):
+                raise ValueError(
+                    f"Perturb mode `{perturb_runner.mode}` requires an environment with "
+                    "`apply_end_effector_force`. This is currently supported for "
+                    "FurnitureRLSimEnv only."
+                )
         perturb_runner.reset_episode(env.num_envs, perturb_device)
 
     # TODO - figure out how to fix this
@@ -573,20 +574,23 @@ def rollout(
         # action_pred = actor.normalizer(action_pred, "action", forward=False)
 
         if perturb_runner is not None and perturb_runner.enabled:
-            assert apply_ee_force is not None
-            assert perturb_device is not None
-            perturb_forces = perturb_runner.compute_force(
-                PerturbContext(
-                    step_idx=step_idx,
-                    num_envs=env.num_envs,
-                    device=perturb_device,
-                    furniture_name=getattr(env, "furniture_name", None),
-                    task_name=getattr(env, "task_name", None),
-                    skill_states=active_skill_states,
-                    ee_pos_vel=ee_pos_vel,
-                )
+            perturb_ctx = PerturbContext(
+                step_idx=step_idx,
+                num_envs=env.num_envs,
+                device=perturb_device,
+                furniture_name=getattr(env, "furniture_name", None),
+                task_name=getattr(env, "task_name", None),
+                skill_states=active_skill_states,
+                ee_pos_vel=ee_pos_vel,
             )
-            apply_ee_force(perturb_forces)
+            # 1. Modify action in-place for replay-safe slowdown (place_slowdown).
+            if perturb_runner.modifies_action:
+                action_pred = perturb_runner.modify_action(action_pred, perturb_ctx)
+            # 2. Apply external perturbation forces (random_small / short_large / place_slowdown jitter).
+            if perturb_runner.applies_force:
+                assert apply_ee_force is not None
+                perturb_forces = perturb_runner.compute_force(perturb_ctx)
+                apply_ee_force(perturb_forces)
 
         obs, reward, done, _ = env.step(action_pred, sample_perturbations=False)
 

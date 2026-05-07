@@ -30,9 +30,11 @@ class PerturbStats:
     total_steps: int = 0
     applied_steps: int = 0
     applied_env_steps: int = 0
+    modified_steps: int = 0
+    modified_env_steps: int = 0
     mode_counts: dict[str, int] = field(default_factory=dict)
 
-    def record(self, mode: str, forces: torch.Tensor):
+    def record_force(self, mode: str, forces: torch.Tensor):
         self.total_steps += 1
         applied_mask = torch.linalg.norm(forces.detach(), dim=-1) > 0
         applied_env_steps = int(applied_mask.sum().item())
@@ -42,11 +44,19 @@ class PerturbStats:
         self.applied_env_steps += applied_env_steps
         self.mode_counts[mode] = self.mode_counts.get(mode, 0) + applied_env_steps
 
+    def record_action_mod(self, num_envs_modified: int):
+        if num_envs_modified == 0:
+            return
+        self.modified_steps += 1
+        self.modified_env_steps += num_envs_modified
+
     def summary(self) -> dict[str, int | dict[str, int]]:
         return {
             "total_steps": self.total_steps,
             "applied_steps": self.applied_steps,
             "applied_env_steps": self.applied_env_steps,
+            "modified_steps": self.modified_steps,
+            "modified_env_steps": self.modified_env_steps,
             "mode_counts": dict(self.mode_counts),
         }
 
@@ -55,7 +65,12 @@ class PerturbRunner:
     """Generate end-effector perturbation forces for evaluation rollouts.
 
     Keep evaluation CLI intentionally small: edit the defaults below when tuning
-    perturbation behavior.
+    perturbation behavior.  Parameters are grouped by perturbation mode so you can
+    jump straight to the block that matches the mode you are using.
+
+    Modes that *modify actions* (currently only place_slowdown) produce replayable
+    trajectories because the modified action is saved into the rollout.  Modes that
+    apply external *forces* (random_small, short_large) do not.
     """
 
     def __init__(self, mode: str):
@@ -66,16 +81,24 @@ class PerturbRunner:
 
         self.config = PerturbConfig(mode=mode)
 
-        # Tunable defaults. These are intentionally not exposed by evaluate_model.py.
-        self.perturb_per_timesteps = 25
-        self.perturb_min_force = 5.0
-        self.perturb_max_force = 10.0
-        self.perturb_delay = 5
-        self.perturb_state = "place"
-        self.perturb_furniture: Optional[str] = None
-        self.perturb_slowdown_gain = 30.0
-        self.perturb_down_vel_threshold = 1e-4
+        # -- common --
         self.perturb_seed = 0
+
+        # -- random_small --
+        self.random_small_interval = 25      # steps between random force applications
+        self.random_small_max_force = 10.0    # max force magnitude
+
+        # -- short_large --
+        self.short_large_min_force = 5.0              # min force when firing
+        self.short_large_max_force = 10.0              # max force when firing
+        self.short_large_delay = 5                     # steps to wait after entering target state
+        self.short_large_trigger_state = "place"       # skill state that triggers the impulse
+        self.short_large_trigger_furniture: Optional[str] = None  # restrict to a specific furniture / task
+
+        # -- place_slowdown --
+        self.place_slowdown_speed_ratio = 0.8          # z-axis action scale during place (1.0 = off)
+        self.place_slowdown_random_force = 0.0         # max random force overlaid (0 = off)
+        self.place_slowdown_random_interval = 25       # steps between random force applications
 
         self.stats = PerturbStats()
         self._generator = torch.Generator()
@@ -87,8 +110,10 @@ class PerturbRunner:
             "none": self._zero_force,
             "random_small": self._random_small,
             "short_large": self._short_large,
-            "place_slowdown": self._place_slowdown,
+            "place_slowdown": self._place_slowdown_random,
         }
+
+    # -- public properties --------------------------------------------------
 
     @property
     def mode(self) -> str:
@@ -102,6 +127,20 @@ class PerturbRunner:
     def requires_skill_annotations(self) -> bool:
         return self.mode in {"short_large", "place_slowdown"}
 
+    @property
+    def modifies_action(self) -> bool:
+        return self.mode == "place_slowdown"
+
+    @property
+    def applies_force(self) -> bool:
+        if self.mode in {"random_small", "short_large"}:
+            return True
+        if self.mode == "place_slowdown" and self.place_slowdown_random_force > 0:
+            return True
+        return False
+
+    # -- public methods -----------------------------------------------------
+
     def reset_episode(self, num_envs: int, device: torch.device):
         self._short_large_match_steps = torch.zeros(
             num_envs, dtype=torch.int64, device=device
@@ -110,25 +149,39 @@ class PerturbRunner:
 
     def compute_force(self, context: PerturbContext) -> torch.Tensor:
         forces = self._mode_fns[self.mode](context)
-        self.stats.record(self.mode, forces)
+        self.stats.record_force(self.mode, forces)
         return forces
+
+    def modify_action(
+        self, action: torch.Tensor, context: PerturbContext
+    ) -> torch.Tensor:
+        """Return a modified copy of *action* (replay-safe)."""
+        if self.mode == "place_slowdown":
+            return self._modify_action_place_slowdown(action, context)
+        return action
+
+    # -- force: none --------------------------------------------------------
 
     def _zero_force(self, context: PerturbContext) -> torch.Tensor:
         return torch.zeros((context.num_envs, 3), device=context.device)
 
+    # -- force: random_small ------------------------------------------------
+
     def _random_small(self, context: PerturbContext) -> torch.Tensor:
-        if context.step_idx % self.perturb_per_timesteps != 0:
+        if context.step_idx % self.random_small_interval != 0:
             return self._zero_force(context)
         return self._sample_random_forces(
             context.num_envs,
             context.device,
             min_force=0.0,
-            max_force=self.perturb_max_force,
+            max_force=self.random_small_max_force,
         )
+
+    # -- force: short_large -------------------------------------------------
 
     def _short_large(self, context: PerturbContext) -> torch.Tensor:
         self._ensure_short_large_state(context)
-        matches = self._matches_target_state(context)
+        matches = self._matches_short_large_target(context)
         assert self._short_large_match_steps is not None
         assert self._short_large_fired is not None
 
@@ -140,7 +193,7 @@ class PerturbRunner:
         should_fire = (
             matches
             & ~self._short_large_fired
-            & (self._short_large_match_steps >= self.perturb_delay + 1)
+            & (self._short_large_match_steps >= self.short_large_delay + 1)
         )
 
         forces = self._zero_force(context)
@@ -148,45 +201,49 @@ class PerturbRunner:
             sampled_forces = self._sample_random_forces(
                 context.num_envs,
                 context.device,
-                min_force=self.perturb_min_force,
-                max_force=self.perturb_max_force,
+                min_force=self.short_large_min_force,
+                max_force=self.short_large_max_force,
             )
             forces[should_fire] = sampled_forces[should_fire]
             self._short_large_fired[should_fire] = True
         return forces
 
-    def _place_slowdown(self, context: PerturbContext) -> torch.Tensor:
-        if context.ee_pos_vel is None:
-            raise ValueError("place_slowdown perturbation requires ee_pos_vel.")
+    # -- force: place_slowdown_random ---------------------------------------
 
-        ee_pos_vel = context.ee_pos_vel.to(device=context.device, dtype=torch.float32)
-        if ee_pos_vel.shape != (context.num_envs, 3):
-            raise ValueError(
-                "ee_pos_vel must have shape "
-                f"({context.num_envs}, 3), got {tuple(ee_pos_vel.shape)}"
-            )
-
-        skill_matches = self._matches_skill_suffix(context.skill_states, "place").to(
-            device=context.device
+    def _place_slowdown_random(self, context: PerturbContext) -> torch.Tensor:
+        if (
+            self.place_slowdown_random_force <= 0
+            or context.step_idx % self.place_slowdown_random_interval != 0
+        ):
+            return self._zero_force(context)
+        return self._sample_random_forces(
+            context.num_envs,
+            context.device,
+            min_force=0.0,
+            max_force=self.place_slowdown_random_force,
         )
-        downward_speed = torch.clamp(-ee_pos_vel[:, 2], min=0.0)
-        moving_down = downward_speed > self.perturb_down_vel_threshold
-        should_apply = skill_matches & moving_down
 
-        forces = self._zero_force(context)
-        if not should_apply.any():
-            return forces
+    # -- action modification ------------------------------------------------
 
-        speed = torch.linalg.norm(ee_pos_vel, dim=-1).clamp_min(1e-6)
-        direction = -ee_pos_vel / speed.unsqueeze(-1)
-        magnitude = torch.clamp(
-            downward_speed * self.perturb_slowdown_gain,
-            max=self.perturb_max_force,
-        )
-        forces[should_apply] = direction[should_apply] * magnitude[
-            should_apply
-        ].unsqueeze(-1)
-        return forces
+    def _modify_action_place_slowdown(
+        self, action: torch.Tensor, context: PerturbContext
+    ) -> torch.Tensor:
+        if self.place_slowdown_speed_ratio >= 1.0:
+            return action
+
+        skill_matches = self._matches_skill_suffix(
+            context.skill_states, "place"
+        ).to(device=action.device)
+        num_modified = int(skill_matches.sum().item())
+        self.stats.record_action_mod(num_modified)
+        if num_modified == 0:
+            return action
+
+        modified = action.clone()
+        modified[skill_matches, 2] *= self.place_slowdown_speed_ratio
+        return modified
+
+    # -- helpers ------------------------------------------------------------
 
     def _ensure_short_large_state(self, context: PerturbContext):
         if (
@@ -197,16 +254,16 @@ class PerturbRunner:
         ):
             self.reset_episode(context.num_envs, context.device)
 
-    def _matches_target_state(self, context: PerturbContext) -> torch.Tensor:
+    def _matches_short_large_target(self, context: PerturbContext) -> torch.Tensor:
         furniture_matches = (
-            self.perturb_furniture is None
-            or context.furniture_name == self.perturb_furniture
-            or context.task_name == self.perturb_furniture
+            self.short_large_trigger_furniture is None
+            or context.furniture_name == self.short_large_trigger_furniture
+            or context.task_name == self.short_large_trigger_furniture
         )
         if not furniture_matches:
             return torch.zeros(context.num_envs, dtype=torch.bool, device=context.device)
         return self._matches_skill_suffix(
-            context.skill_states, self.perturb_state
+            context.skill_states, self.short_large_trigger_state
         ).to(device=context.device)
 
     def _matches_skill_suffix(
