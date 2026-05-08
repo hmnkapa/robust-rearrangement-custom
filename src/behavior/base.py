@@ -597,18 +597,17 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
 
         return actions
 
-    def _subdivide_actions(self, actions: deque) -> deque:
-        """Subdivide a deque of delta actions into smaller steps.
+    def _subdivide_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        """Subdivide an action chunk into smaller steps.
 
-        Uses cumulative-sum → resample → diff to produce *ratio* times as many
-        actions, each approximately 1/*ratio* the magnitude.
+        chunk: (B, N, 8) — delta actions [dx,dy,dz, qx,qy,qz,qw, grip]
+        Returns: (B, M, 8) where M = int(N * subdivide_ratio)
         """
         ratio = self.subdivide_ratio
-        chunk = torch.stack(list(actions), dim=1)  # (B, N, 8)
         B, N, D = chunk.shape
         M = max(1, int(N * ratio))
         if M == N:
-            return actions
+            return chunk
 
         device = chunk.device
         dtype = chunk.dtype
@@ -616,14 +615,12 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         old_t = torch.arange(N + 1, device=device).float()
         new_t = torch.linspace(0.0, float(N), M + 1, device=device)
 
-        # position delta (cumsum → resample → diff → scale by 1/ratio)
         pos_delta = chunk[:, :, :3]
         cum_pos = pos_delta.cumsum(dim=1)
         cum_pos = torch.cat([torch.zeros(B, 1, 3, device=device, dtype=dtype), cum_pos], dim=1)
         new_cum_pos = _linear_resample_1d(cum_pos, old_t, new_t)
         new_pos = (new_cum_pos[:, 1:, :] - new_cum_pos[:, :-1, :]) / ratio
 
-        # quaternion delta (axis-angle → cumsum → resample → diff → scale → quat)
         quat_delta = chunk[:, :, 3:7]
         rotvec_delta = C.quaternion_to_axis_angle(quat_delta)
         cum_rotvec = rotvec_delta.cumsum(dim=1)
@@ -632,15 +629,18 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         new_rotvec = (new_cum_rotvec[:, 1:, :] - new_cum_rotvec[:, :-1, :]) / ratio
         new_quat = _axis_angle_to_quaternion(new_rotvec)
 
-        # gripper (nearest-neighbour — binary signal)
-        grip = chunk[:, :, 7:8]  # (B, N, 1)
+        grip = chunk[:, :, 7:8]
         new_t_mid = torch.linspace(0.0, float(N - 1), M, device=device)
         nn_idx = new_t_mid.round().long().clamp(0, N - 1)
         new_grip = grip[:, nn_idx, :]
 
-        new_chunk = torch.cat([new_pos, new_quat, new_grip], dim=-1)  # (B, M, 8)
+        return torch.cat([new_pos, new_quat, new_grip], dim=-1)
+
+    def _subdivide_actions(self, actions: deque) -> deque:
+        chunk = torch.stack(list(actions), dim=1)
+        new_chunk = self._subdivide_chunk(chunk)
         subdivided = deque()
-        for i in range(M):
+        for i in range(new_chunk.shape[1]):
             subdivided.append(new_chunk[:, i, :])
         return subdivided
 

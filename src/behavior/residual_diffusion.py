@@ -119,13 +119,16 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
 
         if not self.base_nactions:
             # If there are no base actions, predict the action
-            base_nactioon_pred = self._normalized_action(nobs)
+            base_nactioon_pred = self._normalized_action(nobs, use_warmstart=False)
 
             # Add self.action_horizon base actions
             start = self.obs_horizon - 1 if self.predict_past_actions else 0
             end = start + self.action_horizon
-            for i in range(start, end):
-                self.base_nactions.append(base_nactioon_pred[:, i, :])
+            chunk = base_nactioon_pred[:, start:end, :]  # (B, action_horizon, D)
+            if self.subdivide_ratio > 1.0:
+                chunk = self._subdivide_chunk(chunk)
+            for i in range(chunk.shape[1]):
+                self.base_nactions.append(chunk[:, i, :])
 
         # Pop off the next base action
         base_naction = self.base_nactions.popleft()
