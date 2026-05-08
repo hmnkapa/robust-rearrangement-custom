@@ -68,9 +68,12 @@ class PerturbRunner:
     perturbation behavior.  Parameters are grouped by perturbation mode so you can
     jump straight to the block that matches the mode you are using.
 
-    Modes that *modify actions* (currently only place_slowdown) produce replayable
-    trajectories because the modified action is saved into the rollout.  Modes that
-    apply external *forces* (random_small, short_large) do not.
+    *place_slowdown* subdivides the action chunk inside the Actor queue so the
+    robot takes smaller, more frequent steps during the place skill — producing
+    replayable trajectories with higher temporal resolution.
+
+    *random_small* and *short_large* apply external forces and do NOT produce
+    replayable trajectories.
     """
 
     def __init__(self, mode: str):
@@ -96,9 +99,8 @@ class PerturbRunner:
         self.short_large_trigger_furniture: Optional[str] = None  # restrict to a specific furniture / task
 
         # -- place_slowdown --
-        self.place_slowdown_speed_ratio = 0.8          # z-axis action scale during place (1.0 = off)
-        self.place_slowdown_random_force = 0.0         # max random force overlaid (0 = off)
-        self.place_slowdown_random_interval = 25       # steps between random force applications
+        self.place_slowdown_subdivide_ratio = 3.0        # new_timesteps / model_generated_timesteps
+        self.place_slowdown_pos_noise = 0.0              # optional position noise (meters), 0 = off
 
         self.stats = PerturbStats()
         self._generator = torch.Generator()
@@ -110,7 +112,7 @@ class PerturbRunner:
             "none": self._zero_force,
             "random_small": self._random_small,
             "short_large": self._short_large,
-            "place_slowdown": self._place_slowdown_random,
+            "place_slowdown": self._zero_force,
         }
 
     # -- public properties --------------------------------------------------
@@ -129,15 +131,17 @@ class PerturbRunner:
 
     @property
     def modifies_action(self) -> bool:
+        """Whether the runner wants to set actor.subdivide_ratio."""
         return self.mode == "place_slowdown"
 
     @property
     def applies_force(self) -> bool:
-        if self.mode in {"random_small", "short_large"}:
-            return True
-        if self.mode == "place_slowdown" and self.place_slowdown_random_force > 0:
-            return True
-        return False
+        return self.mode in {"random_small", "short_large"}
+
+    @property
+    def subdivides_action(self) -> bool:
+        """Alias: the runner subdivides actions via the actor queue."""
+        return self.modifies_action
 
     # -- public methods -----------------------------------------------------
 
@@ -155,10 +159,21 @@ class PerturbRunner:
     def modify_action(
         self, action: torch.Tensor, context: PerturbContext
     ) -> torch.Tensor:
-        """Return a modified copy of *action* (replay-safe)."""
-        if self.mode == "place_slowdown":
-            return self._modify_action_place_slowdown(action, context)
+        """No-op — subdivision is handled by the actor via subdivide_ratio."""
         return action
+
+    def get_subdivide_ratio(self, context: PerturbContext) -> float:
+        """Return the subdivide ratio for the current skill context."""
+        if self.mode != "place_slowdown":
+            return 1.0
+        if self.place_slowdown_subdivide_ratio <= 1.0:
+            return 1.0
+        skill_matches = self._matches_skill_suffix(
+            context.skill_states, "place"
+        )
+        if skill_matches.any():
+            return self.place_slowdown_subdivide_ratio
+        return 1.0
 
     # -- force: none --------------------------------------------------------
 
@@ -207,41 +222,6 @@ class PerturbRunner:
             forces[should_fire] = sampled_forces[should_fire]
             self._short_large_fired[should_fire] = True
         return forces
-
-    # -- force: place_slowdown_random ---------------------------------------
-
-    def _place_slowdown_random(self, context: PerturbContext) -> torch.Tensor:
-        if (
-            self.place_slowdown_random_force <= 0
-            or context.step_idx % self.place_slowdown_random_interval != 0
-        ):
-            return self._zero_force(context)
-        return self._sample_random_forces(
-            context.num_envs,
-            context.device,
-            min_force=0.0,
-            max_force=self.place_slowdown_random_force,
-        )
-
-    # -- action modification ------------------------------------------------
-
-    def _modify_action_place_slowdown(
-        self, action: torch.Tensor, context: PerturbContext
-    ) -> torch.Tensor:
-        if self.place_slowdown_speed_ratio >= 1.0:
-            return action
-
-        skill_matches = self._matches_skill_suffix(
-            context.skill_states, "place"
-        ).to(device=action.device)
-        num_modified = int(skill_matches.sum().item())
-        self.stats.record_action_mod(num_modified)
-        if num_modified == 0:
-            return action
-
-        modified = action.clone()
-        modified[skill_matches, 2] *= self.place_slowdown_speed_ratio
-        return modified
 
     # -- helpers ------------------------------------------------------------
 

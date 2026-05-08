@@ -565,14 +565,6 @@ def rollout(
         if not getattr(actor, "expects_raw_robot_state", False):
             obs["robot_state"] = env.filter_and_concat_robot_state(obs["robot_state"])
 
-        # Get the next actions from the actor
-        action_pred = actor.action(obs)
-        
-        # print("[DEBUG] action: ", action_pred)
-        # print("[DEBUG] gripper action: ", action_pred[:, 7])
-        # action_pred = torch.tensor(actions[step_idx], device="cuda").unsqueeze(0)
-        # action_pred = actor.normalizer(action_pred, "action", forward=False)
-
         if perturb_runner is not None and perturb_runner.enabled:
             perturb_ctx = PerturbContext(
                 step_idx=step_idx,
@@ -583,14 +575,17 @@ def rollout(
                 skill_states=active_skill_states,
                 ee_pos_vel=ee_pos_vel,
             )
-            # 1. Modify action in-place for replay-safe slowdown (place_slowdown).
             if perturb_runner.modifies_action:
-                action_pred = perturb_runner.modify_action(action_pred, perturb_ctx)
-            # 2. Apply external perturbation forces (random_small / short_large / place_slowdown jitter).
+                actor.subdivide_ratio = perturb_runner.get_subdivide_ratio(perturb_ctx)
             if perturb_runner.applies_force:
                 assert apply_ee_force is not None
                 perturb_forces = perturb_runner.compute_force(perturb_ctx)
                 apply_ee_force(perturb_forces)
+        else:
+            actor.subdivide_ratio = 1.0
+
+        # Get the next actions from the actor
+        action_pred = actor.action(obs)
 
         obs, reward, done, _ = env.step(action_pred, sample_perturbations=False)
 

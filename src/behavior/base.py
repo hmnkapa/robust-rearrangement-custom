@@ -60,6 +60,43 @@ def model_skill_dim(cfg: DictConfig) -> int:
     return int(skill_dim)
 
 
+def _linear_resample_1d(y, x_old, x_new):
+    """Linearly resample *y* from *x_old* coordinates to *x_new* coordinates.
+
+    y: (B, N, D)   x_old: (N,)   x_new: (M,)
+    Returns: (B, M, D)
+    """
+    B, N, D = y.shape
+    M = x_new.shape[0]
+
+    idx = torch.searchsorted(x_old, x_new).clamp(1, N - 1)
+    x_l = x_old[idx - 1]
+    x_r = x_old[idx]
+    frac = ((x_new - x_l) / (x_r - x_l).clamp_min(1e-8)).reshape(1, M, 1)
+    y_l = y[:, idx - 1, :]
+    y_r = y[:, idx, :]
+    return y_l * (1.0 - frac) + y_r * frac
+
+
+def _axis_angle_to_quaternion(axis_angle):
+    """Convert rotation vectors (axis * angle) to quaternions xyzw.
+
+    axis_angle: (..., 3)
+    Returns: (..., 4) xyzw
+    """
+    theta = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+    eps = 1e-8
+    half = theta / 2.0
+    axis = axis_angle / theta.clamp_min(eps)
+    q_xyz = axis * torch.sin(half)
+    q_w = torch.cos(half)
+    quat = torch.cat([q_xyz, q_w], dim=-1)
+    small = theta.squeeze(-1) < eps
+    if small.any():
+        quat[small] = quat.new_tensor([0.0, 0.0, 0.0, 1.0])
+    return quat
+
+
 # Update the PostInitCaller to be compatible
 class PostInitCaller(type(torch.nn.Module)):
     def __call__(cls, *args, **kwargs):
@@ -123,6 +160,9 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         # A queue of the next actions to be executed in the current horizon
         self.observations = deque(maxlen=self.obs_horizon)
         self.actions = deque(maxlen=self.action_horizon)
+
+        # Subdivide ratio for action chunk interpolation (>1.0 = slowdown)
+        self.subdivide_ratio: float = 1.0
 
         self.observation_type = cfg.observation_type
         self.requires_skill_input = model_requires_skill_input(cfg)
@@ -552,7 +592,57 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         for i in range(start, end):
             actions.append(action_pred[:, i, :])
 
+        if self.subdivide_ratio > 1.0:
+            actions = self._subdivide_actions(actions)
+
         return actions
+
+    def _subdivide_actions(self, actions: deque) -> deque:
+        """Subdivide a deque of delta actions into smaller steps.
+
+        Uses cumulative-sum → resample → diff to produce *ratio* times as many
+        actions, each approximately 1/*ratio* the magnitude.
+        """
+        ratio = self.subdivide_ratio
+        chunk = torch.stack(list(actions), dim=1)  # (B, N, 8)
+        B, N, D = chunk.shape
+        M = max(1, int(N * ratio))
+        if M == N:
+            return actions
+
+        device = chunk.device
+        dtype = chunk.dtype
+
+        old_t = torch.arange(N + 1, device=device).float()
+        new_t = torch.linspace(0.0, float(N), M + 1, device=device)
+
+        # position delta (cumsum → resample → diff → scale by 1/ratio)
+        pos_delta = chunk[:, :, :3]
+        cum_pos = pos_delta.cumsum(dim=1)
+        cum_pos = torch.cat([torch.zeros(B, 1, 3, device=device, dtype=dtype), cum_pos], dim=1)
+        new_cum_pos = _linear_resample_1d(cum_pos, old_t, new_t)
+        new_pos = (new_cum_pos[:, 1:, :] - new_cum_pos[:, :-1, :]) / ratio
+
+        # quaternion delta (axis-angle → cumsum → resample → diff → scale → quat)
+        quat_delta = chunk[:, :, 3:7]
+        rotvec_delta = C.quaternion_to_axis_angle(quat_delta)
+        cum_rotvec = rotvec_delta.cumsum(dim=1)
+        cum_rotvec = torch.cat([torch.zeros(B, 1, 3, device=device, dtype=dtype), cum_rotvec], dim=1)
+        new_cum_rotvec = _linear_resample_1d(cum_rotvec, old_t, new_t)
+        new_rotvec = (new_cum_rotvec[:, 1:, :] - new_cum_rotvec[:, :-1, :]) / ratio
+        new_quat = _axis_angle_to_quaternion(new_rotvec)
+
+        # gripper (nearest-neighbour — binary signal)
+        grip = chunk[:, :, 7:8]  # (B, N, 1)
+        new_t_mid = torch.linspace(0.0, float(N - 1), M, device=device)
+        nn_idx = new_t_mid.round().long().clamp(0, N - 1)
+        new_grip = grip[:, nn_idx, :]
+
+        new_chunk = torch.cat([new_pos, new_quat, new_grip], dim=-1)  # (B, M, 8)
+        subdivided = deque()
+        for i in range(M):
+            subdivided.append(new_chunk[:, i, :])
+        return subdivided
 
     @torch.no_grad()
     def action_pred(self, batch):

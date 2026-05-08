@@ -793,6 +793,10 @@ if __name__ == "__main__":
                     f"(observation_type={cfg.observation_type}, "
                     f"actor={actor_name}, skill_dim={cfg.get('skill_dim', None)})"
                 )
+                if args.action_horizon is not None:
+                    cfg.actor.action_horizon = args.action_horizon
+                    print(f"Overriding action_horizon to {args.action_horizon}")
+
                 actor: Actor = get_actor(cfg=cfg, device=device)
 
                 if isinstance(actor, DiffusionPolicy):
