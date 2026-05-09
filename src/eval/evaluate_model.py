@@ -508,6 +508,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--record-for-coverage", action="store_true")
     parser.add_argument("--annotate-skill", action="store_true")
+    parser.add_argument("--guidance-point-on-image", action="store_true")
     parser.add_argument("--skill-on-image", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
@@ -780,12 +781,6 @@ if __name__ == "__main__":
 
                 requires_skill_input = model_requires_skill_input(cfg)
                 uses_guidance_point = model_uses_guidance_point(cfg)
-                if uses_guidance_point:
-                    assert args.annotate_skill, (
-                        "Checkpoint config has data.annotate_guidance_point=true, "
-                        "which requires --annotate-skill so guidance points are drawn "
-                        "into policy input RGB observations."
-                    )
                 actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
                 print(
                     "Skill input requirement: "
@@ -870,7 +865,10 @@ if __name__ == "__main__":
                     if args.save_depth_image:
                         suffix = "rgbd"
                     if args.annotate_skill:
-                        suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
+                        if args.guidance_point_on_image:
+                            suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
+                        else:
+                            suffix = "rgbd-only-skill" if args.save_depth_image else "rgb-only-skill"
                     if task_group:
                         suffix = f"{suffix}/{task_group}" if suffix else task_group
                     if args.rollout_suffix_model_name is not None:
@@ -1002,6 +1000,7 @@ if __name__ == "__main__":
                         pc_generator=pc_generator,
                         annotate_skill=args.annotate_skill,
                         annotate_guidance_point=uses_guidance_point,
+                        guidance_point_on_image=args.guidance_point_on_image,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
                         collect_skill_stats=True,

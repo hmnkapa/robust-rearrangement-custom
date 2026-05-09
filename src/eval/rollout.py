@@ -399,6 +399,7 @@ def rollout(
     pc_generator = None,
     annotate_skill: bool = False,
     annotate_guidance_point: bool = False,
+    guidance_point_on_image: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -490,7 +491,7 @@ def rollout(
         resize_depth(video_obs, "depth_image1")
         resize_crop_depth(video_obs, "depth_image2")
 
-    if annotate_skill or annotate_guidance_point:
+    if annotate_guidance_point or guidance_point_on_image:
         _draw_guidance_points_for_all_envs(
             video_obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
         )
@@ -657,7 +658,7 @@ def rollout(
             resize_depth(video_obs, "depth_image1")
             resize_crop_depth(video_obs, "depth_image2")
 
-        if annotate_skill or annotate_guidance_point:
+        if annotate_guidance_point or guidance_point_on_image:
             _draw_guidance_points_for_all_envs(
                 video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
             )
@@ -795,6 +796,7 @@ def calculate_success_rate(
     pc_generator = None,
     annotate_skill: bool = False,
     annotate_guidance_point: bool = False,
+    guidance_point_on_image: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -855,6 +857,7 @@ def calculate_success_rate(
             pc_generator=pc_generator,
             annotate_skill=annotate_skill,
             annotate_guidance_point=annotate_guidance_point,
+            guidance_point_on_image=guidance_point_on_image,
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
@@ -1082,6 +1085,7 @@ def do_rollout_evaluation(
     actor: Actor,
     best_success_rate: float,
     epoch_idx: int,
+    guidance_point_on_image: bool = False,
 ) -> float:
     rollout_task = config.rollout.get("task", config.task)
     rollout_randomness = config.rollout.get("randomness", config.randomness)
@@ -1113,6 +1117,7 @@ def do_rollout_evaluation(
         annotate_guidance_point=annotate_guidance_point,
         provide_skill_input=provide_skill_input,
         collect_skill_stats=True,
+        guidance_point_on_image=guidance_point_on_image,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)
