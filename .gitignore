@@ -129,3 +129,4 @@ scene.xml
 /isaacgym/
 /.bench_tmp/
 /.tmp/
+/.claude/
