@@ -187,7 +187,10 @@ def _resize_guidance_point_for_image(
     return uv.astype(np.float32)
 
 
-def _draw_guidance_points_for_all_envs(video_obs, annotation_bundles, annotate_wrist_camera: bool):
+def _draw_guidance_points_for_all_envs(
+    video_obs, annotation_bundles, annotate_wrist_camera: bool,
+    guidance_point_colored: bool = False,
+):
     image_keys = ["color_image2"]
     if annotate_wrist_camera:
         image_keys.append("color_image1")
@@ -205,7 +208,9 @@ def _draw_guidance_points_for_all_envs(video_obs, annotation_bundles, annotate_w
                 annotated_batch[env_idx].shape,
             )
             annotated_batch[env_idx] = draw_guidance_point_on_image(
-                annotated_batch[env_idx], guidance
+                annotated_batch[env_idx], guidance,
+                skill=bundle.get("skill"),
+                use_skill_color=guidance_point_colored,
             )
         video_obs[image_key] = torch.from_numpy(annotated_batch).to(video_obs[image_key].device)
 
@@ -400,6 +405,7 @@ def rollout(
     annotate_skill: bool = False,
     annotate_guidance_point: bool = False,
     guidance_point_on_image: bool = False,
+    guidance_point_colored: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -481,7 +487,8 @@ def rollout(
     resize_crop_depth(obs, "depth_image2")
     if annotate_guidance_point:
         _draw_guidance_points_for_all_envs(
-            obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
+            obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera,
+            guidance_point_colored=guidance_point_colored,
         )
     _attach_skill_tensor_to_obs(obs, actor, initial_skills)
 
@@ -493,7 +500,8 @@ def rollout(
 
     if annotate_guidance_point or guidance_point_on_image:
         _draw_guidance_points_for_all_envs(
-            video_obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera
+            video_obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera,
+            guidance_point_colored=guidance_point_colored,
         )
 
     # save initial visualization and rewards
@@ -647,7 +655,8 @@ def rollout(
         resize_crop_depth(obs, "depth_image2")
         if annotate_guidance_point:
             _draw_guidance_points_for_all_envs(
-                obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
+                obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera,
+                guidance_point_colored=guidance_point_colored,
             )
         _attach_skill_tensor_to_obs(obs, actor, current_skills)
 
@@ -660,7 +669,8 @@ def rollout(
 
         if annotate_guidance_point or guidance_point_on_image:
             _draw_guidance_points_for_all_envs(
-                video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera
+                video_obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera,
+                guidance_point_colored=guidance_point_colored,
             )
 
         skills.append(current_skills)
@@ -797,6 +807,7 @@ def calculate_success_rate(
     annotate_skill: bool = False,
     annotate_guidance_point: bool = False,
     guidance_point_on_image: bool = False,
+    guidance_point_colored: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -858,6 +869,7 @@ def calculate_success_rate(
             annotate_skill=annotate_skill,
             annotate_guidance_point=annotate_guidance_point,
             guidance_point_on_image=guidance_point_on_image,
+            guidance_point_colored=guidance_point_colored,
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
@@ -1086,6 +1098,7 @@ def do_rollout_evaluation(
     best_success_rate: float,
     epoch_idx: int,
     guidance_point_on_image: bool = False,
+    guidance_point_colored: bool = False,
 ) -> float:
     rollout_task = config.rollout.get("task", config.task)
     rollout_randomness = config.rollout.get("randomness", config.randomness)
@@ -1118,6 +1131,7 @@ def do_rollout_evaluation(
         provide_skill_input=provide_skill_input,
         collect_skill_stats=True,
         guidance_point_on_image=guidance_point_on_image,
+        guidance_point_colored=guidance_point_colored,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)

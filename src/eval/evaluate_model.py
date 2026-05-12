@@ -509,6 +509,7 @@ if __name__ == "__main__":
     parser.add_argument("--record-for-coverage", action="store_true")
     parser.add_argument("--annotate-skill", action="store_true")
     parser.add_argument("--guidance-point-on-image", action="store_true")
+    parser.add_argument("--guidance-point-colored", action="store_true")
     parser.add_argument("--skill-on-image", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
@@ -866,7 +867,10 @@ if __name__ == "__main__":
                         suffix = "rgbd"
                     if args.annotate_skill:
                         if args.guidance_point_on_image:
-                            suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
+                            if args.guidance_point_colored:
+                                suffix = "rgbd-skill-colored" if args.save_depth_image else "rgb-skill-colored"
+                            else:
+                                suffix = "rgbd-skill" if args.save_depth_image else "rgb-skill"
                         else:
                             suffix = "rgbd-only-skill" if args.save_depth_image else "rgb-only-skill"
                     if task_group:
@@ -1001,6 +1005,7 @@ if __name__ == "__main__":
                         annotate_skill=args.annotate_skill,
                         annotate_guidance_point=uses_guidance_point,
                         guidance_point_on_image=args.guidance_point_on_image,
+                        guidance_point_colored=args.guidance_point_colored,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
                         collect_skill_stats=True,

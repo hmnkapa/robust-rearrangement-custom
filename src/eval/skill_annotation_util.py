@@ -17,6 +17,13 @@ from furniture_bench.utils.pose import rot_mat
 
 
 VALID_SKILLS = {"pick", "place", "insert", "screw", "push"}
+GUIDANCE_POINT_COLOR_MAP = {
+    "pick": (0, 255, 255),    # Yellow in BGR
+    "screw": (0, 255, 255),   # Yellow in BGR
+    "place": (255, 0, 0),     # Red in BGR (original)
+    "push": (255, 0, 0),      # Red in BGR (original)
+    "insert": (255, 0, 0),    # Red in BGR (original)
+}
 OUTPUT_HEIGHT = 240
 OUTPUT_WIDTH = 320
 
@@ -781,7 +788,12 @@ def draw_skill_on_image(image: np.ndarray, skill: str) -> np.ndarray:
     return annotated
 
 
-def draw_guidance_point_on_image(image: np.ndarray, guidance_point_2d) -> np.ndarray:
+def draw_guidance_point_on_image(
+    image: np.ndarray,
+    guidance_point_2d,
+    skill: Optional[str] = None,
+    use_skill_color: bool = False,
+) -> np.ndarray:
     if guidance_point_2d is None:
         return image
 
@@ -793,7 +805,10 @@ def draw_guidance_point_on_image(image: np.ndarray, guidance_point_2d) -> np.nda
     # big dot setting
     # point_radius = 6
     # point_alpha = 1.0
-    point_color = (255, 0, 0)
+    if use_skill_color and skill and skill in GUIDANCE_POINT_COLOR_MAP:
+        point_color = GUIDANCE_POINT_COLOR_MAP[skill]
+    else:
+        point_color = (255, 0, 0)
 
     def _draw_point(frame: np.ndarray, center: tuple[int, int]) -> np.ndarray:
         overlay = frame.copy()
