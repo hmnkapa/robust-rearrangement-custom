@@ -12,6 +12,7 @@ data:
   augment_image: true
   # 引导信息
   annotate_guidance_point: false
+  annotate_guidance_point_colored: false
   annotate_skill_one_hot: false
   environment: ${environment}
   task: ${task}

@@ -16,7 +16,7 @@ from typing import Dict, Optional, Union
 from pathlib import Path
 
 from src.behavior.base import Actor
-from src.behavior.base import model_requires_skill_input, model_uses_guidance_point
+from src.behavior.base import model_requires_skill_input, model_uses_guidance_point, model_uses_guidance_point_colored
 from src.common.skills import batch_skills_to_onehot_tensor
 from src.visualization.render_mp4 import create_in_memory_mp4
 from src.common.context import suppress_all_output
@@ -406,6 +406,7 @@ def rollout(
     annotate_guidance_point: bool = False,
     guidance_point_on_image: bool = False,
     guidance_point_colored: bool = False,
+    model_guidance_point_colored: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -488,7 +489,7 @@ def rollout(
     if annotate_guidance_point:
         _draw_guidance_points_for_all_envs(
             obs, initial_annotations, annotate_wrist_camera=annotate_wrist_camera,
-            guidance_point_colored=guidance_point_colored,
+            guidance_point_colored=model_guidance_point_colored,
         )
     _attach_skill_tensor_to_obs(obs, actor, initial_skills)
 
@@ -656,7 +657,7 @@ def rollout(
         if annotate_guidance_point:
             _draw_guidance_points_for_all_envs(
                 obs, current_annotations, annotate_wrist_camera=annotate_wrist_camera,
-                guidance_point_colored=guidance_point_colored,
+                guidance_point_colored=model_guidance_point_colored,
             )
         _attach_skill_tensor_to_obs(obs, actor, current_skills)
 
@@ -808,6 +809,7 @@ def calculate_success_rate(
     annotate_guidance_point: bool = False,
     guidance_point_on_image: bool = False,
     guidance_point_colored: bool = False,
+    model_guidance_point_colored: bool = False,
     skill_on_image: bool = False,
     annotate_wrist_camera: bool = False,
     provide_skill_input: bool = False,
@@ -870,6 +872,7 @@ def calculate_success_rate(
             annotate_guidance_point=annotate_guidance_point,
             guidance_point_on_image=guidance_point_on_image,
             guidance_point_colored=guidance_point_colored,
+            model_guidance_point_colored=model_guidance_point_colored,
             skill_on_image=skill_on_image,
             annotate_wrist_camera=annotate_wrist_camera,
             provide_skill_input=provide_skill_input,
@@ -1116,6 +1119,7 @@ def do_rollout_evaluation(
     actor.set_task(task2idx[rollout_task])
     provide_skill_input = model_requires_skill_input(config)
     annotate_guidance_point = model_uses_guidance_point(config)
+    model_guidance_point_colored = model_uses_guidance_point_colored(config)
 
     rollout_stats = calculate_success_rate(
         env,
@@ -1132,6 +1136,7 @@ def do_rollout_evaluation(
         collect_skill_stats=True,
         guidance_point_on_image=guidance_point_on_image,
         guidance_point_colored=guidance_point_colored,
+        model_guidance_point_colored=model_guidance_point_colored,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)

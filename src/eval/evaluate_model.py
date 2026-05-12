@@ -22,7 +22,7 @@ from gymnasium import Env
 import torch  # needs to be after isaac gym imports
 from omegaconf import DictConfig, OmegaConf
 from src.behavior.base import Actor  # noqa
-from src.behavior.base import model_requires_skill_input, model_uses_guidance_point
+from src.behavior.base import model_requires_skill_input, model_uses_guidance_point, model_uses_guidance_point_colored
 from src.behavior.diffusion import DiffusionPolicy  # noqa
 from src.eval.rollout import calculate_success_rate
 from src.behavior import get_actor
@@ -782,6 +782,7 @@ if __name__ == "__main__":
 
                 requires_skill_input = model_requires_skill_input(cfg)
                 uses_guidance_point = model_uses_guidance_point(cfg)
+                uses_guidance_point_colored = model_uses_guidance_point_colored(cfg)
                 actor_name = cfg.actor_name if "actor_name" in cfg else cfg.actor.name
                 print(
                     "Skill input requirement: "
@@ -1006,6 +1007,7 @@ if __name__ == "__main__":
                         annotate_guidance_point=uses_guidance_point,
                         guidance_point_on_image=args.guidance_point_on_image,
                         guidance_point_colored=args.guidance_point_colored,
+                        model_guidance_point_colored=uses_guidance_point_colored,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
                         collect_skill_stats=True,

@@ -33,6 +33,7 @@ from src.behavior.base import (
     Actor,
     model_requires_skill_input,
     model_uses_guidance_point,
+    model_uses_guidance_point_colored,
 )
 from src.common.earlystop import EarlyStopper
 from src.common.files import get_processed_paths, path_override
@@ -471,10 +472,12 @@ def sort_data_paths(data_paths: List[Path]) -> List[Path]:
 
 def configure_observation_annotation_flags(cfg: DictConfig):
     annotate_guidance_point = model_uses_guidance_point(cfg)
+    annotate_guidance_point_colored = model_uses_guidance_point_colored(cfg)
     annotate_skill_one_hot = model_requires_skill_input(cfg)
 
     OmegaConf.set_struct(cfg, False)
     cfg.data.annotate_guidance_point = annotate_guidance_point
+    cfg.data.annotate_guidance_point_colored = annotate_guidance_point_colored
     cfg.data.annotate_skill_one_hot = annotate_skill_one_hot
     cfg.skill_dim = len(SKILL_ORDER) if annotate_skill_one_hot else 0
     OmegaConf.set_struct(cfg, True)

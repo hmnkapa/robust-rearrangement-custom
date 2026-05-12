@@ -40,6 +40,11 @@ def model_uses_guidance_point(cfg: DictConfig) -> bool:
     return False if guidance_flag is None else guidance_flag
 
 
+def model_uses_guidance_point_colored(cfg: DictConfig) -> bool:
+    colored_flag = _config_data_flag(cfg, "annotate_guidance_point_colored")
+    return False if colored_flag is None else colored_flag
+
+
 def model_requires_skill_input(cfg: DictConfig) -> bool:
     skill_flag = _config_data_flag(cfg, "annotate_skill_one_hot")
     if skill_flag is not None:
