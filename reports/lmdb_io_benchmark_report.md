@@ -336,6 +336,13 @@ LMDB 使用 MVCC，每个 `get_frames()` 调用涉及读事务。虽然 LMDB 的
 > *232: `O_DIRECT` 不被该内核支持，随机 4K 数据无 `O_DIRECT`（可能部分命中 page cache）
 > †HDD 随机读为 LMDB benchmark 实测值（16 workers + NCQ），`O_DIRECT` 下单线程仅 ~1.6 MB/s（无 NCQ 协同）
 
+**补充测试（3090服务器）**：
+
+| 服务器 | 最快盘路径 | 磁盘类型 | 顺序读 (MB/s) | 随机 4K 16 并发 (MB/s) | 可用空间 |
+|--------|-----------|---------|--------------|----------------------|---------|
+| `zju_3090_221` | `/home/hy` | **NVMe** | 1,900 | ~707 | `/` 808G |
+| `zju_3090_251` `/data` | `/data` | **RAID HDD** | 214 | **~2.4** | `/data` 347G |
+
 **测试方法说明**：
 - 顺序读：`dd if=/tmp/testfile of=/dev/null bs=1M count=1024 iflag=direct`（绕过 page cache）
 - 随机 4K 16 并发：16 个 Python 进程同时 `O_DIRECT` 随机读（`os.lseek` + `os.read`），每进程 10,000 次 4KB 读取，跨越 2GB 文件。报告值为 16 进程聚合
