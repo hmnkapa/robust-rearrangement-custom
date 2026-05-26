@@ -605,8 +605,10 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
     def _subdivide_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
         """Subdivide an action chunk into smaller steps.
 
-        chunk: (B, N, 8) — delta actions [dx,dy,dz, qx,qy,qz,qw, grip]
-        Returns: (B, M, 8) where M = int(N * subdivide_ratio)
+        chunk: (B, N, D) — delta actions.
+          D=8:  [dx,dy,dz, qx,qy,qz,qw, grip]  (quaternion)
+          D=10: [dx,dy,dz, r1..r6, grip]       (rot_6d)
+        Returns: (B, M, D) where M = int(N * subdivide_ratio)
         """
         ratio = self.subdivide_ratio
         B, N, D = chunk.shape
@@ -624,22 +626,51 @@ class Actor(torch.nn.Module, PrintParamCountMixin, metaclass=PostInitCaller):
         cum_pos = pos_delta.cumsum(dim=1)
         cum_pos = torch.cat([torch.zeros(B, 1, 3, device=device, dtype=dtype), cum_pos], dim=1)
         new_cum_pos = _linear_resample_1d(cum_pos, old_t, new_t)
-        new_pos = (new_cum_pos[:, 1:, :] - new_cum_pos[:, :-1, :]) / ratio
+        new_pos = (new_cum_pos[:, 1:, :] - new_cum_pos[:, :-1, :])
 
-        quat_delta = chunk[:, :, 3:7]
-        rotvec_delta = C.quaternion_to_axis_angle(quat_delta)
+        if D == 8:
+            quat_delta = chunk[:, :, 3:7]
+            rotvec_delta = C.quaternion_to_axis_angle(quat_delta)
+        elif D == 10:
+            # rot_6d actions in normalized space: consecutive values are
+            # close, so linear interpolation is safe and correct.
+            rot_delta = chunk[:, :, 3:-1]
+            cum_rot = rot_delta.cumsum(dim=1)
+            cum_rot = torch.cat([torch.zeros(B, 1, D - 4, device=device, dtype=dtype), cum_rot], dim=1)
+            new_cum_rot = _linear_resample_1d(cum_rot, old_t, new_t)
+            new_rot = (new_cum_rot[:, 1:, :] - new_cum_rot[:, :-1, :])
+            grip = chunk[:, :, -1:]
+            new_t_mid = torch.linspace(0.0, float(N - 1), M, device=device)
+            nn_idx = new_t_mid.round().long().clamp(0, N - 1)
+            new_grip = grip[:, nn_idx, :]
+            return torch.cat([new_pos, new_rot, new_grip], dim=-1)
+        else:
+            # Generic fallback: treat rotation dims 3:D-1 as a block and
+            # interpolate linearly (no SO(3) geodesic). Gripper is last dim.
+            rot_delta = chunk[:, :, 3:-1]
+            cum_rot = rot_delta.cumsum(dim=1)
+            cum_rot = torch.cat([torch.zeros(B, 1, D - 4, device=device, dtype=dtype), cum_rot], dim=1)
+            new_cum_rot = _linear_resample_1d(cum_rot, old_t, new_t)
+            new_rot = (new_cum_rot[:, 1:, :] - new_cum_rot[:, :-1, :])
+            grip = chunk[:, :, -1:]
+            new_t_mid = torch.linspace(0.0, float(N - 1), M, device=device)
+            nn_idx = new_t_mid.round().long().clamp(0, N - 1)
+            new_grip = grip[:, nn_idx, :]
+            return torch.cat([new_pos, new_rot, new_grip], dim=-1)
+
+        # D == 8 only (D == 10 and fallback both return early above)
         cum_rotvec = rotvec_delta.cumsum(dim=1)
         cum_rotvec = torch.cat([torch.zeros(B, 1, 3, device=device, dtype=dtype), cum_rotvec], dim=1)
         new_cum_rotvec = _linear_resample_1d(cum_rotvec, old_t, new_t)
-        new_rotvec = (new_cum_rotvec[:, 1:, :] - new_cum_rotvec[:, :-1, :]) / ratio
-        new_quat = _axis_angle_to_quaternion(new_rotvec)
+        new_rotvec = (new_cum_rotvec[:, 1:, :] - new_cum_rotvec[:, :-1, :])
+        new_rot = _axis_angle_to_quaternion(new_rotvec)
 
-        grip = chunk[:, :, 7:8]
+        grip = chunk[:, :, D - 1 : D]
         new_t_mid = torch.linspace(0.0, float(N - 1), M, device=device)
         nn_idx = new_t_mid.round().long().clamp(0, N - 1)
         new_grip = grip[:, nn_idx, :]
 
-        return torch.cat([new_pos, new_quat, new_grip], dim=-1)
+        return torch.cat([new_pos, new_rot, new_grip], dim=-1)
 
     def _subdivide_actions(self, actions: deque) -> deque:
         chunk = torch.stack(list(actions), dim=1)

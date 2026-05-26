@@ -3,7 +3,9 @@ import hydra
 from omegaconf import DictConfig
 from src.behavior.diffusion import DiffusionPolicy
 from src.common.geometry import proprioceptive_quat_to_6d_rotation
+import src.common.geometry as C
 from src.models.residual import ResidualPolicy
+from src.behavior.base import _axis_angle_to_quaternion
 import torch
 import torch.nn as nn
 
@@ -44,6 +46,10 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         self.actions = None
         self.observations = deque(maxlen=self.obs_horizon)
         self.base_nactions = deque(maxlen=self.action_horizon)
+        self._last_subdivide_ratio: float = 1.0
+        # Queue of pre-computed sub-actions from per-step subdivision.
+        # When non-empty, pop directly instead of running model inference.
+        self._sub_actions: deque = deque()
 
         # Make the residual layers:
         # This is an MLP that takes in the state and predicted action
@@ -112,10 +118,29 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         """
         Predict the action given the batch of observations
         """
+        # If we have pending sub-actions from a previous per-step
+        # subdivision, return the next one directly (already denormalized).
+        if self._sub_actions:
+            result = self._sub_actions.popleft()
+            # Reset tracked EE position when sub-actions are exhausted so
+            # the next full step re-reads from the fresh observation.
+            if not self._sub_actions:
+                self._tracked_ee_pos = None
+            return result
+
         self.observations.append(obs)
 
         # Normalize observations
         nobs = self._normalized_obs(self.observations, flatten=self.flatten_obs)
+
+        # When the subdivide ratio changes (skill transition), discard
+        # any leftover actions from the previous ratio to avoid mixing
+        # different step sizes.
+        if self.subdivide_ratio != self._last_subdivide_ratio:
+            self.base_nactions.clear()
+            self._sub_actions.clear()
+            self._tracked_ee_pos = None
+            self._last_subdivide_ratio = self.subdivide_ratio
 
         if not self.base_nactions:
             # If there are no base actions, predict the action
@@ -125,8 +150,6 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
             start = self.obs_horizon - 1 if self.predict_past_actions else 0
             end = start + self.action_horizon
             chunk = base_nactioon_pred[:, start:end, :]  # (B, action_horizon, D)
-            if self.subdivide_ratio > 1.0:
-                chunk = self._subdivide_chunk(chunk)
             for i in range(chunk.shape[1]):
                 self.base_nactions.append(chunk[:, i, :])
 
@@ -137,14 +160,74 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         nobs = nobs.flatten(start_dim=1)
         residual_nobs = torch.cat([nobs, base_naction], dim=-1)
 
-        # Predict the residual (already scaled)
-        residual = self.residual_policy.get_action(residual_nobs)
+        # Predict the residual (already scaled = actor_mean * action_scale)
+        # Also get unscaled actor_mean for training-metric comparison
+        actor_mean = self.residual_policy.actor_mean(residual_nobs)  # unscaled, raw NN output
+        residual = actor_mean * self.residual_policy.action_scale  # = get_action(...)
 
         # Add the residual to the base action
         naction = base_naction + residual
 
-        # Denormalize and return the action
-        return self.normalizer(naction, "action", forward=False)
+        # DEBUG: compute EXACT same metric as training wandb "action_norm_mean"
+        # training code: action_norms = torch.norm(b_actions[:, :3], dim=-1)
+        # where b_actions = unscaled residual_naction (sampled during training, mean during eval)
+        # For eval we use mean (no sampling). To match training exactly, also simulate sampling.
+        unscaled_pos_norm_mean = torch.norm(actor_mean[:, :3], dim=-1)  # per-env, position only
+        # Also simulate with sampling noise: logstd=-1 -> std=exp(-1)=0.368
+        actor_std = torch.exp(self.residual_policy.actor_logstd[:, :3])  # (1, 3)
+        # Expected ||sampled||^2 = ||mu||^2 + 3*sigma^2 (approximately)
+        unscaled_pos_norm_with_noise = torch.sqrt(
+            unscaled_pos_norm_mean ** 2 + 3 * actor_std.mean() ** 2
+        )
+        if not hasattr(self, '_train_metric_norms'):
+            self._train_metric_norms = []
+            self._train_metric_norms_with_noise = []
+            self._base_pos_norms = []
+            self._scaled_res_pos_norms = []
+        self._train_metric_norms.append(unscaled_pos_norm_mean.mean().item())
+        self._train_metric_norms_with_noise.append(unscaled_pos_norm_with_noise.mean().item())
+        self._base_pos_norms.append(torch.norm(base_naction[:, :3], dim=-1).mean().item())
+        self._scaled_res_pos_norms.append(torch.norm(residual[:, :3], dim=-1).mean().item())
+
+        # Denormalize the final action
+        final_action = self.normalizer(naction, "action", forward=False)  # (B, D)
+
+        if self.subdivide_ratio > 1.0:
+            # Subdivide this single final action into `ratio` sub-actions.
+            # The action is absolute position + delta rotation.
+            # Track our own EE position estimate because observations are
+            # not updated during sub-steps (we skip model forward pass).
+            if not hasattr(self, '_tracked_ee_pos'):
+                self._tracked_ee_pos = None
+            r = int(self.subdivide_ratio)
+            if self._tracked_ee_pos is None:
+                # First subdivided step: read actual EE pos from observation
+                self._tracked_ee_pos = self.observations[-1]["robot_state"][:, :3]
+            ee_pos = self._tracked_ee_pos
+
+            target_pos = final_action[:, :3]  # (B, 3)
+            delta_pos = target_pos - ee_pos
+            # Rotation: rot_6d → quat → axis-angle → scale → quat → rot_6d
+            rot_6d = final_action[:, 3:9]  # (B, 6)
+            rot_mat = C.rotation_6d_to_matrix(rot_6d)
+            quat_delta = C.matrix_to_quaternion_xyzw(rot_mat)  # (B, 4)
+            aa_delta = C.quaternion_to_axis_angle(quat_delta)  # (B, 3)
+            grip = final_action[:, 9:10]  # (B, 1)
+
+            for k in range(1, r + 1):
+                frac = k / r
+                sub_pos = ee_pos + delta_pos * frac
+                sub_aa = aa_delta * frac
+                sub_quat = _axis_angle_to_quaternion(sub_aa)
+                sub_rot_6d = C.quaternion_xyzw_to_rotation_6d(sub_quat)
+                self._sub_actions.append(
+                    torch.cat([sub_pos, sub_rot_6d, grip], dim=-1)
+                )
+            # Update tracked position to the final target
+            self._tracked_ee_pos = target_pos
+            return self._sub_actions.popleft()
+
+        return final_action
 
     @torch.no_grad()
     def action_pred(self, batch):

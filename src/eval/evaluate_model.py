@@ -1010,7 +1010,7 @@ if __name__ == "__main__":
                         model_guidance_point_colored=uses_guidance_point_colored,
                         skill_on_image=args.skill_on_image,
                         provide_skill_input=requires_skill_input,
-                        collect_skill_stats=True,
+                        collect_skill_stats=args.annotate_skill,
                         output_only_pickle=args.output_only_pickle,
                         perturb_runner=perturb_runner,
                     )
@@ -1023,6 +1023,18 @@ if __name__ == "__main__":
                         f"Success rate ({task}): "
                         f"{format_success_rate(rollout_stats.n_success, rollout_stats.n_rollouts)}"
                     )
+                    # DEBUG: print training-equivalent action_norm_mean
+                    if hasattr(actor, '_train_metric_norms') and actor._train_metric_norms:
+                        import numpy as np
+                        tmn = np.array(actor._train_metric_norms)
+                        tmn_n = np.array(actor._train_metric_norms_with_noise)
+                        bpn = np.array(actor._base_pos_norms)
+                        srpn = np.array(actor._scaled_res_pos_norms)
+                        print(f"[TRAIN_METRIC] action_norm_mean (mean, pos3d, unscaled) = {tmn.mean():.4f} std={tmn.std():.4f}")
+                        print(f"[TRAIN_METRIC] action_norm_mean (with noise, pos3d, unscaled) = {tmn_n.mean():.4f} std={tmn_n.std():.4f}")
+                        print(f"[TRAIN_METRIC] base_action pos3d norm (normalized) = {bpn.mean():.4f}")
+                        print(f"[TRAIN_METRIC] residual pos3d norm (scaled by action_scale) = {srpn.mean():.4f}")
+                        print(f"[TRAIN_METRIC] residual scaled / base (pos3d) = {srpn.mean()/bpn.mean()*100:.1f}%")
                     _print_skill_progress_stats(
                         task=task,
                         state_counts=rollout_stats.state_counts,
