@@ -488,6 +488,13 @@ if __name__ == "__main__":
     parser.add_argument("--stop-after-n-success", type=int, default=0)
     parser.add_argument("--break-on-n-success", action="store_true")
     parser.add_argument(
+        "--target-successes",
+        type=int,
+        default=0,
+        help="If >0, keep running rollouts until this many successes are collected. "
+        "n-rollouts acts as the batch size per iteration.",
+    )
+    parser.add_argument(
         "--perturb-mode",
         type=str,
         choices=PERTURB_MODES,
@@ -989,6 +996,7 @@ if __name__ == "__main__":
                         actor=actor,
                         env=env,
                         n_rollouts=args.n_rollouts,
+                        target_successes=args.target_successes or None,
                         rollout_max_steps=rollout_max_steps,
                         epoch_idx=0,
                         discount=cfg.discount,

@@ -363,16 +363,25 @@ class SuccessTqdm(tqdm):
         self.task_name = task_name
         self.round = 0
         self.success_in_prev_rounds = 0
+        self.target_only = False
 
     def pbar_desc(self, n_success: int):
         total = self.round * self.num_envs
         n_success += self.success_in_prev_rounds
         success_rate = n_success / total if total > 0 else 0
-        self.set_description(
-            f"Performing rollouts ({self.task_name}): "
-            f"round {self.round}/{self.n_rollouts//self.num_envs}, "
-            f"success: {n_success}/{total} ({success_rate:.1%})"
-        )
+        if self.target_only:
+            desc = (
+                f"Performing rollouts ({self.task_name}): "
+                f"round {self.round}, "
+                f"success: {n_success}/{total} ({success_rate:.1%})"
+            )
+        else:
+            desc = (
+                f"Performing rollouts ({self.task_name}): "
+                f"round {self.round}/{self.n_rollouts//self.num_envs}, "
+                f"success: {n_success}/{total} ({success_rate:.1%})"
+            )
+        self.set_description(desc)
 
     def before_round(self, n_success: int):
         self.success_in_prev_rounds = n_success
@@ -817,7 +826,10 @@ def calculate_success_rate(
     full_length_rollout: bool = False,
     output_only_pickle: bool = False,
     perturb_runner: Optional[PerturbRunner] = None,
+    target_successes: Optional[int] = None,
 ) -> RolloutStats:
+
+    use_target_mode = target_successes is not None and target_successes > 0
 
     pbar = SuccessTqdm(
         num_envs=env.num_envs,
@@ -828,6 +840,8 @@ def calculate_success_rate(
         leave=True,
         unit="step",
     )
+    if use_target_mode:
+        pbar.target_only = True
 
     if n_parts_assemble is None:
         n_parts_assemble = env.n_parts_assemble
@@ -837,6 +851,7 @@ def calculate_success_rate(
     )
 
     n_success = 0
+    n_total_rollouts = 0
     total_reward = 0
     episode_returns = []
     table_rows = []
@@ -854,7 +869,12 @@ def calculate_success_rate(
         first_success = []
 
     pbar.pbar_desc(n_success)
-    for i in range(n_rollouts // env.num_envs):
+    while True:
+        if not use_target_mode and n_total_rollouts >= n_rollouts:
+            break
+        if use_target_mode and n_success >= target_successes:
+            break
+
         # Update the progress bar
         pbar.before_round(n_success)
 
@@ -885,6 +905,7 @@ def calculate_success_rate(
         # Calculate the success rate
         success_flags = rollout_data.rewards.sum(dim=1) == n_parts_assemble
         n_success += success_flags.sum().item()
+        n_total_rollouts += env.num_envs
 
         for env_idx in range(env.num_envs):
             _accumulate_episode_skill_stats(
@@ -1075,10 +1096,11 @@ def calculate_success_rate(
     skill_success_rates = _compute_success_rates(state_counts, skill_completion_counts)
     step_success_rates = _compute_success_rates(step_counts, step_completion_counts)
 
+    final_total = n_total_rollouts if use_target_mode else n_rollouts
     return RolloutStats(
-        success_rate=n_success / n_rollouts,
+        success_rate=n_success / max(final_total, 1),
         n_success=n_success,
-        n_rollouts=n_rollouts,
+        n_rollouts=final_total,
         epoch_idx=epoch_idx,
         rollout_max_steps=rollout_max_steps,
         total_return=np.sum(episode_returns) if episode_returns else 0,
