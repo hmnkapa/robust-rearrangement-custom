@@ -142,6 +142,13 @@ def compute_normalizer_stats_from_dict(data_dict):
 
 
 def merge_normalizer_stats(dst_stats, src_stats):
+    # If stats were previously cleared due to shape mismatch, don't rebuild
+    # them.  This sentinel forces downstream training code to recompute
+    # stats from data, which is correct for multi-task datasets whose
+    # observation spaces differ across tasks.
+    if dst_stats.get("__incompatible__"):
+        return
+
     for key, value in src_stats.items():
         if key not in dst_stats:
             dst_stats[key] = {
@@ -149,6 +156,17 @@ def merge_normalizer_stats(dst_stats, src_stats):
                 "max": value["max"].copy(),
             }
             continue
+
+        if dst_stats[key]["min"].shape != value["min"].shape:
+            print(
+                f"[WARNING] Shape mismatch for normalizer key '{key}': "
+                f"{dst_stats[key]['min'].shape} vs {value['min'].shape}. "
+                f"Clearing precomputed normalizer stats; "
+                f"they will be recomputed at training time."
+            )
+            dst_stats.clear()
+            dst_stats["__incompatible__"] = True
+            return
 
         dst_stats[key]["min"] = np.minimum(dst_stats[key]["min"], value["min"])
         dst_stats[key]["max"] = np.maximum(dst_stats[key]["max"], value["max"])
@@ -161,6 +179,7 @@ def serialize_normalizer_stats(stats):
             "max": value["max"].astype(np.float32, copy=False).tolist(),
         }
         for key, value in stats.items()
+        if not key.startswith("__")
     }
 
 
