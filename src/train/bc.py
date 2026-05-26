@@ -597,6 +597,7 @@ def main(cfg: DictConfig):
             demo_outcome=to_native(cfg.data.demo_outcome),
             suffix=to_native(cfg.data.suffix),
             dataset_format=to_native(cfg.data.get("storage_format", "zarr")),
+            suffix_fallback=to_native(cfg.data.get("suffix_fallback")),
         )
     else:
         data_path = path_override(cfg.data.data_paths_override)

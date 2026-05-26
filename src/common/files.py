@@ -115,6 +115,7 @@ def get_processed_paths(
     demo_outcome: Union[List[DemoStatus], DemoStatus] = "success",
     suffix: Union[str, None] = None,
     dataset_format: str = "zarr",
+    suffix_fallback: Union[str, None] = None,
 ) -> Path:
     """
     Takes in a set of parameters and returns a list of paths to
@@ -122,6 +123,9 @@ def get_processed_paths(
 
     The suffix parameter is used to choose any bespoke datasets that
     are not covered by the other parameters (e.g., diffik-produced data).
+
+    If suffix is provided and no data is found, suffix_fallback is used
+    as a fallback suffix before returning an empty list.
     """
 
     path = Path(os.environ["DATA_DIR_PROCESSED"]) / "processed"
@@ -140,6 +144,23 @@ def get_processed_paths(
         merged_paths = expand_lmdb_shard_paths(merged_path)
         if merged_paths:
             return merged_paths
+        if suffix is not None and suffix_fallback is not None:
+            print(
+                f"No data found for suffix '{suffix}', "
+                f"falling back to suffix '{suffix_fallback}'"
+            )
+            return get_processed_paths(
+                controller=controller,
+                domain=domain,
+                task=task,
+                demo_source=demo_source,
+                randomness=randomness,
+                demo_outcome=demo_outcome,
+                suffix=suffix_fallback,
+                dataset_format=dataset_format,
+                suffix_fallback=None,
+            )
+        return merged_paths
 
     paths = [path]
 
@@ -181,12 +202,29 @@ def get_processed_paths(
                 )
             else:
                 lmdb_paths.extend(expand_lmdb_shard_paths(path))
-        return sorted(set(lmdb_paths), key=lmdb_shard_sort_key)
+        result = sorted(set(lmdb_paths), key=lmdb_shard_sort_key)
+    else:
+        # Use glob to find all the zarr paths
+        result = [Path(path) for p in paths for path in glob(str(p), recursive=True)]
 
-    # Use glob to find all the zarr paths
-    paths = [Path(path) for p in paths for path in glob(str(p), recursive=True)]
+    if not result and suffix is not None and suffix_fallback is not None:
+        print(
+            f"No data found for suffix '{suffix}', "
+            f"falling back to suffix '{suffix_fallback}'"
+        )
+        return get_processed_paths(
+            controller=controller,
+            domain=domain,
+            task=task,
+            demo_source=demo_source,
+            randomness=randomness,
+            demo_outcome=demo_outcome,
+            suffix=suffix_fallback,
+            dataset_format=dataset_format,
+            suffix_fallback=None,
+        )
 
-    return paths
+    return result
 
 
 def path_override(

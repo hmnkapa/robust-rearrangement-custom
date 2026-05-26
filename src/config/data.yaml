@@ -22,6 +22,7 @@ data:
   demo_outcome: ${demo_outcome}
   pad_after: true
   suffix: null
+  suffix_fallback: null
   include_future_obs: false
   minority_class_power: false
   data_paths_override: null
