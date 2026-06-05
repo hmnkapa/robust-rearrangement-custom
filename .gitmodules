@@ -1,6 +1,6 @@
 [submodule "furniture-bench"]
 	path = furniture-bench
-	url = git@github.com:amorphophallus/FurnitureBench-custom.git
+	url = https://github.com/hmnkapa/FurnitureBench-custom.git
 	branch=main
 [submodule "third_party/pytorch3d"]
 	path = third_party/pytorch3d
