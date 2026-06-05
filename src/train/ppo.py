@@ -333,6 +333,7 @@ def main(cfg: DictConfig):
         # Find the rewards that are not zero
         # Env is successful if it received a reward more than or equal to n_parts_to_assemble
         env_success = (rewards > 0).sum(dim=0) >= n_parts_to_assemble
+        mean_reward = rewards.sum(dim=0).mean().item()
         success_rate = env_success.float().mean().item()
 
         # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
@@ -355,7 +356,11 @@ def main(cfg: DictConfig):
         if eval_mode:
             # If we are in eval mode, we don't need to do any training, so log the result and continue
             wandb.log(
-                {"eval/success_rate": success_rate, "iteration": iteration},
+                {
+                    "eval/success_rate": success_rate,
+                    "eval/mean_reward": mean_reward,
+                    "iteration": iteration,
+                },
                 step=global_step,
             )
 
@@ -559,6 +564,7 @@ def main(cfg: DictConfig):
             {
                 "charts/SPS": sps,
                 "charts/rewards": rewards.sum().item(),
+                "charts/mean_reward": mean_reward,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "values/advantages": b_advantages.mean().item(),

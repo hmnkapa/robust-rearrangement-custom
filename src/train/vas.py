@@ -354,6 +354,7 @@ def main(cfg: DictConfig):
                 )
 
         # Calculate the success rate
+        mean_reward = rewards.sum(dim=0).mean().item()
         reward_mask = rewards.sum(dim=0) > 0
         success_rate = reward_mask.float().mean().item()
 
@@ -379,7 +380,11 @@ def main(cfg: DictConfig):
         if eval_mode:
             # If we are in eval mode, we don't need to do any training, so log the result and continue
             wandb.log(
-                {"eval/success_rate": success_rate, "iteration": iteration},
+                {
+                    "eval/success_rate": success_rate,
+                    "eval/mean_reward": mean_reward,
+                    "iteration": iteration,
+                },
                 step=global_step,
             )
 
@@ -513,6 +518,7 @@ def main(cfg: DictConfig):
             {
                 "charts/SPS": sps,
                 "charts/rewards": rewards.sum().item(),
+                "charts/mean_reward": mean_reward,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "values/advantages": b_advantages.mean().item(),

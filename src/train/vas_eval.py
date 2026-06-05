@@ -452,6 +452,7 @@ if __name__ == "__main__":
             .item()
         )
         # If any positive reward was received, consider it a success
+        mean_reward = rewards.sum(dim=0).mean().item()
         reward_mask = (rewards.sum(dim=0) > 0).float()
         success_rate = reward_mask.mean().item()
 
@@ -464,6 +465,7 @@ if __name__ == "__main__":
             "charts/SPS", int(global_step / (time.time() - start_time)), global_step
         )
         writer.add_scalar("charts/rewards", rewards.sum().item(), global_step)
+        writer.add_scalar("charts/mean_reward", mean_reward, global_step)
         writer.add_scalar("charts/discounted_rewards", discounted_rewards, global_step)
         writer.add_scalar("charts/success_rate", success_rate, global_step)
 
