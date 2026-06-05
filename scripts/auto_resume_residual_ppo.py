@@ -289,10 +289,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     original_command = list(args.command)
     state = RunState()
+    resume_count = 0
 
     initial_resume = get_hydra_override(original_command, "resume.checkpoint_path")
     if initial_resume:
         state.run_name = Path(initial_resume).expanduser().parent.name
+        resume_count = 1
     initial_wandb_id = get_hydra_override(original_command, "wandb.continue_run_id")
     if initial_wandb_id:
         state.wandb_run_id = initial_wandb_id
@@ -308,16 +310,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command = original_command
     with log_path.open("a", encoding="utf-8") as log_file:
         runner._log_wrapper(log_file, f"log file: {log_path}")
+        if initial_resume:
+            runner._log_wrapper(
+                log_file,
+                f"initial resume checkpoint: {initial_resume} (resume #{resume_count})",
+            )
         while True:
             if attempt > 0 and state.run_name:
                 run_dir = workdir / "models" / state.run_name
                 checkpoint_path = find_latest_checkpoint(run_dir)
                 if checkpoint_path is not None:
+                    resume_count += 1
                     command = build_resume_command(
                         original_command, checkpoint_path, state.wandb_run_id
                     )
                     runner._log_wrapper(
-                        log_file, f"resuming from checkpoint: {checkpoint_path}"
+                        log_file,
+                        f"resuming from checkpoint: {checkpoint_path} (resume #{resume_count})",
                     )
                 else:
                     command = original_command
@@ -334,13 +343,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             return_code = runner.run_once(command, state, log_file)
             if return_code == 0:
+                runner._log_wrapper(log_file, f"total resume count: {resume_count}")
                 return 0
             if runner.stop_requested:
+                runner._log_wrapper(log_file, f"total resume count: {resume_count}")
                 return runner.exit_code_after_signal()
 
             attempt += 1
             runner.sleep_before_restart(log_file)
             if runner.stop_requested:
+                runner._log_wrapper(log_file, f"total resume count: {resume_count}")
                 return runner.exit_code_after_signal()
 
 
