@@ -1,7 +1,7 @@
 [submodule "furniture-bench"]
 	path = furniture-bench
-	url = https://github.com/hmnkapa/FurnitureBench-custom.git
-	branch=main
+	url = git@github.com:hmnkapa/FurnitureBench-custom.git
+	branch=feature/desk-reward
 [submodule "third_party/pytorch3d"]
 	path = third_party/pytorch3d
 	url = git@github.com:facebookresearch/pytorch3d.git
