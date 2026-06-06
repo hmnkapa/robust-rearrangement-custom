@@ -432,6 +432,8 @@ def main(cfg: DictConfig):
     actions = torch.zeros((steps_per_iteration, cfg.num_envs) + env.action_space.shape)
     logprobs = torch.zeros((steps_per_iteration, cfg.num_envs))
     rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    assembly_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    rot_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     dones = torch.zeros((steps_per_iteration, cfg.num_envs))
     values = torch.zeros((steps_per_iteration, cfg.num_envs))
 
@@ -494,24 +496,36 @@ def main(cfg: DictConfig):
             actions[step] = residual_naction.cpu()
             logprobs[step] = logprob.cpu()
             rewards[step] = reward.view(-1).cpu()
+            assembly_reward = info.get("assembly_reward", torch.zeros_like(reward))
+            if not torch.is_tensor(assembly_reward):
+                assembly_reward = torch.as_tensor(
+                    assembly_reward, device=reward.device
+                )
+            assembly_rewards[step] = assembly_reward.view(-1).detach().cpu()
+            rot_reward = info.get("desk_leg_rot_reward", torch.zeros_like(reward))
+            if not torch.is_tensor(rot_reward):
+                rot_reward = torch.as_tensor(rot_reward, device=reward.device)
+            rot_rewards[step] = rot_reward.view(-1).detach().cpu()
             next_done = next_done.view(-1).cpu()
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
                 print(
-                    f"env_step={env_step}, global_step={global_step}, mean_reward={rewards[:step+1].sum(dim=0).mean().item()} fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
+                    f"env_step={env_step}, global_step={global_step}, mean_reward={rewards[:step+1].sum(dim=0).mean().item()}, mean_rot_reward={rot_rewards[:step+1].sum(dim=0).mean().item()} fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
                 )
 
         # Calculate the success rate
         # Find the rewards that are not zero
         # Env is successful if it received a reward more than or equal to n_parts_to_assemble
-        env_success = (rewards > 0).sum(dim=0) >= n_parts_to_assemble
+        env_success = (assembly_rewards > 0).sum(dim=0) >= n_parts_to_assemble
         mean_reward = rewards.sum(dim=0).mean().item()
+        mean_assembly_reward = assembly_rewards.sum(dim=0).mean().item()
+        mean_rot_reward = rot_rewards.sum(dim=0).mean().item()
         success_rate = env_success.float().mean().item()
 
         if success_rate > 0:
             # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
             # Count total timesteps in successful trajectories
-            timesteps_in_success = rewards[:, env_success]
+            timesteps_in_success = assembly_rewards[:, env_success]
 
             # Find index of last reward in each trajectory
             # This has all timesteps including and after episode is done
@@ -572,6 +586,8 @@ def main(cfg: DictConfig):
                 {
                     "eval/success_rate": success_rate,
                     "eval/mean_reward": mean_reward,
+                    "eval/mean_assembly_reward": mean_assembly_reward,
+                    "eval/mean_rot_reward": mean_rot_reward,
                     "eval/best_eval_success_rate": best_eval_success_rate,
                     "iteration": iteration,
                 },
@@ -729,6 +745,10 @@ def main(cfg: DictConfig):
                 "training/SPS": sps,
                 "charts/rewards": rewards.sum().item(),
                 "charts/mean_reward": mean_reward,
+                "charts/assembly_rewards": assembly_rewards.sum().item(),
+                "charts/mean_assembly_reward": mean_assembly_reward,
+                "charts/rot_rewards": rot_rewards.sum().item(),
+                "charts/mean_rot_reward": mean_rot_reward,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "charts/mean_success_episode_length": mean_success_episode_length,
@@ -754,6 +774,8 @@ def main(cfg: DictConfig):
                 "histograms/advantages": wandb.Histogram(b_advantages),
                 "histograms/logprobs": wandb.Histogram(logprobs),
                 "histograms/rewards": wandb.Histogram(rewards),
+                "histograms/assembly_rewards": wandb.Histogram(assembly_rewards),
+                "histograms/rot_rewards": wandb.Histogram(rot_rewards),
                 "histograms/action_norms": wandb.Histogram(action_norms),
             },
             step=global_step,
