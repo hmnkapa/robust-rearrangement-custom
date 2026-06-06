@@ -293,6 +293,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     initial_resume = get_hydra_override(original_command, "resume.checkpoint_path")
     if initial_resume:
+        original_command = replace_or_append_hydra_override(
+            original_command, "resume.checkpoint_path", initial_resume
+        )
         state.run_name = Path(initial_resume).expanduser().parent.name
         resume_count = 1
     initial_wandb_id = get_hydra_override(original_command, "wandb.continue_run_id")

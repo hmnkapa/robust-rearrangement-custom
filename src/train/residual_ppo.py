@@ -6,8 +6,10 @@ from ipdb import set_trace as bp
 
 import random
 import time
+from typing import Optional
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from src.behavior.diffusion import DiffusionPolicy
@@ -36,6 +38,93 @@ import gymnasium as gym
 
 # Register the eval resolver for omegaconf
 OmegaConf.register_new_resolver("eval", eval)
+
+
+def _task_overrides_cfg() -> DictConfig:
+    """Return only explicit Hydra task overrides as an OmegaConf object."""
+    try:
+        overrides = HydraConfig.get().overrides.task
+    except ValueError:
+        return OmegaConf.create()
+
+    dotlist = []
+    for override in overrides:
+        if not override or override.startswith("hydra.") or override.startswith("~"):
+            continue
+        if "=" not in override:
+            continue
+        dotlist.append(override.lstrip("+"))
+    return OmegaConf.from_dotlist(dotlist)
+
+
+def _resolve_checkpoint_path(path: str) -> Path:
+    checkpoint_path = Path(path).expanduser()
+    if checkpoint_path.is_absolute():
+        return checkpoint_path
+    return Path(hydra.utils.get_original_cwd()) / checkpoint_path
+
+
+def _resume_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
+    resume_cfg = cfg.get("resume")
+    if resume_cfg is None:
+        return None
+    checkpoint_path = resume_cfg.get("checkpoint_path")
+    if checkpoint_path in (None, ""):
+        return None
+    return _resolve_checkpoint_path(str(checkpoint_path))
+
+
+def _load_local_checkpoint(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
+    print(f"Loading local resume checkpoint from {path}")
+    return torch.load(path, map_location="cpu")
+
+
+def _merge_checkpoint_config_with_overrides(
+    cfg: DictConfig, checkpoint_state_dict: dict
+) -> DictConfig:
+    checkpoint_cfg = checkpoint_state_dict.get("config")
+    if checkpoint_cfg is None:
+        return cfg
+
+    checkpoint_cfg = OmegaConf.create(checkpoint_cfg)
+    OmegaConf.set_struct(checkpoint_cfg, False)
+    merged_cfg = OmegaConf.merge(checkpoint_cfg, _task_overrides_cfg())
+    OmegaConf.set_struct(merged_cfg, False)
+    return merged_cfg
+
+
+def _is_eval_iteration(iteration: int, cfg: DictConfig) -> bool:
+    return (iteration - int(cfg.eval_first)) % cfg.eval_interval == 0
+
+
+def _global_step_from_iteration(iteration: int, cfg: DictConfig) -> int:
+    completed_train_iterations = sum(
+        not _is_eval_iteration(idx, cfg) for idx in range(1, iteration + 1)
+    )
+    return int(completed_train_iterations * cfg.batch_size)
+
+
+def _load_training_state(
+    *,
+    agent: nn.Module,
+    optimizer_actor: optim.Optimizer,
+    optimizer_critic: optim.Optimizer,
+    lr_scheduler_actor,
+    lr_scheduler_critic,
+    state_dict: dict,
+) -> None:
+    model_state_dict = state_dict["model_state_dict"]
+    if "actor_logstd" in model_state_dict:
+        agent.residual_policy.load_state_dict(model_state_dict)
+    else:
+        agent.load_state_dict(model_state_dict)
+
+    optimizer_actor.load_state_dict(state_dict["optimizer_actor_state_dict"])
+    optimizer_critic.load_state_dict(state_dict["optimizer_critic_state_dict"])
+    lr_scheduler_actor.load_state_dict(state_dict["scheduler_actor_state_dict"])
+    lr_scheduler_critic.load_state_dict(state_dict["scheduler_critic_state_dict"])
 
 
 @torch.no_grad()
@@ -76,25 +165,30 @@ def main(cfg: DictConfig):
 
     OmegaConf.set_struct(cfg, False)
 
+    resume_checkpoint_path = _resume_checkpoint_path(cfg)
+    run_state_dict = None
+    if resume_checkpoint_path is not None:
+        run_state_dict = _load_local_checkpoint(resume_checkpoint_path)
+        cfg = _merge_checkpoint_config_with_overrides(cfg, run_state_dict)
+
     if (job_id := os.environ.get("SLURM_JOB_ID")) is not None:
         cfg.slurm_job_id = job_id
 
     # Ensure exactly one of cfg.base_policy.wandb_id or cfg.base_policy.wt_path is set
-    assert (
-        sum(
-            [
-                cfg.base_policy.wandb_id is not None,
-                cfg.base_policy.wt_path is not None,
-            ]
-        )
-        == 1
-    ), "Exactly one of base_policy.wandb_id or base_policy.wt_path must be set"
-
-    run_state_dict = None
+    if resume_checkpoint_path is None:
+        assert (
+            sum(
+                [
+                    cfg.base_policy.wandb_id is not None,
+                    cfg.base_policy.wt_path is not None,
+                ]
+            )
+            == 1
+        ), "Exactly one of base_policy.wandb_id or base_policy.wt_path must be set"
 
     # Check if we are continuing a run
     run_exists = False
-    if cfg.wandb.continue_run_id is not None:
+    if resume_checkpoint_path is None and cfg.wandb.continue_run_id is not None:
         try:
             run: Run = wandb.Api().run(
                 f"{cfg.wandb.project}/{cfg.wandb.continue_run_id}"
@@ -135,6 +229,34 @@ def main(cfg: DictConfig):
         sps = run.summary.get("charts/SPS", run.summary.get("training/SPS", 0))
         training_cum_time = sps * global_step
         run_name = run.name
+
+    elif resume_checkpoint_path is not None:
+        print(f"Resuming run from local checkpoint {resume_checkpoint_path}")
+
+        base_cfg = cfg.base_policy
+        merge_base_bc_config_with_root_config(cfg, base_cfg)
+
+        if "actor_name" not in cfg or cfg.actor_name is None:
+            cfg.actor_name = f"residual_{cfg.base_policy.actor.name}"
+        if cfg.seed is None:
+            cfg.seed = random.randint(0, 2**32 - 1)
+
+        iteration = int(run_state_dict.get("iteration", 0))
+        global_step = int(
+            run_state_dict.get(
+                "global_step", _global_step_from_iteration(iteration, cfg)
+            )
+        )
+        best_eval_success_rate = run_state_dict.get("best_eval_success_rate")
+        if best_eval_success_rate is None:
+            best_eval_success_rate = (
+                run_state_dict.get("success_rate", 0.0)
+                if resume_checkpoint_path.name == "actor_chkpt_best_success_rate.pt"
+                else 0.0
+            )
+        best_eval_success_rate = float(best_eval_success_rate)
+        training_cum_time = float(run_state_dict.get("training_cum_time", 0.0))
+        run_name = resume_checkpoint_path.parent.name
 
     else:
         global_step = 0
@@ -249,40 +371,35 @@ def main(cfg: DictConfig):
     )
 
     if run_state_dict is not None:
-        if "actor_logstd" in run_state_dict["model_state_dict"]:
-            agent.residual_policy.load_state_dict(run_state_dict["model_state_dict"])
-        else:
-            agent.load_state_dict(run_state_dict["model_state_dict"])
-
-        optimizer_actor.load_state_dict(run_state_dict["optimizer_actor_state_dict"])
-        optimizer_critic.load_state_dict(run_state_dict["optimizer_critic_state_dict"])
-        lr_scheduler_actor.load_state_dict(run_state_dict["scheduler_actor_state_dict"])
-        lr_scheduler_critic.load_state_dict(
-            run_state_dict["scheduler_critic_state_dict"]
+        _load_training_state(
+            agent=agent,
+            optimizer_actor=optimizer_actor,
+            optimizer_critic=optimizer_critic,
+            lr_scheduler_actor=lr_scheduler_actor,
+            lr_scheduler_critic=lr_scheduler_critic,
+            state_dict=run_state_dict,
         )
     else:
         agent.load_base_state_dict(base_wts)
 
     residual_policy = agent.residual_policy
 
-    if (
+    has_pretrained_wts = (
         "pretrained_wts" in cfg.actor.residual_policy
         and cfg.actor.residual_policy.pretrained_wts
-    ):
+    )
+    if run_state_dict is None and has_pretrained_wts:
         print(
             f"Loading pretrained weights from {cfg.actor.residual_policy.pretrained_wts}"
         )
         run_state_dict = torch.load(cfg.actor.residual_policy.pretrained_wts)
-
-        if "actor_logstd" in run_state_dict["model_state_dict"]:
-            agent.residual_policy.load_state_dict(run_state_dict["model_state_dict"])
-        else:
-            agent.load_state_dict(run_state_dict["model_state_dict"])
-        optimizer_actor.load_state_dict(run_state_dict["optimizer_actor_state_dict"])
-        optimizer_critic.load_state_dict(run_state_dict["optimizer_critic_state_dict"])
-        lr_scheduler_actor.load_state_dict(run_state_dict["scheduler_actor_state_dict"])
-        lr_scheduler_critic.load_state_dict(
-            run_state_dict["scheduler_critic_state_dict"]
+        _load_training_state(
+            agent=agent,
+            optimizer_actor=optimizer_actor,
+            optimizer_critic=optimizer_critic,
+            lr_scheduler_actor=lr_scheduler_actor,
+            lr_scheduler_critic=lr_scheduler_critic,
+            state_dict=run_state_dict,
         )
 
     steps_per_iteration = cfg.data_collection_steps
@@ -440,7 +557,9 @@ def main(cfg: DictConfig):
                         "config": OmegaConf.to_container(cfg, resolve=True),
                         "success_rate": success_rate,
                         "success_timesteps_share": success_timesteps_share,
+                        "best_eval_success_rate": best_eval_success_rate,
                         "iteration": iteration,
+                        "global_step": global_step,
                         "training_cum_time": training_cum_time,
                     },
                     model_path,
@@ -656,7 +775,9 @@ def main(cfg: DictConfig):
                     "scheduler_critic_state_dict": lr_scheduler_critic.state_dict(),
                     "config": OmegaConf.to_container(cfg, resolve=True),
                     "success_rate": success_rate,
+                    "best_eval_success_rate": best_eval_success_rate,
                     "iteration": iteration,
+                    "global_step": global_step,
                     "training_cum_time": training_cum_time,
                 },
                 model_path,

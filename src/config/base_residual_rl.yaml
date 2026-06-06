@@ -19,6 +19,9 @@ base_policy:
   wt_type: best_success_rate
   wt_path: null  # If starting with a base policy stored on file 
 
+resume:
+  checkpoint_path: null
+
 observation_type: state
 
 total_timesteps: 1_000_000_000
