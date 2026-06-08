@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Prefer this checkout over editable installs that may point at an older clone.
+export PYTHONPATH="$REPO_ROOT/furniture-bench:$REPO_ROOT/furniture-bench/r3m:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 CUDA_VISIBLE_DEVICES=1 python "$SCRIPT_DIR/auto_resume_residual_ppo.py" \
     --workdir "$REPO_ROOT" \
     --restart-delay 10 \
@@ -18,6 +21,7 @@ CUDA_VISIBLE_DEVICES=1 python "$SCRIPT_DIR/auto_resume_residual_ppo.py" \
     wandb.entity=null \
     checkpoint_interval=1 \
     debug=false \
-    residual_l1=0.01 \
-    residual_l2=0.01 \
-    ent_coef=0.01
+    residual_l1=0.001 \
+    residual_l2=0.001 \
+    ent_coef=0.001 \
+    env.desk_leg_rot_reward_weight=0.5

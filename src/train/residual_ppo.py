@@ -312,6 +312,9 @@ def main(cfg: DictConfig):
         observation_space="state",
         randomness=cfg.env.randomness,
         max_env_steps=100_000_000,
+        desk_leg_rot_reward=cfg.env.desk_leg_rot_reward,
+        desk_leg_rot_reward_weight=cfg.env.desk_leg_rot_reward_weight,
+        desk_leg_rot_reward_clip=cfg.env.desk_leg_rot_reward_clip,
     )
 
     n_parts_to_assemble = env.n_parts_assemble

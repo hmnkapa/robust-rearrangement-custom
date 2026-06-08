@@ -35,6 +35,9 @@ data_collection_steps: ${num_env_steps}
 env:
   randomness: low
   task: one_leg
+  desk_leg_rot_reward: true
+  desk_leg_rot_reward_weight: 0.1
+  desk_leg_rot_reward_clip: 0.2
 
 actor:
   residual_policy:
