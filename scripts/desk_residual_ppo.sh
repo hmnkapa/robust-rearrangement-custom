@@ -24,4 +24,5 @@ CUDA_VISIBLE_DEVICES=1 python "$SCRIPT_DIR/auto_resume_residual_ppo.py" \
     residual_l1=0.001 \
     residual_l2=0.001 \
     ent_coef=0.001 \
-    env.desk_leg_rot_reward_weight=0.5
+    env.desk_leg_rot_reward_weight=0.5 \
+    "$@"

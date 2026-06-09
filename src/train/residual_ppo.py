@@ -315,6 +315,7 @@ def main(cfg: DictConfig):
         desk_leg_rot_reward=cfg.env.desk_leg_rot_reward,
         desk_leg_rot_reward_weight=cfg.env.desk_leg_rot_reward_weight,
         desk_leg_rot_reward_clip=cfg.env.desk_leg_rot_reward_clip,
+        desk_leg_insert_reward_value=cfg.env.desk_leg_insert_reward_value,
     )
 
     n_parts_to_assemble = env.n_parts_assemble
@@ -435,6 +436,7 @@ def main(cfg: DictConfig):
     actions = torch.zeros((steps_per_iteration, cfg.num_envs) + env.action_space.shape)
     logprobs = torch.zeros((steps_per_iteration, cfg.num_envs))
     rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    insert_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     assembly_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     rot_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     dones = torch.zeros((steps_per_iteration, cfg.num_envs))
@@ -499,6 +501,10 @@ def main(cfg: DictConfig):
             actions[step] = residual_naction.cpu()
             logprobs[step] = logprob.cpu()
             rewards[step] = reward.view(-1).cpu()
+            insert_reward = info.get("insert_reward", torch.zeros_like(reward))
+            if not torch.is_tensor(insert_reward):
+                insert_reward = torch.as_tensor(insert_reward, device=reward.device)
+            insert_rewards[step] = insert_reward.view(-1).detach().cpu()
             assembly_reward = info.get("assembly_reward", torch.zeros_like(reward))
             if not torch.is_tensor(assembly_reward):
                 assembly_reward = torch.as_tensor(
@@ -513,7 +519,7 @@ def main(cfg: DictConfig):
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
                 print(
-                    f"env_step={env_step}, global_step={global_step}, mean_reward={rewards[:step+1].sum(dim=0).mean().item()}, mean_rot_reward={rot_rewards[:step+1].sum(dim=0).mean().item()} fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
+                    f"env_step={env_step}, global_step={global_step}, mean_reward={rewards[:step+1].sum(dim=0).mean().item()}, mean_insert_reward={insert_rewards[:step+1].sum(dim=0).mean().item()}, mean_rot_reward={rot_rewards[:step+1].sum(dim=0).mean().item()} fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
                 )
 
         # Calculate the success rate
@@ -521,6 +527,7 @@ def main(cfg: DictConfig):
         # Env is successful if it received a reward more than or equal to n_parts_to_assemble
         env_success = (assembly_rewards > 0).sum(dim=0) >= n_parts_to_assemble
         mean_reward = rewards.sum(dim=0).mean().item()
+        mean_insert_reward = insert_rewards.sum(dim=0).mean().item()
         mean_assembly_reward = assembly_rewards.sum(dim=0).mean().item()
         mean_rot_reward = rot_rewards.sum(dim=0).mean().item()
         success_rate = env_success.float().mean().item()
@@ -589,6 +596,7 @@ def main(cfg: DictConfig):
                 {
                     "eval/success_rate": success_rate,
                     "eval/mean_reward": mean_reward,
+                    "eval/mean_insert_reward": mean_insert_reward,
                     "eval/mean_assembly_reward": mean_assembly_reward,
                     "eval/mean_rot_reward": mean_rot_reward,
                     "eval/best_eval_success_rate": best_eval_success_rate,
@@ -748,6 +756,8 @@ def main(cfg: DictConfig):
                 "training/SPS": sps,
                 "charts/rewards": rewards.sum().item(),
                 "charts/mean_reward": mean_reward,
+                "charts/insert_rewards": insert_rewards.sum().item(),
+                "charts/mean_insert_reward": mean_insert_reward,
                 "charts/assembly_rewards": assembly_rewards.sum().item(),
                 "charts/mean_assembly_reward": mean_assembly_reward,
                 "charts/rot_rewards": rot_rewards.sum().item(),
@@ -777,6 +787,7 @@ def main(cfg: DictConfig):
                 "histograms/advantages": wandb.Histogram(b_advantages),
                 "histograms/logprobs": wandb.Histogram(logprobs),
                 "histograms/rewards": wandb.Histogram(rewards),
+                "histograms/insert_rewards": wandb.Histogram(insert_rewards),
                 "histograms/assembly_rewards": wandb.Histogram(assembly_rewards),
                 "histograms/rot_rewards": wandb.Histogram(rot_rewards),
                 "histograms/action_norms": wandb.Histogram(action_norms),

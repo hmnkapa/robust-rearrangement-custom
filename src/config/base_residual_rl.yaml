@@ -38,6 +38,7 @@ env:
   desk_leg_rot_reward: true
   desk_leg_rot_reward_weight: 0.1
   desk_leg_rot_reward_clip: 0.2
+  desk_leg_insert_reward_value: 1.0
 
 actor:
   residual_policy:
