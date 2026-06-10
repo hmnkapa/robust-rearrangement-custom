@@ -135,8 +135,12 @@ class FurnitureEnvRLWrapper:
         # Move the robot
         obs, reward, done, info = self._inner_step(action_chunk)
 
-        # Episodes that received reward are terminated
-        terminated = reward > 0
+        # Desk now uses dense staged rewards, so only the env's success signal should
+        # terminate it. Keep the legacy reward>0 behavior for sparse-reward tasks.
+        if getattr(self.env, "furniture_name", None) == "desk":
+            terminated = done
+        else:
+            terminated = reward > 0
 
         # Check if any envs have reached the max number of steps
         truncated = self.env.env_steps >= self.max_env_steps

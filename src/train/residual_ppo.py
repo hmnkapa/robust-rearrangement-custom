@@ -312,12 +312,28 @@ def main(cfg: DictConfig):
         observation_space="state",
         randomness=cfg.env.randomness,
         max_env_steps=100_000_000,
-        desk_leg_rot_reward=cfg.env.desk_leg_rot_reward,
-        desk_leg_rot_reward_weight=cfg.env.desk_leg_rot_reward_weight,
-        desk_leg_rot_reward_clip=cfg.env.desk_leg_rot_reward_clip,
+        desk_insert_reward=cfg.env.desk_insert_reward,
+        desk_success_reward=cfg.env.desk_success_reward,
+        desk_twist_target_deg=cfg.env.desk_twist_target_deg,
+        desk_twist_round_deg=cfg.env.desk_twist_round_deg,
+        desk_twist_total_reward=cfg.env.desk_twist_total_reward,
+        desk_twist_axis_sign=cfg.env.desk_twist_axis_sign,
+        desk_contact_reward_weight=cfg.env.desk_contact_reward_weight,
+        desk_release_reward_weight=cfg.env.desk_release_reward_weight,
+        desk_contact_reward_scale=cfg.env.desk_contact_reward_scale,
+        desk_contact_threshold=cfg.env.desk_contact_threshold,
+        desk_release_contact_threshold=cfg.env.desk_release_contact_threshold,
+        desk_contact_key_y=cfg.env.desk_contact_key_y,
+        desk_contact_surface=cfg.env.desk_contact_surface,
+        desk_twist_delta_clip_deg=cfg.env.desk_twist_delta_clip_deg,
+        desk_twist_progress_threshold_deg=cfg.env.desk_twist_progress_threshold_deg,
+        desk_no_progress_limit=cfg.env.desk_no_progress_limit,
+        desk_wrist_limit_margin_rad=cfg.env.desk_wrist_limit_margin_rad,
+        desk_wrist_reset_threshold_rad=cfg.env.desk_wrist_reset_threshold_rad,
     )
 
     n_parts_to_assemble = env.n_parts_assemble
+    is_desk_task = cfg.env.task == "desk"
 
     if cfg.base_policy.actor.name == "diffusion":
         agent = ResidualDiffusionPolicy(device, base_cfg)
@@ -436,7 +452,11 @@ def main(cfg: DictConfig):
     logprobs = torch.zeros((steps_per_iteration, cfg.num_envs))
     rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     assembly_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
-    rot_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    insert_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    twist_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    contact_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    release_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    success_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     dones = torch.zeros((steps_per_iteration, cfg.num_envs))
     values = torch.zeros((steps_per_iteration, cfg.num_envs))
 
@@ -449,6 +469,12 @@ def main(cfg: DictConfig):
     # Create model save dir
     model_save_dir: Path = Path("models") / wandb.run.name
     model_save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _info_reward(info, key, reward):
+        value = info.get(key, torch.zeros_like(reward))
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value, device=reward.device)
+        return value.view(-1).detach().cpu()
 
     while global_step < cfg.total_timesteps:
         iteration += 1
@@ -499,36 +525,44 @@ def main(cfg: DictConfig):
             actions[step] = residual_naction.cpu()
             logprobs[step] = logprob.cpu()
             rewards[step] = reward.view(-1).cpu()
-            assembly_reward = info.get("assembly_reward", torch.zeros_like(reward))
-            if not torch.is_tensor(assembly_reward):
-                assembly_reward = torch.as_tensor(
-                    assembly_reward, device=reward.device
-                )
-            assembly_rewards[step] = assembly_reward.view(-1).detach().cpu()
-            rot_reward = info.get("desk_leg_rot_reward", torch.zeros_like(reward))
-            if not torch.is_tensor(rot_reward):
-                rot_reward = torch.as_tensor(rot_reward, device=reward.device)
-            rot_rewards[step] = rot_reward.view(-1).detach().cpu()
+            assembly_rewards[step] = _info_reward(info, "assembly_reward", reward)
+            insert_rewards[step] = _info_reward(info, "desk_insert_reward", reward)
+            twist_rewards[step] = _info_reward(info, "desk_twist_reward", reward)
+            contact_rewards[step] = _info_reward(info, "desk_contact_reward", reward)
+            release_rewards[step] = _info_reward(info, "desk_release_reward", reward)
+            success_rewards[step] = _info_reward(info, "desk_success_reward", reward)
             next_done = next_done.view(-1).cpu()
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
                 print(
-                    f"env_step={env_step}, global_step={global_step}, mean_reward={rewards[:step+1].sum(dim=0).mean().item()}, mean_rot_reward={rot_rewards[:step+1].sum(dim=0).mean().item()} fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
+                    f"env_step={env_step}, global_step={global_step}, "
+                    f"mean_reward={rewards[:step+1].sum(dim=0).mean().item()}, "
+                    f"mean_twist_reward={twist_rewards[:step+1].sum(dim=0).mean().item()} "
+                    f"fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
                 )
 
         # Calculate the success rate
         # Find the rewards that are not zero
         # Env is successful if it received a reward more than or equal to n_parts_to_assemble
-        env_success = (assembly_rewards > 0).sum(dim=0) >= n_parts_to_assemble
+        if is_desk_task:
+            success_reward_unit = max(float(cfg.env.desk_success_reward), 1e-6)
+            progress_units = success_rewards / success_reward_unit
+        else:
+            progress_units = assembly_rewards
+        env_success = progress_units.sum(dim=0) >= n_parts_to_assemble
         mean_reward = rewards.sum(dim=0).mean().item()
         mean_assembly_reward = assembly_rewards.sum(dim=0).mean().item()
-        mean_rot_reward = rot_rewards.sum(dim=0).mean().item()
+        mean_insert_reward = insert_rewards.sum(dim=0).mean().item()
+        mean_twist_reward = twist_rewards.sum(dim=0).mean().item()
+        mean_contact_reward = contact_rewards.sum(dim=0).mean().item()
+        mean_release_reward = release_rewards.sum(dim=0).mean().item()
+        mean_success_reward = success_rewards.sum(dim=0).mean().item()
         success_rate = env_success.float().mean().item()
 
         if success_rate > 0:
             # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
             # Count total timesteps in successful trajectories
-            timesteps_in_success = assembly_rewards[:, env_success]
+            timesteps_in_success = progress_units[:, env_success]
 
             # Find index of last reward in each trajectory
             # This has all timesteps including and after episode is done
@@ -590,7 +624,11 @@ def main(cfg: DictConfig):
                     "eval/success_rate": success_rate,
                     "eval/mean_reward": mean_reward,
                     "eval/mean_assembly_reward": mean_assembly_reward,
-                    "eval/mean_rot_reward": mean_rot_reward,
+                    "eval/mean_insert_reward": mean_insert_reward,
+                    "eval/mean_twist_reward": mean_twist_reward,
+                    "eval/mean_contact_reward": mean_contact_reward,
+                    "eval/mean_release_reward": mean_release_reward,
+                    "eval/mean_success_reward": mean_success_reward,
                     "eval/best_eval_success_rate": best_eval_success_rate,
                     "iteration": iteration,
                 },
@@ -750,8 +788,16 @@ def main(cfg: DictConfig):
                 "charts/mean_reward": mean_reward,
                 "charts/assembly_rewards": assembly_rewards.sum().item(),
                 "charts/mean_assembly_reward": mean_assembly_reward,
-                "charts/rot_rewards": rot_rewards.sum().item(),
-                "charts/mean_rot_reward": mean_rot_reward,
+                "charts/insert_rewards": insert_rewards.sum().item(),
+                "charts/mean_insert_reward": mean_insert_reward,
+                "charts/twist_rewards": twist_rewards.sum().item(),
+                "charts/mean_twist_reward": mean_twist_reward,
+                "charts/contact_rewards": contact_rewards.sum().item(),
+                "charts/mean_contact_reward": mean_contact_reward,
+                "charts/release_rewards": release_rewards.sum().item(),
+                "charts/mean_release_reward": mean_release_reward,
+                "charts/success_rewards": success_rewards.sum().item(),
+                "charts/mean_success_reward": mean_success_reward,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "charts/mean_success_episode_length": mean_success_episode_length,
@@ -778,7 +824,11 @@ def main(cfg: DictConfig):
                 "histograms/logprobs": wandb.Histogram(logprobs),
                 "histograms/rewards": wandb.Histogram(rewards),
                 "histograms/assembly_rewards": wandb.Histogram(assembly_rewards),
-                "histograms/rot_rewards": wandb.Histogram(rot_rewards),
+                "histograms/insert_rewards": wandb.Histogram(insert_rewards),
+                "histograms/twist_rewards": wandb.Histogram(twist_rewards),
+                "histograms/contact_rewards": wandb.Histogram(contact_rewards),
+                "histograms/release_rewards": wandb.Histogram(release_rewards),
+                "histograms/success_rewards": wandb.Histogram(success_rewards),
                 "histograms/action_norms": wandb.Histogram(action_norms),
             },
             step=global_step,
