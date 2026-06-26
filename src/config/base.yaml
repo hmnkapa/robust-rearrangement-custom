@@ -43,6 +43,7 @@ wandb:
   project: ???
   notes: null
   mode: online
+  save_checkpoints: false
   continue_run_id: null
   name: null
 

@@ -87,6 +87,7 @@ Task = Literal[
     "one_leg",
     "lamp",
     "round_table",
+    "desk",
     "mug_rack",
     "factory_peg_hole",
     "bimanual_insertion",

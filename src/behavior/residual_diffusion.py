@@ -58,9 +58,10 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         # They're cheap to compute and we can use them to both improve the
         # performance of the policy and to estimate the uncertainty of the
         # policy.
+        self.residual_task_state_dim = int(cfg.get("residual_task_state_dim", 0))
         self.residual_policy: ResidualPolicy = hydra.utils.instantiate(
             cfg.actor.residual_policy,
-            obs_shape=(self.timestep_obs_dim,),
+            obs_shape=(self.timestep_obs_dim + self.residual_task_state_dim,),
             action_shape=(self.action_dim,),
         )
 
@@ -258,7 +259,28 @@ class ResidualDiffusionPolicy(DiffusionPolicy):
         robot_state = self.normalizer(robot_state, "robot_state", forward=True)
         parts_poses = self.normalizer(parts_poses, "parts_poses", forward=True)
 
-        obs = torch.cat([robot_state, parts_poses], dim=-1)
+        obs_parts = [robot_state, parts_poses]
+        if self.residual_task_state_dim > 0:
+            task_state = obs.get("task_state")
+            if task_state is None:
+                task_state = torch.zeros(
+                    robot_state.shape[0],
+                    self.residual_task_state_dim,
+                    device=robot_state.device,
+                    dtype=robot_state.dtype,
+                )
+            else:
+                task_state = task_state.to(
+                    device=robot_state.device, dtype=robot_state.dtype
+                )
+                if task_state.shape[-1] != self.residual_task_state_dim:
+                    raise ValueError(
+                        "Expected task_state dim "
+                        f"{self.residual_task_state_dim}, got {task_state.shape[-1]}"
+                    )
+            obs_parts.append(task_state)
+
+        obs = torch.cat(obs_parts, dim=-1)
 
         # Clamp the observation to be bounded to [-5, 5]
         obs = torch.clamp(obs, -3, 3)

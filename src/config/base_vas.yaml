@@ -78,5 +78,6 @@ wandb:
   entity: huyue233-zhejiang-university
   project: ${env.task}-vas-dr-${env.randomness}-1
   mode: online
+  save_checkpoints: false
 
 debug: false

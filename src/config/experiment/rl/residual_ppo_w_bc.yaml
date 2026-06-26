@@ -35,5 +35,6 @@ wandb:
   project: ol-rppo-dr-${env.randomness}-1
   # project: tmp-bc-in-the-loop-rl-test
   mode: online
+  save_checkpoints: false
 
 debug: false

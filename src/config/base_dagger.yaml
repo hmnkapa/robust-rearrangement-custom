@@ -54,6 +54,7 @@ wandb:
   entity: huyue233-zhejiang-university
   project: ol-dagger-low-1
   mode: online
+  save_checkpoints: false
   notes: null
   continue_run_id: null
 

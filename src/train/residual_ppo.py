@@ -320,6 +320,12 @@ def main(cfg: DictConfig):
         desk_twist_axis_sign=cfg.env.desk_twist_axis_sign,
         desk_contact_reward_weight=cfg.env.desk_contact_reward_weight,
         desk_release_reward_weight=cfg.env.desk_release_reward_weight,
+        desk_contact_reward_max_attempts=cfg.env.get(
+            "desk_contact_reward_max_attempts", 5
+        ),
+        desk_release_reward_max_attempts=cfg.env.get(
+            "desk_release_reward_max_attempts", 5
+        ),
         desk_contact_reward_scale=cfg.env.desk_contact_reward_scale,
         desk_contact_threshold=cfg.env.desk_contact_threshold,
         desk_release_contact_threshold=cfg.env.desk_release_contact_threshold,
@@ -334,6 +340,19 @@ def main(cfg: DictConfig):
 
     n_parts_to_assemble = env.n_parts_assemble
     is_desk_task = cfg.env.task == "desk"
+    env_obs_spaces = getattr(env.observation_space, "spaces", {})
+    residual_task_state_dim = (
+        int(env_obs_spaces["task_state"].shape[-1])
+        if "task_state" in env_obs_spaces
+        else 0
+    )
+    OmegaConf.set_struct(base_cfg, False)
+    OmegaConf.update(
+        cfg, "residual_task_state_dim", residual_task_state_dim, merge=True
+    )
+    OmegaConf.update(
+        base_cfg, "residual_task_state_dim", residual_task_state_dim, merge=True
+    )
 
     if cfg.base_policy.actor.name == "diffusion":
         agent = ResidualDiffusionPolicy(device, base_cfg)
@@ -616,7 +635,8 @@ def main(cfg: DictConfig):
                     model_path,
                 )
 
-                wandb.save(model_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(model_path)
                 print(f"Evaluation success rate improved. Model saved to {model_path}")
 
             wandb.log(
@@ -858,7 +878,8 @@ def main(cfg: DictConfig):
                 model_path,
             )
 
-            wandb.save(model_path)
+            if cfg.wandb.get("save_checkpoints", False):
+                wandb.save(model_path)
             print(f"Model saved to {model_path}")
 
         # Print some stats at the end of the iteration

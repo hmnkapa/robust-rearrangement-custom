@@ -539,7 +539,8 @@ def main(cfg: DictConfig):
                 best_test_loss = test_loss_mean
                 save_path = str(model_save_dir / f"actor_chkpt_best_test_loss.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(save_path)
 
             # Save the model if the success rate is the best so far
             if (
@@ -549,7 +550,8 @@ def main(cfg: DictConfig):
                 prev_best_success_rate = best_success_rate
                 save_path = str(model_save_dir / f"actor_chkpt_best_success_rate.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(save_path)
 
             if (
                 cfg.training.checkpoint_interval > 0
@@ -557,7 +559,8 @@ def main(cfg: DictConfig):
             ):
                 save_path = str(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(save_path)
 
             if cfg.training.store_last_model:
                 save_path = str(model_save_dir / f"actor_chkpt_last.pt")
@@ -570,7 +573,8 @@ def main(cfg: DictConfig):
                     save_dict[f"{name}_scheduler_state_dict"] = scheduler.state_dict()
 
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(save_path)
 
             # Run diffusion sampling on a training batch
             if (

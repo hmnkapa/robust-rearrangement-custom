@@ -42,11 +42,17 @@ class FurnitureEnvRLWrapper:
             robot_state_dim = 16
 
         parts_poses_dim = self.env.observation_space["parts_poses"].shape[-1]
+        env_obs_spaces = getattr(self.env.observation_space, "spaces", {})
+        task_state_dim = (
+            env_obs_spaces["task_state"].shape[-1]
+            if "task_state" in env_obs_spaces
+            else 0
+        )
 
         self.observation_space = gym.spaces.Box(
             -float("inf"),
             float("inf"),
-            shape=(robot_state_dim + parts_poses_dim,),
+            shape=(robot_state_dim + parts_poses_dim + task_state_dim,),
         )
 
         # Define the maximum number of steps in the environment
@@ -80,7 +86,13 @@ class FurnitureEnvRLWrapper:
         robot_state = self.normalizer(robot_state, "robot_state", forward=True)
         parts_poses = self.normalizer(parts_poses, "parts_poses", forward=True)
 
-        nobs = torch.cat([robot_state, parts_poses], dim=-1)
+        obs_parts = [robot_state, parts_poses]
+        if "task_state" in obs:
+            obs_parts.append(
+                obs["task_state"].to(device=robot_state.device, dtype=robot_state.dtype)
+            )
+
+        nobs = torch.cat(obs_parts, dim=-1)
 
         # Clamp the observation to be bounded to [-5, 5]
         nobs = torch.clamp(nobs, -5, 5)
@@ -233,11 +245,17 @@ class RLPolicyEnvWrapper:
             robot_state_dim = 16
 
         parts_poses_dim = self.env.observation_space["parts_poses"].shape[-1]
+        env_obs_spaces = getattr(self.env.observation_space, "spaces", {})
+        task_state_dim = (
+            env_obs_spaces["task_state"].shape[-1]
+            if "task_state" in env_obs_spaces
+            else 0
+        )
 
         self.observation_space = gym.spaces.Box(
             -float("inf"),
             float("inf"),
-            shape=(robot_state_dim + parts_poses_dim,),
+            shape=(robot_state_dim + parts_poses_dim + task_state_dim,),
         )
 
         # Define the maximum number of steps in the environment

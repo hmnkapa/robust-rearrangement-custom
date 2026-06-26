@@ -454,7 +454,8 @@ def main(cfg: DictConfig):
                     model_path,
                 )
 
-                wandb.save(model_path)
+                if cfg.wandb.get("save_checkpoints", False):
+                    wandb.save(model_path)
                 print(f"Evaluation success rate improved. Model saved to {model_path}")
 
             wandb.log(
@@ -666,7 +667,8 @@ def main(cfg: DictConfig):
                 model_path,
             )
 
-            wandb.save(model_path)
+            if cfg.wandb.get("save_checkpoints", False):
+                wandb.save(model_path)
             print(f"Model saved to {model_path}")
 
         # Print some stats at the end of the iteration
