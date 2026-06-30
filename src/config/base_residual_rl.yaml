@@ -48,6 +48,12 @@ env:
   desk_twist_round_deg: 90.0
   desk_twist_total_reward: 1.0
   desk_twist_axis_sign: 1.0
+  desk_top_yaw_target_deg: 180.0
+  desk_top_yaw_total_reward: null
+  desk_top_yaw_bonus_reward: null
+  desk_top_yaw_success_tolerance_deg: 10.0
+  desk_top_max_tilt_deg: 15.0
+  desk_top_yaw_delta_clip_deg: 20.0
   desk_contact_reward_weight: 0.15
   desk_release_reward_weight: 0.10
   desk_contact_reward_max_attempts: 5

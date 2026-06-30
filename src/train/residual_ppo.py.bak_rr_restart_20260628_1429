@@ -64,30 +64,20 @@ def _resolve_checkpoint_path(path: str) -> Path:
     return Path(hydra.utils.get_original_cwd()) / checkpoint_path
 
 
-def _checkpoint_path_from_cfg_section(
-    cfg: DictConfig, section_name: str
-) -> Optional[Path]:
-    section_cfg = cfg.get(section_name)
-    if section_cfg is None:
+def _resume_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
+    resume_cfg = cfg.get("resume")
+    if resume_cfg is None:
         return None
-    checkpoint_path = section_cfg.get("checkpoint_path")
+    checkpoint_path = resume_cfg.get("checkpoint_path")
     if checkpoint_path in (None, ""):
         return None
     return _resolve_checkpoint_path(str(checkpoint_path))
 
 
-def _resume_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
-    return _checkpoint_path_from_cfg_section(cfg, "resume")
-
-
-def _init_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
-    return _checkpoint_path_from_cfg_section(cfg, "init_from")
-
-
 def _load_local_checkpoint(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
-    print(f"Loading local checkpoint from {path}")
+    print(f"Loading local resume checkpoint from {path}")
     return torch.load(path, map_location="cpu")
 
 
@@ -125,20 +115,16 @@ def _load_training_state(
     lr_scheduler_critic,
     state_dict: dict,
 ) -> None:
-    _load_model_state(agent, state_dict)
-
-    optimizer_actor.load_state_dict(state_dict["optimizer_actor_state_dict"])
-    optimizer_critic.load_state_dict(state_dict["optimizer_critic_state_dict"])
-    lr_scheduler_actor.load_state_dict(state_dict["scheduler_actor_state_dict"])
-    lr_scheduler_critic.load_state_dict(state_dict["scheduler_critic_state_dict"])
-
-
-def _load_model_state(agent: nn.Module, state_dict: dict) -> None:
     model_state_dict = state_dict["model_state_dict"]
     if "actor_logstd" in model_state_dict:
         agent.residual_policy.load_state_dict(model_state_dict)
     else:
         agent.load_state_dict(model_state_dict)
+
+    optimizer_actor.load_state_dict(state_dict["optimizer_actor_state_dict"])
+    optimizer_critic.load_state_dict(state_dict["optimizer_critic_state_dict"])
+    lr_scheduler_actor.load_state_dict(state_dict["scheduler_actor_state_dict"])
+    lr_scheduler_critic.load_state_dict(state_dict["scheduler_critic_state_dict"])
 
 
 @torch.no_grad()
@@ -180,35 +166,10 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
     resume_checkpoint_path = _resume_checkpoint_path(cfg)
-    init_checkpoint_path = _init_checkpoint_path(cfg)
     run_state_dict = None
-    init_state_dict = None
-    if resume_checkpoint_path is not None and init_checkpoint_path is not None:
-        print(
-            "Both resume.checkpoint_path and init_from.checkpoint_path were set; "
-            "resume.checkpoint_path takes precedence."
-        )
-        init_checkpoint_path = None
-
     if resume_checkpoint_path is not None:
         run_state_dict = _load_local_checkpoint(resume_checkpoint_path)
         cfg = _merge_checkpoint_config_with_overrides(cfg, run_state_dict)
-    elif init_checkpoint_path is not None:
-        task_overrides = _task_overrides_cfg()
-        init_state_dict = _load_local_checkpoint(init_checkpoint_path)
-        cfg = _merge_checkpoint_config_with_overrides(cfg, init_state_dict)
-        OmegaConf.update(cfg, "resume.checkpoint_path", None, merge=True)
-        OmegaConf.update(
-            cfg, "init_from.checkpoint_path", str(init_checkpoint_path), merge=True
-        )
-        OmegaConf.update(cfg, "wandb.continue_run_id", None, merge=True)
-        if "seed" not in task_overrides:
-            OmegaConf.update(cfg, "seed", None, merge=True)
-        if (
-            "wandb" not in task_overrides
-            or "name" not in task_overrides.get("wandb", {})
-        ):
-            OmegaConf.update(cfg, "wandb.name", None, merge=True)
 
     if (job_id := os.environ.get("SLURM_JOB_ID")) is not None:
         cfg.slurm_job_id = job_id
@@ -322,10 +283,7 @@ def main(cfg: DictConfig):
         if cfg.seed is None:
             cfg.seed = random.randint(0, 2**32 - 1)
 
-        run_name = cfg.wandb.get("name", None)
-        if run_name in (None, ""):
-            run_name = f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
-        OmegaConf.update(cfg, "wandb.name", str(run_name), merge=True)
+        run_name = f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
 
     if "task" not in cfg.env:
         cfg.env.task = "one_leg"
@@ -360,14 +318,6 @@ def main(cfg: DictConfig):
         desk_twist_round_deg=cfg.env.desk_twist_round_deg,
         desk_twist_total_reward=cfg.env.desk_twist_total_reward,
         desk_twist_axis_sign=cfg.env.desk_twist_axis_sign,
-        desk_top_yaw_target_deg=cfg.env.get("desk_top_yaw_target_deg", 180.0),
-        desk_top_yaw_total_reward=cfg.env.get("desk_top_yaw_total_reward", None),
-        desk_top_yaw_bonus_reward=cfg.env.get("desk_top_yaw_bonus_reward", None),
-        desk_top_yaw_success_tolerance_deg=cfg.env.get(
-            "desk_top_yaw_success_tolerance_deg", 10.0
-        ),
-        desk_top_max_tilt_deg=cfg.env.get("desk_top_max_tilt_deg", 15.0),
-        desk_top_yaw_delta_clip_deg=cfg.env.get("desk_top_yaw_delta_clip_deg", 20.0),
         desk_contact_reward_weight=cfg.env.desk_contact_reward_weight,
         desk_release_reward_weight=cfg.env.desk_release_reward_weight,
         desk_contact_reward_max_attempts=cfg.env.get(
@@ -391,13 +341,10 @@ def main(cfg: DictConfig):
     n_parts_to_assemble = env.n_parts_assemble
     is_desk_task = cfg.env.task == "desk"
     env_obs_spaces = getattr(env.observation_space, "spaces", {})
-    configured_residual_task_state_dim = int(
-        cfg.get("residual_task_state_dim", 0) or 0
-    )
     residual_task_state_dim = (
         int(env_obs_spaces["task_state"].shape[-1])
         if "task_state" in env_obs_spaces
-        else configured_residual_task_state_dim
+        else 0
     )
     OmegaConf.set_struct(base_cfg, False)
     OmegaConf.update(
@@ -472,9 +419,6 @@ def main(cfg: DictConfig):
         )
     else:
         agent.load_base_state_dict(base_wts)
-        if init_state_dict is not None:
-            print(f"Initializing policy weights from {init_checkpoint_path}")
-            _load_model_state(agent, init_state_dict)
 
     residual_policy = agent.residual_policy
 
@@ -482,7 +426,7 @@ def main(cfg: DictConfig):
         "pretrained_wts" in cfg.actor.residual_policy
         and cfg.actor.residual_policy.pretrained_wts
     )
-    if run_state_dict is None and init_state_dict is None and has_pretrained_wts:
+    if run_state_dict is None and has_pretrained_wts:
         print(
             f"Loading pretrained weights from {cfg.actor.residual_policy.pretrained_wts}"
         )
@@ -532,9 +476,6 @@ def main(cfg: DictConfig):
     contact_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     release_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     success_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
-    top_yaw_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
-    top_yaw_bonus_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
-    desk_task_successes = torch.zeros((steps_per_iteration, cfg.num_envs))
     dones = torch.zeros((steps_per_iteration, cfg.num_envs))
     values = torch.zeros((steps_per_iteration, cfg.num_envs))
 
@@ -553,28 +494,6 @@ def main(cfg: DictConfig):
         if not torch.is_tensor(value):
             value = torch.as_tensor(value, device=reward.device)
         return value.view(-1).detach().cpu()
-
-    def _desk_success_from_info(info, reward):
-        top_complete = info.get(
-            "desk_top_yaw_complete",
-            torch.zeros_like(reward, dtype=torch.bool),
-        )
-        if not torch.is_tensor(top_complete):
-            top_complete = torch.as_tensor(top_complete, device=reward.device)
-        success_mask = info.get(
-            "desk_success_mask",
-            torch.zeros(
-                (reward.shape[0], n_parts_to_assemble),
-                dtype=torch.bool,
-                device=reward.device,
-            ),
-        )
-        if not torch.is_tensor(success_mask):
-            success_mask = torch.as_tensor(success_mask, device=reward.device)
-        return (
-            top_complete.view(-1).bool()
-            & success_mask.view(reward.shape[0], -1).bool().all(dim=1)
-        ).float().detach().cpu()
 
     while global_step < cfg.total_timesteps:
         iteration += 1
@@ -631,12 +550,6 @@ def main(cfg: DictConfig):
             contact_rewards[step] = _info_reward(info, "desk_contact_reward", reward)
             release_rewards[step] = _info_reward(info, "desk_release_reward", reward)
             success_rewards[step] = _info_reward(info, "desk_success_reward", reward)
-            top_yaw_rewards[step] = _info_reward(info, "desk_top_yaw_reward", reward)
-            top_yaw_bonus_rewards[step] = _info_reward(
-                info, "desk_top_yaw_bonus", reward
-            )
-            if is_desk_task:
-                desk_task_successes[step] = _desk_success_from_info(info, reward)
             next_done = next_done.view(-1).cpu()
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
@@ -647,15 +560,15 @@ def main(cfg: DictConfig):
                     f"fps={env_step * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
                 )
 
-        # Calculate the success rate. Desk uses the env's staged completion signal;
-        # sparse-reward tasks keep the legacy reward-count criterion.
+        # Calculate the success rate
+        # Find the rewards that are not zero
+        # Env is successful if it received a reward more than or equal to n_parts_to_assemble
         if is_desk_task:
-            progress_units = desk_task_successes
-            success_threshold = 1
+            success_reward_unit = max(float(cfg.env.desk_success_reward), 1e-6)
+            progress_units = success_rewards / success_reward_unit
         else:
             progress_units = assembly_rewards
-            success_threshold = n_parts_to_assemble
-        env_success = progress_units.sum(dim=0) >= success_threshold
+        env_success = progress_units.sum(dim=0) >= n_parts_to_assemble
         mean_reward = rewards.sum(dim=0).mean().item()
         mean_assembly_reward = assembly_rewards.sum(dim=0).mean().item()
         mean_insert_reward = insert_rewards.sum(dim=0).mean().item()
@@ -663,8 +576,6 @@ def main(cfg: DictConfig):
         mean_contact_reward = contact_rewards.sum(dim=0).mean().item()
         mean_release_reward = release_rewards.sum(dim=0).mean().item()
         mean_success_reward = success_rewards.sum(dim=0).mean().item()
-        mean_top_yaw_reward = top_yaw_rewards.sum(dim=0).mean().item()
-        mean_top_yaw_bonus = top_yaw_bonus_rewards.sum(dim=0).mean().item()
         success_rate = env_success.float().mean().item()
 
         if success_rate > 0:
@@ -674,7 +585,7 @@ def main(cfg: DictConfig):
 
             # Find index of last reward in each trajectory
             # This has all timesteps including and after episode is done
-            success_dones = timesteps_in_success.cumsum(dim=0) >= success_threshold
+            success_dones = timesteps_in_success.cumsum(dim=0) >= n_parts_to_assemble
             last_reward_idx = success_dones.int().argmax(dim=0)
 
             # Calculate the total number of timesteps in successful trajectories
@@ -738,8 +649,6 @@ def main(cfg: DictConfig):
                     "eval/mean_contact_reward": mean_contact_reward,
                     "eval/mean_release_reward": mean_release_reward,
                     "eval/mean_success_reward": mean_success_reward,
-                    "eval/mean_top_yaw_reward": mean_top_yaw_reward,
-                    "eval/mean_top_yaw_bonus": mean_top_yaw_bonus,
                     "eval/best_eval_success_rate": best_eval_success_rate,
                     "iteration": iteration,
                 },
@@ -909,10 +818,6 @@ def main(cfg: DictConfig):
                 "charts/mean_release_reward": mean_release_reward,
                 "charts/success_rewards": success_rewards.sum().item(),
                 "charts/mean_success_reward": mean_success_reward,
-                "charts/top_yaw_rewards": top_yaw_rewards.sum().item(),
-                "charts/mean_top_yaw_reward": mean_top_yaw_reward,
-                "charts/top_yaw_bonus_rewards": top_yaw_bonus_rewards.sum().item(),
-                "charts/mean_top_yaw_bonus": mean_top_yaw_bonus,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "charts/mean_success_episode_length": mean_success_episode_length,
