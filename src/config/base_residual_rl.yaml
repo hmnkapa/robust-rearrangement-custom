@@ -22,6 +22,12 @@ base_policy:
 resume:
   checkpoint_path: null
 
+init_from:
+  # Initialize policy weights from a local checkpoint while starting a fresh PPO run.
+  # Unlike resume.checkpoint_path, this does not restore iteration, global_step,
+  # optimizer state, scheduler state, or the W&B run id.
+  checkpoint_path: null
+
 observation_type: state
 residual_task_state_dim: 0
 
@@ -49,7 +55,7 @@ env:
   desk_contact_reward_scale: 0.02
   desk_contact_threshold: 0.035
   desk_release_contact_threshold: 0.045
-  desk_contact_key_y: 0.03375
+  desk_contact_key_y: 0.039375
   desk_contact_surface: 0.0175
   desk_twist_delta_clip_deg: 20.0
   desk_twist_progress_threshold_deg: 2.0
@@ -110,6 +116,7 @@ wandb:
   save_checkpoints: false
   entity: null
   notes: null
+  name: null
   continue_run_id: null
 
 debug: false

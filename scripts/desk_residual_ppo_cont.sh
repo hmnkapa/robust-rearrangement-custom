@@ -7,25 +7,25 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Prefer this checkout over editable installs that may point at an older clone.
 export PYTHONPATH="$REPO_ROOT/furniture-bench:$REPO_ROOT/furniture-bench/r3m:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-CUDA_VISIBLE_DEVICES=7 python "$SCRIPT_DIR/auto_resume_residual_ppo.py" \
+CUDA_VISIBLE_DEVICES=0 python "$SCRIPT_DIR/auto_resume_residual_ppo.py" \
     --workdir "$REPO_ROOT" \
     --restart-delay 10 \
     -- \
     python -m src.train.residual_ppo \
-    base_policy.wt_path=/home/hy/lq/outputs/2026-05-06/12-39-53.760711/models/crimson-microwave-10/actor_chkpt_last.pt \
+    init_from.checkpoint_path=/home/hy/lq/robust-rearrangement-custom-fix-contact-reward/actor_chkpt_130.pt \
     env.task=desk \
     env.randomness=low \
-    num_env_steps=3000 \
+    num_env_steps=4000 \
     num_envs=2048 \
-    update_epochs=100 \
+    update_epochs=50 \
     normalize_reward=false \
-    total_timesteps=1500000000 \
-    num_minibatches=16 \
+    total_timesteps=2000000000 \
+    num_minibatches=8 \
     wandb.entity=null \
     checkpoint_interval=1 \
     debug=false \
-    residual_l1=0.001 \
-    residual_l2=0.001 \
+    residual_l1=0.01 \
+    residual_l2=0.01 \
     ent_coef=0.001 \
     env.desk_insert_reward=2.0 \
     env.desk_success_reward=2.0 \

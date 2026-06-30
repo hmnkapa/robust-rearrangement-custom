@@ -126,7 +126,10 @@ def build_resume_command(
     wandb_run_id: Optional[str],
 ) -> list[str]:
     command = replace_or_append_hydra_override(
-        base_command, "resume.checkpoint_path", checkpoint_path
+        base_command, "init_from.checkpoint_path", "null"
+    )
+    command = replace_or_append_hydra_override(
+        command, "resume.checkpoint_path", checkpoint_path
     )
     if wandb_run_id:
         command = replace_or_append_hydra_override(

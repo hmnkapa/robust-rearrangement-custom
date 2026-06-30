@@ -64,20 +64,30 @@ def _resolve_checkpoint_path(path: str) -> Path:
     return Path(hydra.utils.get_original_cwd()) / checkpoint_path
 
 
-def _resume_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
-    resume_cfg = cfg.get("resume")
-    if resume_cfg is None:
+def _checkpoint_path_from_cfg_section(
+    cfg: DictConfig, section_name: str
+) -> Optional[Path]:
+    section_cfg = cfg.get(section_name)
+    if section_cfg is None:
         return None
-    checkpoint_path = resume_cfg.get("checkpoint_path")
+    checkpoint_path = section_cfg.get("checkpoint_path")
     if checkpoint_path in (None, ""):
         return None
     return _resolve_checkpoint_path(str(checkpoint_path))
 
 
+def _resume_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
+    return _checkpoint_path_from_cfg_section(cfg, "resume")
+
+
+def _init_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
+    return _checkpoint_path_from_cfg_section(cfg, "init_from")
+
+
 def _load_local_checkpoint(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
-    print(f"Loading local resume checkpoint from {path}")
+    print(f"Loading local checkpoint from {path}")
     return torch.load(path, map_location="cpu")
 
 
@@ -115,16 +125,20 @@ def _load_training_state(
     lr_scheduler_critic,
     state_dict: dict,
 ) -> None:
-    model_state_dict = state_dict["model_state_dict"]
-    if "actor_logstd" in model_state_dict:
-        agent.residual_policy.load_state_dict(model_state_dict)
-    else:
-        agent.load_state_dict(model_state_dict)
+    _load_model_state(agent, state_dict)
 
     optimizer_actor.load_state_dict(state_dict["optimizer_actor_state_dict"])
     optimizer_critic.load_state_dict(state_dict["optimizer_critic_state_dict"])
     lr_scheduler_actor.load_state_dict(state_dict["scheduler_actor_state_dict"])
     lr_scheduler_critic.load_state_dict(state_dict["scheduler_critic_state_dict"])
+
+
+def _load_model_state(agent: nn.Module, state_dict: dict) -> None:
+    model_state_dict = state_dict["model_state_dict"]
+    if "actor_logstd" in model_state_dict:
+        agent.residual_policy.load_state_dict(model_state_dict)
+    else:
+        agent.load_state_dict(model_state_dict)
 
 
 @torch.no_grad()
@@ -166,10 +180,35 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
     resume_checkpoint_path = _resume_checkpoint_path(cfg)
+    init_checkpoint_path = _init_checkpoint_path(cfg)
     run_state_dict = None
+    init_state_dict = None
+    if resume_checkpoint_path is not None and init_checkpoint_path is not None:
+        print(
+            "Both resume.checkpoint_path and init_from.checkpoint_path were set; "
+            "resume.checkpoint_path takes precedence."
+        )
+        init_checkpoint_path = None
+
     if resume_checkpoint_path is not None:
         run_state_dict = _load_local_checkpoint(resume_checkpoint_path)
         cfg = _merge_checkpoint_config_with_overrides(cfg, run_state_dict)
+    elif init_checkpoint_path is not None:
+        task_overrides = _task_overrides_cfg()
+        init_state_dict = _load_local_checkpoint(init_checkpoint_path)
+        cfg = _merge_checkpoint_config_with_overrides(cfg, init_state_dict)
+        OmegaConf.update(cfg, "resume.checkpoint_path", None, merge=True)
+        OmegaConf.update(
+            cfg, "init_from.checkpoint_path", str(init_checkpoint_path), merge=True
+        )
+        OmegaConf.update(cfg, "wandb.continue_run_id", None, merge=True)
+        if "seed" not in task_overrides:
+            OmegaConf.update(cfg, "seed", None, merge=True)
+        if (
+            "wandb" not in task_overrides
+            or "name" not in task_overrides.get("wandb", {})
+        ):
+            OmegaConf.update(cfg, "wandb.name", None, merge=True)
 
     if (job_id := os.environ.get("SLURM_JOB_ID")) is not None:
         cfg.slurm_job_id = job_id
@@ -283,7 +322,10 @@ def main(cfg: DictConfig):
         if cfg.seed is None:
             cfg.seed = random.randint(0, 2**32 - 1)
 
-        run_name = f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
+        run_name = cfg.wandb.get("name", None)
+        if run_name in (None, ""):
+            run_name = f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
+        OmegaConf.update(cfg, "wandb.name", str(run_name), merge=True)
 
     if "task" not in cfg.env:
         cfg.env.task = "one_leg"
@@ -341,10 +383,13 @@ def main(cfg: DictConfig):
     n_parts_to_assemble = env.n_parts_assemble
     is_desk_task = cfg.env.task == "desk"
     env_obs_spaces = getattr(env.observation_space, "spaces", {})
+    configured_residual_task_state_dim = int(
+        cfg.get("residual_task_state_dim", 0) or 0
+    )
     residual_task_state_dim = (
         int(env_obs_spaces["task_state"].shape[-1])
         if "task_state" in env_obs_spaces
-        else 0
+        else configured_residual_task_state_dim
     )
     OmegaConf.set_struct(base_cfg, False)
     OmegaConf.update(
@@ -419,6 +464,9 @@ def main(cfg: DictConfig):
         )
     else:
         agent.load_base_state_dict(base_wts)
+        if init_state_dict is not None:
+            print(f"Initializing policy weights from {init_checkpoint_path}")
+            _load_model_state(agent, init_state_dict)
 
     residual_policy = agent.residual_policy
 
@@ -426,7 +474,7 @@ def main(cfg: DictConfig):
         "pretrained_wts" in cfg.actor.residual_policy
         and cfg.actor.residual_policy.pretrained_wts
     )
-    if run_state_dict is None and has_pretrained_wts:
+    if run_state_dict is None and init_state_dict is None and has_pretrained_wts:
         print(
             f"Loading pretrained weights from {cfg.actor.residual_policy.pretrained_wts}"
         )
