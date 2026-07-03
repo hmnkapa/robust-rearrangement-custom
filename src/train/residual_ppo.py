@@ -740,6 +740,8 @@ def main(cfg: DictConfig):
                     "eval/mean_success_reward": mean_success_reward,
                     "eval/mean_top_yaw_reward": mean_top_yaw_reward,
                     "eval/mean_top_yaw_bonus": mean_top_yaw_bonus,
+                    "eval/mean_desk_top_yaw_reward": mean_top_yaw_reward,
+                    "eval/mean_desk_top_yaw_bonus": mean_top_yaw_bonus,
                     "eval/best_eval_success_rate": best_eval_success_rate,
                     "iteration": iteration,
                 },
@@ -913,6 +915,10 @@ def main(cfg: DictConfig):
                 "charts/mean_top_yaw_reward": mean_top_yaw_reward,
                 "charts/top_yaw_bonus_rewards": top_yaw_bonus_rewards.sum().item(),
                 "charts/mean_top_yaw_bonus": mean_top_yaw_bonus,
+                "charts/desk_top_yaw_rewards": top_yaw_rewards.sum().item(),
+                "charts/mean_desk_top_yaw_reward": mean_top_yaw_reward,
+                "charts/desk_top_yaw_bonus_rewards": top_yaw_bonus_rewards.sum().item(),
+                "charts/mean_desk_top_yaw_bonus": mean_top_yaw_bonus,
                 "charts/success_rate": success_rate,
                 "charts/success_timesteps_share": success_timesteps_share,
                 "charts/mean_success_episode_length": mean_success_episode_length,
@@ -944,6 +950,14 @@ def main(cfg: DictConfig):
                 "histograms/contact_rewards": wandb.Histogram(contact_rewards),
                 "histograms/release_rewards": wandb.Histogram(release_rewards),
                 "histograms/success_rewards": wandb.Histogram(success_rewards),
+                "histograms/top_yaw_rewards": wandb.Histogram(top_yaw_rewards),
+                "histograms/top_yaw_bonus_rewards": wandb.Histogram(
+                    top_yaw_bonus_rewards
+                ),
+                "histograms/desk_top_yaw_rewards": wandb.Histogram(top_yaw_rewards),
+                "histograms/desk_top_yaw_bonus_rewards": wandb.Histogram(
+                    top_yaw_bonus_rewards
+                ),
                 "histograms/action_norms": wandb.Histogram(action_norms),
             },
             step=global_step,
