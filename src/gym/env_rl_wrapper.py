@@ -262,8 +262,19 @@ class RLPolicyEnvWrapper:
         self.max_env_steps = max_env_steps
         self.num_envs = self.env.num_envs
 
-    def reset(self, **kwargs):
-        obs = self.env.reset()
+    def reset(self, initial_states=None, desk_initial_phase=None, **kwargs):
+        if initial_states is None:
+            obs = self.env.reset()
+        else:
+            reset_to = getattr(self.env, "reset_to", None)
+            if reset_to is None:
+                raise AttributeError(
+                    f"{type(self.env).__name__} does not support reset_to"
+                )
+            obs = reset_to(initial_states, desk_initial_phase=desk_initial_phase)
+            if obs is None:
+                self.env.refresh()
+                obs = self.env.get_observation()
         self.env_success = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )

@@ -22,6 +22,11 @@ from diffusers.optimization import get_scheduler
 from src.gym.env_rl_wrapper import RLPolicyEnvWrapper
 from src.common.config_util import merge_base_bc_config_with_root_config
 from src.gym.observation import DEFAULT_STATE_OBS
+from src.train.initial_state import (
+    load_desk_initial_states_from_dir,
+    resolve_initial_state_dir,
+    sample_initial_states,
+)
 
 import numpy as np
 import torch
@@ -84,6 +89,15 @@ def _init_checkpoint_path(cfg: DictConfig) -> Optional[Path]:
     return _checkpoint_path_from_cfg_section(cfg, "init_from")
 
 
+def _optional_str(value) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value)
+    if value == "" or value.lower() in {"none", "null"}:
+        return None
+    return value
+
+
 def _load_local_checkpoint(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
@@ -103,6 +117,44 @@ def _merge_checkpoint_config_with_overrides(
     merged_cfg = OmegaConf.merge(checkpoint_cfg, _task_overrides_cfg())
     OmegaConf.set_struct(merged_cfg, False)
     return merged_cfg
+
+
+def _sync_rollout_derived_cfg(cfg: DictConfig) -> None:
+    """Recompute resolved rollout sizes after loading checkpoint configs."""
+    OmegaConf.set_struct(cfg, False)
+
+    num_env_steps = cfg.get("num_env_steps", None)
+    if num_env_steps is None:
+        num_env_steps = cfg.data_collection_steps
+
+    data_collection_steps = int(num_env_steps)
+    num_envs = int(cfg.num_envs)
+    num_minibatches = int(cfg.num_minibatches)
+    total_timesteps = int(cfg.total_timesteps)
+
+    if data_collection_steps <= 0:
+        raise ValueError("num_env_steps must be positive.")
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive.")
+    if num_minibatches <= 0:
+        raise ValueError("num_minibatches must be positive.")
+
+    batch_size = data_collection_steps * num_envs
+    minibatch_size = batch_size // num_minibatches
+    if minibatch_size <= 0:
+        raise ValueError("num_minibatches must not exceed batch_size.")
+
+    num_iterations = total_timesteps // batch_size
+    if num_iterations <= 0:
+        raise ValueError("total_timesteps must be at least one batch_size.")
+
+    OmegaConf.update(
+        cfg, "data_collection_steps", data_collection_steps, merge=True
+    )
+    OmegaConf.update(cfg, "num_env_steps", data_collection_steps, merge=True)
+    OmegaConf.update(cfg, "batch_size", batch_size, merge=True)
+    OmegaConf.update(cfg, "minibatch_size", minibatch_size, merge=True)
+    OmegaConf.update(cfg, "num_iterations", num_iterations, merge=True)
 
 
 def _is_eval_iteration(iteration: int, cfg: DictConfig) -> bool:
@@ -252,6 +304,7 @@ def main(cfg: DictConfig):
 
         base_cfg = cfg.base_policy
         merge_base_bc_config_with_root_config(cfg, base_cfg)
+        _sync_rollout_derived_cfg(cfg)
 
         print(f"Loading weights from {wts}")
 
@@ -274,6 +327,7 @@ def main(cfg: DictConfig):
 
         base_cfg = cfg.base_policy
         merge_base_bc_config_with_root_config(cfg, base_cfg)
+        _sync_rollout_derived_cfg(cfg)
 
         if "actor_name" not in cfg or cfg.actor_name is None:
             cfg.actor_name = f"residual_{cfg.base_policy.actor.name}"
@@ -317,6 +371,7 @@ def main(cfg: DictConfig):
             raise ValueError("No base policy provided")
 
         merge_base_bc_config_with_root_config(cfg, base_cfg)
+        _sync_rollout_derived_cfg(cfg)
         cfg.actor_name = f"residual_{cfg.base_policy.actor.name}"
 
         if cfg.seed is None:
@@ -334,6 +389,32 @@ def main(cfg: DictConfig):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.backends.cudnn.deterministic = cfg.torch_deterministic
+
+    initial_state_dir = _optional_str(cfg.env.get("initial_state_dir", None))
+    initial_state_desk_phase = _optional_str(
+        cfg.env.get("initial_state_desk_phase", None)
+    )
+    initial_states = None
+    initial_state_rng = np.random.default_rng(cfg.seed)
+    if initial_state_dir is not None:
+        if cfg.env.task != "desk":
+            raise ValueError(
+                "env.initial_state_dir currently supports the desk task only."
+            )
+        if initial_state_desk_phase not in (None, "top_yaw", "top_yaw_complete"):
+            raise ValueError(
+                "env.initial_state_desk_phase must be null, 'top_yaw', "
+                "or 'top_yaw_complete'."
+            )
+        initial_state_path = resolve_initial_state_dir(
+            initial_state_dir, hydra.utils.get_original_cwd()
+        )
+        initial_states = load_desk_initial_states_from_dir(initial_state_path)
+        print(
+            f"Loaded {len(initial_states)} desk initial states from "
+            f"{initial_state_path}"
+        )
+        print(f"Initial-state desk phase: {initial_state_desk_phase}")
 
     gpu_id = cfg.gpu_id
     device = torch.device(f"cuda:{gpu_id}")
@@ -369,6 +450,7 @@ def main(cfg: DictConfig):
         desk_top_max_tilt_deg=cfg.env.get("desk_top_max_tilt_deg", 15.0),
         desk_top_yaw_delta_clip_deg=cfg.env.get("desk_top_yaw_delta_clip_deg", 20.0),
         desk_contact_reward_weight=cfg.env.desk_contact_reward_weight,
+        desk_proximity_reward_weight=cfg.env.get("desk_proximity_reward_weight", 0.10),
         desk_release_reward_weight=cfg.env.desk_release_reward_weight,
         desk_contact_reward_max_attempts=cfg.env.get(
             "desk_contact_reward_max_attempts", 5
@@ -377,6 +459,7 @@ def main(cfg: DictConfig):
             "desk_release_reward_max_attempts", 5
         ),
         desk_contact_reward_scale=cfg.env.desk_contact_reward_scale,
+        desk_proximity_reward_scale=cfg.env.get("desk_proximity_reward_scale", 0.02),
         desk_contact_threshold=cfg.env.desk_contact_threshold,
         desk_release_contact_threshold=cfg.env.desk_release_contact_threshold,
         desk_contact_key_y=cfg.env.desk_contact_key_y,
@@ -530,6 +613,7 @@ def main(cfg: DictConfig):
     insert_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     twist_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     contact_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    proximity_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     release_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     success_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
     top_yaw_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
@@ -540,9 +624,19 @@ def main(cfg: DictConfig):
 
     start_time = time.time()
 
+    def _reset_env_and_agent():
+        reset_kwargs = {}
+        if initial_states is not None:
+            reset_kwargs["initial_states"] = sample_initial_states(
+                initial_states, cfg.num_envs, initial_state_rng
+            )
+            reset_kwargs["desk_initial_phase"] = initial_state_desk_phase
+        reset_obs = env.reset(**reset_kwargs)
+        agent.reset()
+        return reset_obs
+
     next_done = torch.zeros(cfg.num_envs)
-    next_obs = env.reset()
-    agent.reset()
+    next_obs = _reset_env_and_agent()
 
     # Create model save dir
     model_save_dir: Path = Path("models") / wandb.run.name
@@ -587,8 +681,7 @@ def main(cfg: DictConfig):
 
         # Also reset the env to have more consistent results
         if eval_mode or cfg.reset_every_iteration:
-            next_obs = env.reset()
-            agent.reset()
+            next_obs = _reset_env_and_agent()
 
         print(f"Eval mode: {eval_mode}")
 
@@ -629,6 +722,9 @@ def main(cfg: DictConfig):
             insert_rewards[step] = _info_reward(info, "desk_insert_reward", reward)
             twist_rewards[step] = _info_reward(info, "desk_twist_reward", reward)
             contact_rewards[step] = _info_reward(info, "desk_contact_reward", reward)
+            proximity_rewards[step] = _info_reward(
+                info, "desk_proximity_reward", reward
+            )
             release_rewards[step] = _info_reward(info, "desk_release_reward", reward)
             success_rewards[step] = _info_reward(info, "desk_success_reward", reward)
             top_yaw_rewards[step] = _info_reward(info, "desk_top_yaw_reward", reward)
@@ -661,6 +757,7 @@ def main(cfg: DictConfig):
         mean_insert_reward = insert_rewards.sum(dim=0).mean().item()
         mean_twist_reward = twist_rewards.sum(dim=0).mean().item()
         mean_contact_reward = contact_rewards.sum(dim=0).mean().item()
+        mean_proximity_reward = proximity_rewards.sum(dim=0).mean().item()
         mean_release_reward = release_rewards.sum(dim=0).mean().item()
         mean_success_reward = success_rewards.sum(dim=0).mean().item()
         mean_top_yaw_reward = top_yaw_rewards.sum(dim=0).mean().item()
@@ -736,10 +833,12 @@ def main(cfg: DictConfig):
                     "eval/mean_insert_reward": mean_insert_reward,
                     "eval/mean_twist_reward": mean_twist_reward,
                     "eval/mean_contact_reward": mean_contact_reward,
+                    "eval/mean_proximity_reward": mean_proximity_reward,
                     "eval/mean_release_reward": mean_release_reward,
                     "eval/mean_success_reward": mean_success_reward,
                     "eval/mean_top_yaw_reward": mean_top_yaw_reward,
                     "eval/mean_top_yaw_bonus": mean_top_yaw_bonus,
+                    "eval/mean_desk_proximity_reward": mean_proximity_reward,
                     "eval/mean_desk_top_yaw_reward": mean_top_yaw_reward,
                     "eval/mean_desk_top_yaw_bonus": mean_top_yaw_bonus,
                     "eval/best_eval_success_rate": best_eval_success_rate,
@@ -907,6 +1006,8 @@ def main(cfg: DictConfig):
                 "charts/mean_twist_reward": mean_twist_reward,
                 "charts/contact_rewards": contact_rewards.sum().item(),
                 "charts/mean_contact_reward": mean_contact_reward,
+                "charts/proximity_rewards": proximity_rewards.sum().item(),
+                "charts/mean_proximity_reward": mean_proximity_reward,
                 "charts/release_rewards": release_rewards.sum().item(),
                 "charts/mean_release_reward": mean_release_reward,
                 "charts/success_rewards": success_rewards.sum().item(),
@@ -917,6 +1018,8 @@ def main(cfg: DictConfig):
                 "charts/mean_top_yaw_bonus": mean_top_yaw_bonus,
                 "charts/desk_top_yaw_rewards": top_yaw_rewards.sum().item(),
                 "charts/mean_desk_top_yaw_reward": mean_top_yaw_reward,
+                "charts/desk_proximity_rewards": proximity_rewards.sum().item(),
+                "charts/mean_desk_proximity_reward": mean_proximity_reward,
                 "charts/desk_top_yaw_bonus_rewards": top_yaw_bonus_rewards.sum().item(),
                 "charts/mean_desk_top_yaw_bonus": mean_top_yaw_bonus,
                 "charts/success_rate": success_rate,
@@ -948,11 +1051,15 @@ def main(cfg: DictConfig):
                 "histograms/insert_rewards": wandb.Histogram(insert_rewards),
                 "histograms/twist_rewards": wandb.Histogram(twist_rewards),
                 "histograms/contact_rewards": wandb.Histogram(contact_rewards),
+                "histograms/proximity_rewards": wandb.Histogram(proximity_rewards),
                 "histograms/release_rewards": wandb.Histogram(release_rewards),
                 "histograms/success_rewards": wandb.Histogram(success_rewards),
                 "histograms/top_yaw_rewards": wandb.Histogram(top_yaw_rewards),
                 "histograms/top_yaw_bonus_rewards": wandb.Histogram(
                     top_yaw_bonus_rewards
+                ),
+                "histograms/desk_proximity_rewards": wandb.Histogram(
+                    proximity_rewards
                 ),
                 "histograms/desk_top_yaw_rewards": wandb.Histogram(top_yaw_rewards),
                 "histograms/desk_top_yaw_bonus_rewards": wandb.Histogram(
